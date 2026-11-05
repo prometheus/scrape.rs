@@ -27,8 +27,11 @@ mod records;
 mod schema;
 #[cfg(test)]
 mod tests;
+pub mod views;
 
 use std::iter::FusedIterator;
+
+pub use otel_arrow_dfe_pdata_views as pdata_views;
 
 use crate::format::{Format, FormatType};
 use crate::parse::{
@@ -48,6 +51,7 @@ pub use self::options::{
 };
 pub use self::records::{MetricPayloadType, OtapMetricRecords};
 pub use self::schema::PROMETHEUS_TYPE_METADATA_KEY;
+pub use self::views::DecodedMetricsView;
 
 /// Maximum distinct `UnivariateMetrics` rows representable in a single OTAP batch (`u16` IDs).
 const MAX_METRICS_PER_BATCH: usize = (u16::MAX as usize) + 1;
@@ -254,12 +258,51 @@ impl ArrowDecoder {
         format: &Format,
         opts: &DecodeOptions,
     ) -> Result<OtapMetricRecords, DecodeError> {
+        let has_default_ts = self.stage_scrape(input, format, opts)?;
+        self.finish_batches(has_default_ts)
+    }
+
+    /// Decodes a single exposition scrape buffer of `format` into [`ArrowDecoder`]'s reusable
+    /// staging buffers and returns a zero-copy [`DecodedMetricsView`] implementing
+    /// [`otel_arrow_dfe_pdata_views::views::metrics::MetricsView`].
+    ///
+    /// Unlike [`ArrowDecoder::decode`], `decode_view` skips materializing Arrow
+    /// [`arrow_array::RecordBatch`]es, allowing downstream OTAP encoders such as
+    /// `otel_arrow_dfe_pdata::encode::encode_metrics_otap_batch` to traverse the staged metric
+    /// families, data points, exemplars, and interned attributes directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] under the same conditions as [`ArrowDecoder::decode`].
+    pub fn decode_view(
+        &mut self,
+        input: &[u8],
+        format: &Format,
+        opts: &DecodeOptions,
+    ) -> Result<DecodedMetricsView<'_>, DecodeError> {
+        self.stage_scrape(input, format, opts)?;
+        Ok(self.view())
+    }
+
+    /// Returns a zero-copy [`DecodedMetricsView`] over the metric batch currently staged in `self`.
+    #[inline]
+    #[must_use]
+    pub fn view(&self) -> DecodedMetricsView<'_> {
+        DecodedMetricsView::new(self)
+    }
+
+    fn stage_scrape(
+        &mut self,
+        input: &[u8],
+        format: &Format,
+        opts: &DecodeOptions,
+    ) -> Result<bool, DecodeError> {
         self.reset_scrape();
         let (mut parser, default_ts_ns) = self.init_scrape_parser(input, format, opts)?;
 
         let mut pending_series = false;
         let mut done = false;
-        let res = self.ingest_entries::<false>(
+        let res = self.stage_entries::<false>(
             &mut parser,
             opts,
             default_ts_ns,
@@ -268,7 +311,8 @@ impl ArrowDecoder {
             &mut done,
         );
         parser.take_scratch_into(self);
-        Ok(res?.unwrap_or_default())
+        res?;
+        Ok(default_ts_ns.is_some())
     }
 
     /// Streams `input` as a sequence of non-empty [`OtapMetricRecords`] chunks bounded by
@@ -417,10 +461,10 @@ impl ArrowDecoder {
         Ok(())
     }
 
-    // Monomorphizing on `CHUNKED` shares one entry dispatch loop between `decode` (`false`) and
-    // `decode_stream` (`true`) while compiling out chunk-boundary flush checks on single-batch
-    // calls.
-    fn ingest_entries<const CHUNKED: bool>(
+    // Monomorphizing on `CHUNKED` shares one entry dispatch loop between single-batch (`false`)
+    // and streaming (`true`) decoding while compiling out chunk-boundary checks on single-batch
+    // calls. Returns `Ok(true)` when a non-empty chunk (or single batch) is staged.
+    fn stage_entries<const CHUNKED: bool>(
         &mut self,
         parser: &mut ActiveParser<'_>,
         opts: &DecodeOptions,
@@ -428,7 +472,7 @@ impl ArrowDecoder {
         max_data_points: usize,
         pending_series: &mut bool,
         done: &mut bool,
-    ) -> Result<Option<OtapMetricRecords>, DecodeError> {
+    ) -> Result<bool, DecodeError> {
         loop {
             let entry = if CHUNKED && *pending_series {
                 *pending_series = false;
@@ -440,14 +484,9 @@ impl ArrowDecoder {
                         self.flush_pending_family(opts, default_ts_ns)?;
                         *done = true;
                         if CHUNKED {
-                            if self.metrics.is_empty() {
-                                return Ok(None);
-                            }
-                            let batch = self.finish_batches(default_ts_ns.is_some())?;
-                            self.reset_batch();
-                            return Ok(Some(batch));
+                            return Ok(!self.metrics.is_empty());
                         }
-                        return Ok(Some(self.finish_batches(default_ts_ns.is_some())?));
+                        return Ok(true);
                     }
                 }
             };
@@ -490,9 +529,7 @@ impl ArrowDecoder {
                                 self.current_family
                                     .start_new(raw_name, &self.series_name_buf);
                                 *pending_series = true;
-                                let batch = self.finish_batches(default_ts_ns.is_some())?;
-                                self.reset_batch();
-                                return Ok(Some(batch));
+                                return Ok(true);
                             }
                             self.current_family
                                 .start_new(raw_name, &self.series_name_buf);
@@ -513,9 +550,7 @@ impl ArrowDecoder {
                                 self.flush_pending_family(opts, default_ts_ns)?;
                             }
                             *pending_series = true;
-                            let batch = self.finish_batches(default_ts_ns.is_some())?;
-                            self.reset_batch();
-                            return Ok(Some(batch));
+                            return Ok(true);
                         }
                     }
 
@@ -525,9 +560,7 @@ impl ArrowDecoder {
                         && self.assembly.is_empty()
                         && self.total_data_points() >= max_data_points
                     {
-                        let batch = self.finish_batches(default_ts_ns.is_some())?;
-                        self.reset_batch();
-                        return Ok(Some(batch));
+                        return Ok(true);
                     }
                 }
             }
@@ -1212,10 +1245,19 @@ pub struct DecodeStream<'dec, 'input> {
     done: bool,
 }
 
-impl Iterator for DecodeStream<'_, '_> {
-    type Item = Result<OtapMetricRecords, DecodeError>;
+impl DecodeStream<'_, '_> {
+    /// Advances the stream to the next bounded chunk and returns a zero-copy
+    /// [`DecodedMetricsView`] borrowing the staged batch without materializing Arrow
+    /// [`arrow_array::RecordBatch`]es.
+    pub fn next_view(&mut self) -> Option<Result<DecodedMetricsView<'_>, DecodeError>> {
+        match self.step_chunk() {
+            Some(Ok(())) => Some(Ok(self.decoder.view())),
+            Some(Err(err)) => Some(Err(err)),
+            None => None,
+        }
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn step_chunk(&mut self) -> Option<Result<(), DecodeError>> {
         if self.done {
             return None;
         }
@@ -1223,7 +1265,10 @@ impl Iterator for DecodeStream<'_, '_> {
             self.done = true;
             return Some(Err(err));
         }
-        match self.decoder.ingest_entries::<true>(
+        if !self.decoder.metrics.is_empty() {
+            self.decoder.reset_batch();
+        }
+        match self.decoder.stage_entries::<true>(
             &mut self.parser,
             &self.opts,
             self.default_ts_ns,
@@ -1231,13 +1276,31 @@ impl Iterator for DecodeStream<'_, '_> {
             &mut self.pending_series,
             &mut self.done,
         ) {
-            Ok(Some(batch)) => Some(Ok(batch)),
-            Ok(None) => None,
+            Ok(true) => Some(Ok(())),
+            Ok(false) => None,
             Err(err) => {
                 self.done = true;
                 self.decoder.reset_scrape();
                 Some(Err(err))
             }
+        }
+    }
+}
+
+impl Iterator for DecodeStream<'_, '_> {
+    type Item = Result<OtapMetricRecords, DecodeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.step_chunk()? {
+            Ok(()) => {
+                let res = self.decoder.finish_batches(self.default_ts_ns.is_some());
+                if res.is_err() {
+                    self.done = true;
+                    self.decoder.reset_scrape();
+                }
+                Some(res)
+            }
+            Err(err) => Some(Err(err)),
         }
     }
 }

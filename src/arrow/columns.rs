@@ -217,7 +217,6 @@ impl OptionalStringCol {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(super) fn get_bytes(&self, row: usize) -> &[u8] {
         if !self.any || (!self.all && !self.valid[row]) {
             return b"";
@@ -345,7 +344,6 @@ impl MetricTable {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(super) fn name_at(&self, row: usize) -> &[u8] {
         let start = self.name_offsets[row] as usize;
         let end = self.name_offsets[row + 1] as usize;
@@ -498,7 +496,6 @@ impl SparseTimestampCol {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(super) fn get_u64(&self, row: usize) -> u64 {
         if self.values.is_empty() || (!self.valid.is_empty() && !self.valid[row]) {
             0
@@ -658,7 +655,6 @@ impl<T: Copy + Default> OptionalValueCol<T> {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(super) fn get(&self, row: usize) -> Option<T> {
         if !self.valid.is_empty() && !self.valid[row] {
             None
@@ -757,7 +753,6 @@ impl AttrTable {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(super) fn range_for_parent(&self, parent_idx: usize) -> std::ops::Range<usize> {
         if parent_idx + 1 >= self.parent_offsets.len() {
             0..0
@@ -840,7 +835,6 @@ impl<const N: usize> SparseFixedBinaryCol<N> {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(super) fn get(&self, row: usize) -> Option<&[u8; N]> {
         if !self.any_present || (!self.valid.is_empty() && !self.valid[row]) {
             None
@@ -935,7 +929,6 @@ impl ExemplarTable {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub(super) fn range_for_dp(&self, dp_idx: usize) -> std::ops::Range<usize> {
         if dp_idx + 1 >= self.dp_offsets.len() {
             0..0
