@@ -31,7 +31,7 @@ use expfmt::format::Format;
 static ALLOC: CountingAlloc = CountingAlloc::new();
 
 /// Filters `alltypes.237mfs.prom.txt` down to its 209 counter, gauge, and untyped metric families
-/// until `#8` adds classic histogram and summary assembly.
+/// to isolate simple scalar family decoding from histogram and summary assembly.
 fn filter_counter_gauge_families(raw: &str) -> Vec<u8> {
     let mut out = String::with_capacity(raw.len());
     let mut skip_family: Option<String> = None;
@@ -78,6 +78,7 @@ fn main() {
     let nometa = fs::read(root.join("alltypes.237mfs.nometa.prom.txt")).unwrap();
     let full = fs::read_to_string(root.join("alltypes.237mfs.prom.txt")).unwrap();
     let typed_simple = filter_counter_gauge_families(&full);
+    let full_bytes = full.as_bytes();
 
     let opts = DecodeOptions::new().with_timestamp_ms(0);
     let stream_256_opts = opts.with_max_data_points_per_batch(256);
@@ -87,6 +88,7 @@ fn main() {
     for (case, payload) in [
         ("alltypes.237mfs.nometa", nometa.as_slice()),
         ("alltypes.209mfs.counter_gauge", typed_simple.as_slice()),
+        ("alltypes.237mfs", full_bytes),
     ] {
         let bytes = payload.len() as u64;
 
@@ -104,6 +106,19 @@ fn main() {
                         .decode(black_box(payload), &Format::TEXT, &opts)
                         .unwrap();
                     black_box(records);
+                }
+            })
+            .bench(format!("Decode/case={case}/mode=decode_view"), move |b| {
+                let mut decoder = ArrowDecoder::new();
+                black_box(decoder.decode_view(payload, &Format::TEXT, &opts).unwrap());
+
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    let view = decoder
+                        .decode_view(black_box(payload), &Format::TEXT, &opts)
+                        .unwrap();
+                    black_box(view);
                 }
             })
             .bench(format!("Decode/case={case}/mode=stream_16k"), move |b| {
