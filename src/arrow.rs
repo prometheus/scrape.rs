@@ -689,7 +689,7 @@ impl ArrowDecoder {
 
         let parent_id = self
             .current_family
-            .emit_into_batch(&mut self.metrics, opts)?;
+            .emit_into_batch(&mut self.metrics, opts, dp_id)?;
         let start_ts_ns = start_ts_ms.and_then(|ms| ms.checked_mul(1_000_000));
         let resolved_ts_ns = match sample_ts_ms {
             Some(ms) => Some(ms_to_ns(ms)?),
@@ -699,6 +699,7 @@ impl ArrowDecoder {
             .base
             .push(parent_id, start_ts_ns, resolved_ts_ns);
         self.num_dp.values.push(value);
+        self.metrics.dp_ranges[parent_id as usize].1 = dp_id + 1;
         Ok(())
     }
 

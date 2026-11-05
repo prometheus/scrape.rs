@@ -604,3 +604,83 @@ fn interleaved_histogram_lines_and_group_rehashing_assemble_correctly() {
         assert_eq!(sums.value(i), (i as f64) * 10.0 + 0.5);
     }
 }
+
+#[test]
+fn staging_ranges_and_column_accessors_match_emitted_rows() {
+    let payload = br#"# TYPE c_seconds counter
+# HELP c_seconds counter help
+# UNIT c_seconds seconds
+c_seconds_total 1 1.0
+c_seconds_total{k="v1",k2="v2"} 2 2.0 # {trace_id="0102030405060708090a0b0c0d0e0f10",span_id="0102030405060708",user="u1"} 1.5 2.5
+c_seconds_created 0.5
+# TYPE g gauge
+g{a="1"} 10
+# TYPE h histogram
+h_bucket{le="1.0"} 3 # {span_id="1112131415161718",route="/a"} 0.5 3.0
+h_bucket{le="+Inf"} 5
+h_sum 12.5
+h_count 5
+# TYPE s summary
+s{q="x",quantile="0.5"} 4.0
+# EOF
+"#;
+
+    let mut dec = ArrowDecoder::new();
+    let _records = dec
+        .decode(
+            payload,
+            &Format::OPEN_METRICS_1_0_0,
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+
+    assert_eq!(dec.metrics.len(), 4);
+    assert_eq!(dec.metrics.name_at(0), b"c_seconds_total");
+    assert_eq!(dec.metrics.desc.get_bytes(0), b"counter help");
+    assert_eq!(dec.metrics.unit.get_bytes(0), b"seconds");
+    assert_eq!(dec.metrics.dp_ranges[0], (0, 2));
+
+    assert_eq!(dec.metrics.name_at(1), b"g");
+    assert_eq!(dec.metrics.desc.get_bytes(1), b"");
+    assert_eq!(dec.metrics.unit.get_bytes(1), b"");
+    assert_eq!(dec.metrics.dp_ranges[1], (2, 3));
+
+    assert_eq!(dec.metrics.name_at(2), b"h");
+    assert_eq!(dec.metrics.dp_ranges[2], (0, 1));
+
+    assert_eq!(dec.metrics.name_at(3), b"s");
+    assert_eq!(dec.metrics.dp_ranges[3], (0, 1));
+
+    // DP 0 has no attributes or exemplars; DP 1 has 2 attributes and 1 exemplar; DP 2 has 1 attribute.
+    assert_eq!(dec.num_dp.attrs.range_for_parent(0), 0..0);
+    assert_eq!(dec.num_dp.attrs.range_for_parent(1), 0..2);
+    assert_eq!(dec.num_dp.attrs.range_for_parent(2), 2..3);
+    assert_eq!(dec.num_dp.attrs.range_for_parent(3), 0..0);
+
+    assert_eq!(dec.num_dp.exemplars.range_for_dp(0), 0..0);
+    assert_eq!(dec.num_dp.exemplars.range_for_dp(1), 0..1);
+    assert_eq!(dec.num_dp.exemplars.range_for_dp(2), 0..0);
+    assert_eq!(dec.num_dp.exemplars.attrs.range_for_parent(0), 0..1);
+    assert_eq!(
+        dec.num_dp.exemplars.span_ids.get(0),
+        Some(&[1, 2, 3, 4, 5, 6, 7, 8])
+    );
+    assert_eq!(
+        dec.num_dp.exemplars.trace_ids.get(0),
+        Some(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    );
+
+    assert_eq!(dec.num_dp.base.start_time.get_u64(0), 500_000_000);
+    assert_eq!(dec.num_dp.base.time.get_u64(0), 1_000_000_000);
+    assert_eq!(dec.num_dp.base.start_time.get_u64(2), 0);
+    assert_eq!(dec.num_dp.base.time.get_u64(2), 0);
+
+    assert_eq!(dec.hist_dp.counts.get(0), Some(5));
+    assert_eq!(dec.hist_dp.sums.get(0), Some(12.5));
+    assert_eq!(dec.hist_dp.exemplars.range_for_dp(0), 0..1);
+    assert_eq!(dec.hist_dp.exemplars.trace_ids.get(0), None);
+
+    assert_eq!(dec.sum_dp.counts.get(0), None);
+    assert_eq!(dec.sum_dp.sums.get(0), None);
+    assert_eq!(dec.sum_dp.attrs.range_for_parent(0), 0..1);
+}

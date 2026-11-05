@@ -14,13 +14,19 @@ exclude = ["tests/otap-compat"]
 
 [features]
 default = ["arrow", "dto"]
-arrow = ["dep:arrow-array", "dep:arrow-buffer", "dep:arrow-schema"]
+arrow = [
+    "dep:arrow-array",
+    "dep:arrow-buffer",
+    "dep:arrow-schema",
+    "dep:otel-arrow-dfe-pdata-views",
+]
 dto = ["dep:prost", "dep:prost-types"]
 
 [dependencies]
 arrow-array = { version = "59", default-features = false, optional = true }
 arrow-buffer = { version = "59", default-features = false, optional = true }
 arrow-schema = { version = "59", default-features = false, optional = true }
+otel-arrow-dfe-pdata-views = { version = "0.54", optional = true }
 prost = { version = "0.14", optional = true }
 prost-types = { version = "0.14", optional = true }
 thiserror = "2"

@@ -179,6 +179,7 @@ impl CurrentFamily {
         &mut self,
         metrics: &mut MetricTable,
         opts: &DecodeOptions,
+        dp_start: u32,
     ) -> Result<u16, DecodeError> {
         if let Some(id) = self.batch_id {
             return Ok(id);
@@ -266,6 +267,7 @@ impl CurrentFamily {
         metrics.metric_types.push(otap_type);
         metrics.is_monotonic.push(is_monotonic);
         metrics.attr_type_keys.push(attr_type_key);
+        metrics.dp_ranges.push((dp_start, dp_start));
         metrics.any_temporality |= has_temporality;
         metrics.all_temporality &= has_temporality;
         metrics.any_sum |= has_sum;
@@ -605,7 +607,11 @@ impl FamilyAssembly {
             return Ok(());
         }
 
-        let parent_id = current_family.emit_into_batch(metrics, opts)?;
+        let dp_start = match current_family.metric_type {
+            MetricType::Summary => sum_dp.base.len() as u32,
+            _ => hist_dp.base.len() as u32,
+        };
+        let parent_id = current_family.emit_into_batch(metrics, opts, dp_start)?;
         let num_groups = self.groups.len();
 
         match current_family.metric_type {
@@ -647,6 +653,7 @@ impl FamilyAssembly {
                     })?;
                     sum_dp.quantile_offsets.push(q_off);
                 }
+                metrics.dp_ranges[parent_id as usize].1 = sum_dp.base.len() as u32;
             }
             MetricType::Histogram | MetricType::GaugeHistogram => {
                 if hist_dp.bucket_offsets.is_empty() {
@@ -732,6 +739,7 @@ impl FamilyAssembly {
                         );
                     }
                 }
+                metrics.dp_ranges[parent_id as usize].1 = hist_dp.base.len() as u32;
             }
             _ => {}
         }
