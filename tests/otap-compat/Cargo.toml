@@ -16,10 +16,15 @@ publish = false
 [workspace]
 
 [dev-dependencies]
+benchfmt = { git = "https://github.com/bwplotka/benchfmt.rs" }
 dhat = "0.3"
 expfmt = { path = "../..", default-features = false, features = ["arrow"] }
 otel-arrow-dfe-pdata = { version = "0.62", features = ["testing"] }
 tokio = { version = "1.48", default-features = false, features = ["macros", "rt"] }
+
+[[bench]]
+name = "otap_encode"
+harness = false
 
 [lints.rust]
 unsafe_code = "forbid"

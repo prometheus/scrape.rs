@@ -604,3 +604,231 @@ fn interleaved_histogram_lines_and_group_rehashing_assemble_correctly() {
         assert_eq!(sums.value(i), (i as f64) * 10.0 + 0.5);
     }
 }
+
+#[test]
+fn staging_ranges_and_column_accessors_match_emitted_rows() {
+    let payload = br#"# TYPE c_seconds counter
+# HELP c_seconds counter help
+# UNIT c_seconds seconds
+c_seconds_total 1 1.0
+c_seconds_total{k="v1",k2="v2"} 2 2.0 # {trace_id="0102030405060708090a0b0c0d0e0f10",span_id="0102030405060708",user="u1"} 1.5 2.5
+c_seconds_created 0.5
+# TYPE g gauge
+g{a="1"} 10
+# TYPE h histogram
+h_bucket{le="1.0"} 3 # {span_id="1112131415161718",route="/a"} 0.5 3.0
+h_bucket{le="+Inf"} 5
+h_sum 12.5
+h_count 5
+# TYPE s summary
+s{q="x",quantile="0.5"} 4.0
+# EOF
+"#;
+
+    let mut dec = ArrowDecoder::new();
+    let _records = dec
+        .decode(
+            payload,
+            &Format::OPEN_METRICS_1_0_0,
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+
+    assert_eq!(dec.metrics.len(), 4);
+    assert_eq!(dec.metrics.name_at(0), b"c_seconds_total");
+    assert_eq!(dec.metrics.desc.get_bytes(0), b"counter help");
+    assert_eq!(dec.metrics.unit.get_bytes(0), b"seconds");
+    assert_eq!(dec.metrics.dp_ranges[0], (0, 2));
+
+    assert_eq!(dec.metrics.name_at(1), b"g");
+    assert_eq!(dec.metrics.desc.get_bytes(1), b"");
+    assert_eq!(dec.metrics.unit.get_bytes(1), b"");
+    assert_eq!(dec.metrics.dp_ranges[1], (2, 3));
+
+    assert_eq!(dec.metrics.name_at(2), b"h");
+    assert_eq!(dec.metrics.dp_ranges[2], (0, 1));
+
+    assert_eq!(dec.metrics.name_at(3), b"s");
+    assert_eq!(dec.metrics.dp_ranges[3], (0, 1));
+
+    // DP 0 has no attributes or exemplars; DP 1 has 2 attributes and 1 exemplar; DP 2 has 1 attribute.
+    assert_eq!(dec.num_dp.attrs.range_for_parent(0), 0..0);
+    assert_eq!(dec.num_dp.attrs.range_for_parent(1), 0..2);
+    assert_eq!(dec.num_dp.attrs.range_for_parent(2), 2..3);
+    assert_eq!(dec.num_dp.attrs.range_for_parent(3), 0..0);
+
+    assert_eq!(dec.num_dp.exemplars.range_for_dp(0), 0..0);
+    assert_eq!(dec.num_dp.exemplars.range_for_dp(1), 0..1);
+    assert_eq!(dec.num_dp.exemplars.range_for_dp(2), 0..0);
+    assert_eq!(dec.num_dp.exemplars.attrs.range_for_parent(0), 0..1);
+    assert_eq!(
+        dec.num_dp.exemplars.span_ids.get(0),
+        Some(&[1, 2, 3, 4, 5, 6, 7, 8])
+    );
+    assert_eq!(
+        dec.num_dp.exemplars.trace_ids.get(0),
+        Some(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    );
+
+    assert_eq!(dec.num_dp.base.start_time.get_u64(0), 500_000_000);
+    assert_eq!(dec.num_dp.base.time.get_u64(0), 1_000_000_000);
+    assert_eq!(dec.num_dp.base.start_time.get_u64(2), 0);
+    assert_eq!(dec.num_dp.base.time.get_u64(2), 0);
+
+    assert_eq!(dec.hist_dp.counts.get(0), Some(5));
+    assert_eq!(dec.hist_dp.sums.get(0), Some(12.5));
+    assert_eq!(dec.hist_dp.exemplars.range_for_dp(0), 0..1);
+    assert_eq!(dec.hist_dp.exemplars.trace_ids.get(0), None);
+
+    assert_eq!(dec.sum_dp.counts.get(0), None);
+    assert_eq!(dec.sum_dp.sums.get(0), None);
+    assert_eq!(dec.sum_dp.attrs.range_for_parent(0), 0..1);
+}
+
+#[test]
+fn decode_view_and_stream_next_view_traverse_all_metric_types() {
+    use otel_arrow_dfe_pdata_views::views::common::{AnyValueView, AttributeView, ValueType};
+    use otel_arrow_dfe_pdata_views::views::metrics::{
+        AggregationTemporality, DataType, DataView, ExemplarView, GaugeView,
+        HistogramDataPointView, HistogramView, MetricView, MetricsView, NumberDataPointView,
+        ResourceMetricsView, ScopeMetricsView, SumView, SummaryDataPointView, SummaryView, Value,
+        ValueAtQuantileView,
+    };
+
+    let payload = br#"# TYPE c_seconds counter
+# HELP c_seconds counter help
+# UNIT c_seconds seconds
+c_seconds_total{method="GET"} 42 2.0 # {trace_id="0102030405060708090a0b0c0d0e0f10",span_id="0102030405060708",user="u1"} 1.0 2.5
+c_seconds_created{method="GET"} 1.0
+# TYPE g gauge
+g{host="a"} 3.5 4.0 # {trace_id="00000000000000000000000000000000",span_id="0000000000000000"} 3.5 4.0
+# TYPE h histogram
+h_bucket{le="1.0",svc="api"} 2 # {span_id="1112131415161718",route="/v1"} 0.5 3.0
+h_bucket{le="+Inf",svc="api"} 5
+h_sum{svc="api"} 9.25
+h_count{svc="api"} 5
+# TYPE s summary
+s{q="p",quantile="0.5"} 1.25
+s{q="p",quantile="0.99"} 4.75
+s_sum{q="p"} 15.0
+s_count{q="p"} 10
+# EOF
+"#;
+
+    let mut dec = ArrowDecoder::new();
+    let empty_view = dec
+        .decode_view(
+            b"# EOF\n",
+            &Format::OPEN_METRICS_1_0_0,
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+    assert!(empty_view.is_empty());
+    assert_eq!(empty_view.num_metrics(), 0);
+    assert_eq!(empty_view.num_data_points(), 0);
+    assert_eq!(empty_view.resources().count(), 0);
+
+    let view = dec
+        .decode_view(
+            payload,
+            &Format::OPEN_METRICS_1_0_0,
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+    assert!(!view.is_empty());
+    assert_eq!(view.num_metrics(), 4);
+    assert_eq!(view.num_data_points(), 4);
+
+    let res = view.resources().next().unwrap();
+    assert!(res.resource().is_none());
+    assert!(res.schema_url().is_none());
+    let scope = res.scopes().next().unwrap();
+    assert!(scope.scope().is_none());
+    assert_eq!(scope.schema_url(), b"");
+
+    let metrics: Vec<_> = scope.metrics().collect();
+    assert_eq!(metrics.len(), 4);
+
+    // 0: Counter (`Sum`)
+    assert_eq!(metrics[0].name(), b"c_seconds_total");
+    assert_eq!(metrics[0].description(), b"counter help");
+    assert_eq!(metrics[0].unit(), b"seconds");
+    let m0_meta = metrics[0].metadata().next().unwrap();
+    assert_eq!(m0_meta.key(), b"prometheus.type");
+    assert_eq!(m0_meta.value().unwrap().value_type(), ValueType::String);
+    assert_eq!(m0_meta.value().unwrap().as_string(), Some(&b"counter"[..]));
+    let d0 = metrics[0].data().unwrap();
+    assert_eq!(d0.value_type(), DataType::Sum);
+    let sum0 = d0.as_sum().unwrap();
+    assert_eq!(
+        sum0.aggregation_temporality(),
+        AggregationTemporality::Cumulative
+    );
+    assert!(sum0.is_monotonic());
+    let dp0 = sum0.data_points().next().unwrap();
+    assert_eq!(dp0.start_time_unix_nano(), 1_000_000_000);
+    assert_eq!(dp0.time_unix_nano(), 2_000_000_000);
+    assert_eq!(dp0.value(), Some(Value::Double(42.0)));
+    let dp0_attr = dp0.attributes().next().unwrap();
+    assert_eq!(dp0_attr.key(), b"method");
+    assert_eq!(dp0_attr.value().unwrap().as_string(), Some(&b"GET"[..]));
+    let ex0 = dp0.exemplars().next().unwrap();
+    assert_eq!(ex0.value(), Some(Value::Double(1.0)));
+    assert_eq!(ex0.time_unix_nano(), 2_500_000_000);
+    assert_eq!(ex0.span_id(), Some(&[1, 2, 3, 4, 5, 6, 7, 8]));
+    assert_eq!(
+        ex0.trace_id(),
+        Some(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    );
+    let ex0_attr = ex0.filtered_attributes().next().unwrap();
+    assert_eq!(ex0_attr.key(), b"user");
+    assert_eq!(ex0_attr.value().unwrap().as_string(), Some(&b"u1"[..]));
+
+    // 1: Gauge with all-zero exemplar span_id/trace_id filtered to `None`
+    let d1 = metrics[1].data().unwrap();
+    let g1 = d1.as_gauge().unwrap();
+    let dp1 = g1.data_points().next().unwrap();
+    assert_eq!(dp1.value(), Some(Value::Double(3.5)));
+    let ex1 = dp1.exemplars().next().unwrap();
+    assert_eq!(ex1.span_id(), None);
+    assert_eq!(ex1.trace_id(), None);
+
+    // 2: Histogram
+    let d2 = metrics[2].data().unwrap();
+    let h2 = d2.as_histogram().unwrap();
+    assert_eq!(
+        h2.aggregation_temporality(),
+        AggregationTemporality::Cumulative
+    );
+    let hdp = h2.data_points().next().unwrap();
+    assert_eq!(hdp.count(), 5);
+    assert_eq!(hdp.sum(), Some(9.25));
+    assert_eq!(hdp.explicit_bounds().collect::<Vec<_>>(), vec![1.0]);
+    assert_eq!(hdp.bucket_counts().collect::<Vec<_>>(), vec![2, 3]);
+    assert_eq!(hdp.exemplars().count(), 1);
+
+    // 3: Summary
+    let d3 = metrics[3].data().unwrap();
+    let s3 = d3.as_summary().unwrap();
+    let sdp = s3.data_points().next().unwrap();
+    assert_eq!(sdp.count(), 10);
+    assert_eq!(sdp.sum(), 15.0);
+    let qvs: Vec<_> = sdp
+        .quantile_values()
+        .map(|qv| (qv.quantile(), qv.value()))
+        .collect();
+    assert_eq!(qvs, vec![(0.5, 1.25), (0.99, 4.75)]);
+
+    // Verify `DecodeStream::next_view` chunking.
+    let opts = DecodeOptions {
+        max_data_points_per_batch: 2,
+        ..DecodeOptions::default()
+    };
+    let mut stream = dec.decode_stream(payload, &Format::OPEN_METRICS_1_0_0, &opts);
+    let mut chunk_counts = Vec::new();
+    while let Some(res) = stream.next_view() {
+        let v = res.unwrap();
+        chunk_counts.push((v.num_metrics(), v.num_data_points()));
+    }
+    assert_eq!(chunk_counts, vec![(2, 2), (2, 2)]);
+}

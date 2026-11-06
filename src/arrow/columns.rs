@@ -217,6 +217,16 @@ impl OptionalStringCol {
     }
 
     #[inline]
+    pub(super) fn get_bytes(&self, row: usize) -> &[u8] {
+        if !self.any || (!self.all && !self.valid[row]) {
+            return b"";
+        }
+        let start = self.offsets[row] as usize;
+        let end = self.offsets[row + 1] as usize;
+        &self.bytes[start..end]
+    }
+
+    #[inline]
     pub(super) fn check_next_offset(
         &self,
         present: bool,
@@ -275,6 +285,7 @@ pub(super) struct MetricTable {
     pub(super) metric_types: Vec<u8>,
     pub(super) is_monotonic: Vec<bool>,
     pub(super) attr_type_keys: Vec<u16>,
+    pub(super) dp_ranges: Vec<(u32, u32)>,
     pub(super) name_offsets: Vec<i32>,
     pub(super) name_bytes: Vec<u8>,
     pub(super) desc: OptionalStringCol,
@@ -293,6 +304,7 @@ impl MetricTable {
             metric_types: Vec::with_capacity(metrics),
             is_monotonic: Vec::with_capacity(metrics),
             attr_type_keys: Vec::with_capacity(metrics),
+            dp_ranges: Vec::with_capacity(metrics),
             name_offsets,
             name_bytes: Vec::with_capacity(metrics.saturating_mul(32)),
             desc: OptionalStringCol::new(),
@@ -308,6 +320,7 @@ impl MetricTable {
         self.metric_types.clear();
         self.is_monotonic.clear();
         self.attr_type_keys.clear();
+        self.dp_ranges.clear();
         self.name_offsets.clear();
         self.name_offsets.push(0);
         self.name_bytes.clear();
@@ -323,10 +336,18 @@ impl MetricTable {
         self.metric_types.capacity()
             + self.is_monotonic.capacity() * size_of::<bool>()
             + self.attr_type_keys.capacity() * size_of::<u16>()
+            + self.dp_ranges.capacity() * size_of::<(u32, u32)>()
             + self.name_offsets.capacity() * size_of::<i32>()
             + self.name_bytes.capacity()
             + self.desc.retained_memory_bytes()
             + self.unit.retained_memory_bytes()
+    }
+
+    #[inline]
+    pub(super) fn name_at(&self, row: usize) -> &[u8] {
+        let start = self.name_offsets[row] as usize;
+        let end = self.name_offsets[row + 1] as usize;
+        &self.name_bytes[start..end]
     }
 
     #[inline]
@@ -472,6 +493,15 @@ impl SparseTimestampCol {
     #[inline]
     pub(super) fn has_nulls(&self) -> bool {
         !self.valid.is_empty()
+    }
+
+    #[inline]
+    pub(super) fn get_u64(&self, row: usize) -> u64 {
+        if self.values.is_empty() || (!self.valid.is_empty() && !self.valid[row]) {
+            0
+        } else {
+            self.values[row] as u64
+        }
     }
 
     #[inline]
@@ -625,6 +655,15 @@ impl<T: Copy + Default> OptionalValueCol<T> {
     }
 
     #[inline]
+    pub(super) fn get(&self, row: usize) -> Option<T> {
+        if !self.valid.is_empty() && !self.valid[row] {
+            None
+        } else {
+            Some(self.values[row])
+        }
+    }
+
+    #[inline]
     pub(super) fn push(&mut self, row_index: usize, val: Option<T>) {
         match val {
             Some(v) => {
@@ -676,6 +715,10 @@ impl OptionalValueCol<f64> {
 pub(super) struct AttrTable {
     pub(super) parent_ids: Vec<u32>,
     pub(super) pairs: Vec<(u32, u32)>,
+    /// CSR-style row offsets indexed by `parent_id` so `range_for_parent` slices a parent's
+    /// contiguous attribute run in $O(1)$ without scanning `parent_ids`. Stays empty when no
+    /// attributes are present in the table.
+    pub(super) parent_offsets: Vec<u32>,
 }
 
 impl AttrTable {
@@ -683,17 +726,20 @@ impl AttrTable {
         Self {
             parent_ids: Vec::with_capacity(cap),
             pairs: Vec::with_capacity(cap),
+            parent_offsets: Vec::new(),
         }
     }
 
     pub(super) fn clear(&mut self) {
         self.parent_ids.clear();
         self.pairs.clear();
+        self.parent_offsets.clear();
     }
 
     pub(super) fn retained_memory_bytes(&self) -> usize {
         self.parent_ids.capacity() * size_of::<u32>()
             + self.pairs.capacity() * size_of::<(u32, u32)>()
+            + self.parent_offsets.capacity() * size_of::<u32>()
     }
 
     #[inline]
@@ -707,13 +753,44 @@ impl AttrTable {
     }
 
     #[inline]
+    pub(super) fn range_for_parent(&self, parent_idx: usize) -> std::ops::Range<usize> {
+        if parent_idx + 1 >= self.parent_offsets.len() {
+            0..0
+        } else {
+            (self.parent_offsets[parent_idx] as usize)
+                ..(self.parent_offsets[parent_idx + 1] as usize)
+        }
+    }
+
+    #[inline]
     pub(super) fn push(&mut self, parent_id: u32, key_id: u32, val_id: u32) {
+        let start_idx = self.pairs.len();
+        let end_idx = start_idx + 1;
+        let p_idx = parent_id as usize;
+        if self.parent_offsets.len() <= p_idx + 1 {
+            self.parent_offsets.resize(p_idx + 1, start_idx as u32);
+            self.parent_offsets.push(end_idx as u32);
+        } else {
+            self.parent_offsets[p_idx + 1] = end_idx as u32;
+        }
         self.parent_ids.push(parent_id);
         self.pairs.push((key_id, val_id));
     }
 
     #[inline]
     pub(super) fn extend_for_parent(&mut self, parent_id: u32, attrs: &[(u32, u32)]) {
+        if attrs.is_empty() {
+            return;
+        }
+        let start_idx = self.pairs.len();
+        let end_idx = start_idx + attrs.len();
+        let p_idx = parent_id as usize;
+        if self.parent_offsets.len() <= p_idx + 1 {
+            self.parent_offsets.resize(p_idx + 1, start_idx as u32);
+            self.parent_offsets.push(end_idx as u32);
+        } else {
+            self.parent_offsets[p_idx + 1] = end_idx as u32;
+        }
         self.parent_ids
             .extend(std::iter::repeat_n(parent_id, attrs.len()));
         self.pairs.extend_from_slice(attrs);
@@ -755,6 +832,15 @@ impl<const N: usize> SparseFixedBinaryCol<N> {
 
     pub(super) fn retained_memory_bytes(&self) -> usize {
         self.values.capacity() * size_of::<[u8; N]>() + self.valid.capacity() * size_of::<bool>()
+    }
+
+    #[inline]
+    pub(super) fn get(&self, row: usize) -> Option<&[u8; N]> {
+        if !self.any_present || (!self.valid.is_empty() && !self.valid[row]) {
+            None
+        } else {
+            Some(&self.values[row])
+        }
     }
 
     #[inline]
@@ -811,6 +897,9 @@ pub(super) struct ExemplarTable {
     pub(super) span_ids: SparseFixedBinaryCol<8>,
     pub(super) trace_ids: SparseFixedBinaryCol<16>,
     pub(super) attrs: AttrTable,
+    /// CSR-style exemplar offsets indexed by parent data-point ID (`dp_id`). Stays unallocated
+    /// when no exemplars are present in the batch.
+    pub(super) dp_offsets: Vec<u32>,
 }
 
 impl ExemplarTable {
@@ -821,6 +910,7 @@ impl ExemplarTable {
         self.span_ids.clear();
         self.trace_ids.clear();
         self.attrs.clear();
+        self.dp_offsets.clear();
     }
 
     pub(super) fn retained_memory_bytes(&self) -> usize {
@@ -830,11 +920,21 @@ impl ExemplarTable {
             + self.span_ids.retained_memory_bytes()
             + self.trace_ids.retained_memory_bytes()
             + self.attrs.retained_memory_bytes()
+            + self.dp_offsets.capacity() * size_of::<u32>()
     }
 
     #[inline]
     pub(super) fn is_empty(&self) -> bool {
         self.parent_ids.is_empty()
+    }
+
+    #[inline]
+    pub(super) fn range_for_dp(&self, dp_idx: usize) -> std::ops::Range<usize> {
+        if dp_idx + 1 >= self.dp_offsets.len() {
+            0..0
+        } else {
+            (self.dp_offsets[dp_idx] as usize)..(self.dp_offsets[dp_idx + 1] as usize)
+        }
     }
 
     #[inline]
@@ -856,6 +956,13 @@ impl ExemplarTable {
         trace_id: Option<[u8; 16]>,
     ) {
         let ex_idx = self.parent_ids.len();
+        let dp_idx = parent_id as usize;
+        if self.dp_offsets.len() <= dp_idx + 1 {
+            self.dp_offsets.resize(dp_idx + 1, ex_idx as u32);
+            self.dp_offsets.push((ex_idx + 1) as u32);
+        } else {
+            self.dp_offsets[dp_idx + 1] = (ex_idx + 1) as u32;
+        }
         self.parent_ids.push(parent_id);
         self.timestamps.push(ts_ns);
         self.values.push(value);

@@ -22,6 +22,7 @@ use expfmt::arrow::{
     OtapMetricRecords, PROMETHEUS_TYPE_METADATA_KEY, UnitSuffixPolicy, UntypedPolicy,
 };
 use expfmt::format::Format;
+use otel_arrow_dfe_pdata::encode::encode_metrics_otap_batch;
 use otel_arrow_dfe_pdata::otap::{Metrics, OtapArrowRecords, OtapBatchStore};
 use otel_arrow_dfe_pdata::proto::OtlpProtoMessage;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
@@ -954,4 +955,160 @@ fn decode_stream_chunks_validate_in_otap_and_handle_more_than_u16_max_metrics() 
         "Boundary counter across u16 batch split."
     );
     assert!(matches!(boundary_metric.data, Some(metric::Data::Sum(_))));
+}
+
+#[test]
+fn pdata_views_encode_metrics_otap_batch_matches_direct_decode_across_fixtures_and_streams() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/textparse");
+    let mut direct_decoder = ArrowDecoder::new();
+    let mut view_decoder = ArrowDecoder::new();
+
+    // 1. Empty payload produces an empty `OtapArrowRecords::Metrics` batch.
+    let empty_view = view_decoder
+        .decode_view(
+            b"# EOF\n",
+            &Format::OPEN_METRICS_1_0_0,
+            &DecodeOptions::default(),
+        )
+        .expect("empty view decodes");
+    let empty_otap =
+        encode_metrics_otap_batch(&empty_view).expect("empty view encodes to OtapArrowRecords");
+    assert_eq!(empty_otap, OtapArrowRecords::Metrics(Metrics::default()));
+
+    // 2. Multi-type OpenMetrics 1.0 payload with counters, gauges, histograms, gaugehistograms,
+    //    summaries, info, stateset, exemplars, and suffix/untyped translation policies.
+    let multi_payload = concat!(
+        "# HELP req_seconds Request latency.\n",
+        "# TYPE req_seconds histogram\n",
+        "# UNIT req_seconds seconds\n",
+        "req_seconds_bucket{route=\"/a\",le=\"0.1\"} 2 1710000000.0 # {trace_id=\"0102030405060708090a0b0c0d0e0f10\",span_id=\"1112131415161718\",user=\"u1\"} 0.05 1709999999.5\n",
+        "req_seconds_bucket{route=\"/a\",le=\"0.5\"} 5 1710000000.0\n",
+        "req_seconds_bucket{route=\"/a\",le=\"+Inf\"} 6 1710000000.0\n",
+        "req_seconds_sum{route=\"/a\"} 1.25 1710000000.0\n",
+        "req_seconds_count{route=\"/a\"} 6 1710000000.0\n",
+        "req_seconds_created{route=\"/a\"} 1709000000.0\n",
+        "# TYPE queue_bytes gaugehistogram\n",
+        "queue_bytes_bucket{shard=\"0\",le=\"10\"} 5 1710000000.0\n",
+        "queue_bytes_bucket{shard=\"0\",le=\"+Inf\"} 6 1710000000.0\n",
+        "queue_bytes_gsum{shard=\"0\"} 42.0 1710000000.0\n",
+        "queue_bytes_gcount{shard=\"0\"} 6 1710000000.0\n",
+        "queue_bytes_bucket{shard=\"1\",le=\"+Inf\"} 3 1710000000.0\n",
+        "# HELP rpc_seconds RPC duration quantiles.\n",
+        "# TYPE rpc_seconds summary\n",
+        "# UNIT rpc_seconds seconds\n",
+        "rpc_seconds{service=\"auth\",quantile=\"0.5\"} 0.02 1710000000.0\n",
+        "rpc_seconds{service=\"auth\",quantile=\"0.99\"} 0.15 1710000000.0\n",
+        "rpc_seconds_sum{service=\"auth\"} 4.5 1710000000.0\n",
+        "rpc_seconds_count{service=\"auth\"} 100 1710000000.0\n",
+        "rpc_seconds_created{service=\"auth\"} 1709000000.0\n",
+        "# HELP calls_total Total calls.\n",
+        "# TYPE calls counter\n",
+        "calls_total{env=\"prod\"} 15 1710000000.0 # {trace_id=\"non-hex-id\"} 1.0 1709999999.0\n",
+        "calls_created{env=\"prod\"} 1709000000.0\n",
+        "# TYPE target info\n",
+        "target_info{version=\"1.2.3\"} 1 1710000000.0\n",
+        "# TYPE modeFeature stateset\n",
+        "modeFeature{modeFeature=\"enabled\"} 1 1710000000.0\n",
+        "# TYPE inferred_total unknown\n",
+        "inferred_total 7 1710000000.0\n",
+        "# EOF\n",
+    );
+    let policy_opts = DecodeOptions::new()
+        .with_counter_suffix_policy(CounterSuffixPolicy::Strip)
+        .with_unit_suffix_policy(UnitSuffixPolicy::Strip)
+        .with_untyped_policy(UntypedPolicy::InferFromSuffix);
+
+    let direct_records = direct_decoder
+        .decode(
+            multi_payload.as_bytes(),
+            &Format::OPEN_METRICS_1_0_0,
+            &policy_opts,
+        )
+        .expect("direct decode succeeds");
+    let direct_otlp = otap_to_otlp(&to_otap_arrow_records(&direct_records));
+
+    let view = view_decoder
+        .decode_view(
+            multi_payload.as_bytes(),
+            &Format::OPEN_METRICS_1_0_0,
+            &policy_opts,
+        )
+        .expect("decode_view succeeds");
+    let mut view_otap =
+        encode_metrics_otap_batch(&view).expect("encode_metrics_otap_batch succeeds");
+    view_otap
+        .encode_transport_optimized()
+        .expect("transport optimize on view batch succeeds");
+    view_otap
+        .decode_transport_optimized_ids()
+        .expect("transport decode IDs on view batch succeeds");
+    let view_otlp = otap_to_otlp(&view_otap);
+    assert_equivalent(&[direct_otlp], &[view_otlp]);
+
+    // 3. Upstream Prometheus and OpenMetrics fixtures.
+    let fixture_opts = DecodeOptions::new().with_timestamp_ms(1_700_000_000_000);
+    for (fixture, format) in [
+        ("alltypes.237mfs.nometa.prom.txt", Format::TEXT),
+        ("alltypes.237mfs.prom.txt", Format::TEXT),
+        ("alltypes.5mfs.om.txt", Format::OPEN_METRICS_1_0_0),
+        ("alltypes.bench.om.txt", Format::OPEN_METRICS_1_0_0),
+        ("histograms.bench.om.txt", Format::OPEN_METRICS_1_0_0),
+        ("ct.bench.om.txt", Format::OPEN_METRICS_1_0_0),
+        ("1histogram.om.txt", Format::OPEN_METRICS_1_0_0),
+        (
+            "TestOpenMetricsParse_UTF8.om.txt",
+            Format::OPEN_METRICS_1_0_0,
+        ),
+    ] {
+        let bytes = fs::read(root.join(fixture)).unwrap();
+        let expected_records = direct_decoder
+            .decode(&bytes, &format, &fixture_opts)
+            .unwrap_or_else(|err| panic!("{fixture} direct decode failed: {err}"));
+        let expected_otlp = otap_to_otlp(&to_otap_arrow_records(&expected_records));
+
+        let decoded_view = view_decoder
+            .decode_view(&bytes, &format, &fixture_opts)
+            .unwrap_or_else(|err| panic!("{fixture} decode_view failed: {err}"));
+        let mut actual_otap = encode_metrics_otap_batch(&decoded_view)
+            .unwrap_or_else(|err| panic!("{fixture} encode_metrics_otap_batch failed: {err}"));
+        actual_otap
+            .encode_transport_optimized()
+            .unwrap_or_else(|err| panic!("{fixture} view transport optimize failed: {err}"));
+        actual_otap
+            .decode_transport_optimized_ids()
+            .unwrap_or_else(|err| panic!("{fixture} view transport decode failed: {err}"));
+        let actual_otlp = otap_to_otlp(&actual_otap);
+        assert_equivalent(&[expected_otlp], &[actual_otlp]);
+    }
+
+    // 4. Streaming `DecodeStream::next_view` chunks fed into `encode_metrics_otap_batch`.
+    //    Use a 128-point chunk size (15 chunks across `alltypes.237mfs.prom.txt`) so the trailing
+    //    zero-sum `prometheus_tsdb_tombstone_cleanup_seconds` histogram shares a batch with
+    //    `prometheus_tsdb_compaction_duration_seconds`; upstream `encode_metrics_otap_batch`
+    //    configures `HistogramDataPoints.sum` with `default_values_optional: true`, which elides
+    //    the `sum` column (decoding back as `sum: None` in OTLP) if every histogram in a chunk has
+    //    `sum == 0.0`.
+    let full_237 = fs::read(root.join("alltypes.237mfs.prom.txt")).unwrap();
+    let full_expected = otap_to_otlp(&to_otap_arrow_records(
+        &direct_decoder
+            .decode(&full_237, &Format::TEXT, &fixture_opts)
+            .unwrap(),
+    ));
+    let stream_opts = fixture_opts.with_max_data_points_per_batch(128);
+    let mut stream = view_decoder.decode_stream(&full_237, &Format::TEXT, &stream_opts);
+    let mut streamed_view_otlp = Vec::new();
+    while let Some(chunk_res) = stream.next_view() {
+        let chunk_view = chunk_res.expect("streamed view chunk decodes");
+        let mut chunk_otap = encode_metrics_otap_batch(&chunk_view)
+            .expect("streamed view chunk encodes to OtapArrowRecords");
+        chunk_otap
+            .encode_transport_optimized()
+            .expect("streamed view chunk transport optimize succeeds");
+        chunk_otap
+            .decode_transport_optimized_ids()
+            .expect("streamed view chunk transport decode succeeds");
+        streamed_view_otlp.push(otap_to_otlp(&chunk_otap));
+    }
+    assert!(streamed_view_otlp.len() > 5);
+    assert_equivalent(&[full_expected], &streamed_view_otlp);
 }
