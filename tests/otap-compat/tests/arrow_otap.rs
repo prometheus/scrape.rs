@@ -955,3 +955,64 @@ fn decode_stream_chunks_validate_in_otap_and_handle_more_than_u16_max_metrics() 
     );
     assert!(matches!(boundary_metric.data, Some(metric::Data::Sum(_))));
 }
+
+#[test]
+fn univariate_metrics_resource_id_enables_otap_resource_attribute_upserts() {
+    use otel_arrow_dfe_pdata::otap::transform::{
+        AttributesTransform, LiteralValue, UpsertTransform, apply_attribute_transform,
+    };
+    use std::collections::BTreeMap;
+
+    let mut decoder = ArrowDecoder::new();
+    let decoded = decoder
+        .decode(
+            b"# TYPE up gauge\nup 1\n# TYPE requests_total counter\nrequests_total 5\n",
+            &Format::TEXT,
+            &DecodeOptions::new().with_timestamp_ms(1_700_000_000_000),
+        )
+        .expect("decode succeeds");
+
+    let mut otap = to_otap_arrow_records(&decoded);
+    let transform = AttributesTransform {
+        upsert: Some(UpsertTransform::new(BTreeMap::from([
+            (
+                "gcp.project_id".into(),
+                LiteralValue::Str("gpe-test-1".into()),
+            ),
+            ("service.name".into(), LiteralValue::Str("avalanche".into())),
+            (
+                "service.instance.id".into(),
+                LiteralValue::Str("10.0.0.1:9001".into()),
+            ),
+        ]))),
+        ..Default::default()
+    };
+
+    apply_attribute_transform(
+        &mut otap,
+        ArrowPayloadType::ResourceAttrs,
+        &transform,
+        false,
+    )
+    .expect("resource attribute upsert succeeds");
+
+    assert!(otap.get(ArrowPayloadType::ResourceAttrs).is_some());
+
+    otap.encode_transport_optimized()
+        .expect("transport optimize succeeds");
+    otap.decode_transport_optimized_ids()
+        .expect("transport decode IDs succeeds");
+
+    let OtlpProtoMessage::Metrics(otlp) = otap_to_otlp(&otap) else {
+        panic!("expected OTLP MetricsData");
+    };
+    assert_eq!(otlp.resource_metrics.len(), 1);
+    let res_attrs = &otlp.resource_metrics[0]
+        .resource
+        .as_ref()
+        .expect("resource present")
+        .attributes;
+    assert!(res_attrs.contains(&kv_str("gcp.project_id", "gpe-test-1")));
+    assert!(res_attrs.contains(&kv_str("service.name", "avalanche")));
+    assert!(res_attrs.contains(&kv_str("service.instance.id", "10.0.0.1:9001")));
+}

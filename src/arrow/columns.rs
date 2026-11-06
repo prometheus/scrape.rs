@@ -30,8 +30,8 @@ use super::schema::{
     OTAP_METRIC_TYPE_HISTOGRAM, OTAP_METRIC_TYPE_SUM, UTC_TIME_ZONE, ValEncoding, dp_attrs_schema,
     exemplars_schema, histogram_bucket_counts_item_field, histogram_dp_schema,
     histogram_explicit_bounds_item_field, metric_attrs_key_dict, metric_attrs_schema,
-    metric_attrs_type_val_dict, number_dp_schema, summary_dp_schema, summary_quantile_item_field,
-    summary_quantile_struct_fields, univariate_metrics_schema,
+    metric_attrs_type_val_dict, number_dp_schema, resource_struct_fields, summary_dp_schema,
+    summary_quantile_item_field, summary_quantile_struct_fields, univariate_metrics_schema,
 };
 
 /// Reusable scratch vectors used when materializing Arrow columns without reallocating.
@@ -356,6 +356,16 @@ impl MetricTable {
         scratch.u16_buf.extend((0..num_metrics).map(|i| i as u16));
         cols.push(Arc::new(UInt16Array::new(
             scalar_from_slice(&scratch.u16_buf),
+            None,
+        )));
+
+        scratch.u16_buf.clear();
+        scratch.u16_buf.resize(num_metrics, 0);
+        let res_ids: ArrayRef =
+            Arc::new(UInt16Array::new(scalar_from_slice(&scratch.u16_buf), None));
+        cols.push(Arc::new(StructArray::new(
+            resource_struct_fields(),
+            vec![res_ids],
             None,
         )));
 

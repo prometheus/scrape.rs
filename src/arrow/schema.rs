@@ -62,14 +62,30 @@ fn timestamp_ns_type() -> DataType {
     DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into()))
 }
 
+static RESOURCE_STRUCT_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        Field::new("id", DataType::UInt16, false).with_metadata(plain_id_metadata()),
+    ])
+});
+
+#[inline]
+pub(super) fn resource_struct_fields() -> Fields {
+    RESOURCE_STRUCT_FIELDS.clone()
+}
+
 fn build_univariate_metrics_schema(
     has_description: bool,
     has_unit: bool,
     has_temporality: bool,
     has_monotonic: bool,
 ) -> SchemaRef {
-    let mut fields = Vec::with_capacity(7);
+    let mut fields = Vec::with_capacity(8);
     fields.push(Field::new("id", DataType::UInt16, false).with_metadata(plain_id_metadata()));
+    fields.push(Field::new(
+        "resource",
+        DataType::Struct(RESOURCE_STRUCT_FIELDS.clone()),
+        false,
+    ));
     fields.push(Field::new("metric_type", DataType::UInt8, false));
     fields.push(Field::new("name", DataType::Utf8, false));
     if has_description {
