@@ -248,33 +248,42 @@ impl<'a> ScopeMetricsView for DecodedScopeMetricsView<'a> {
     }
 }
 
-/// Iterator over [`DecodedMetricView`] entries in a [`DecodedScopeMetricsView`].
-#[derive(Clone)]
-pub struct DecodedMetricIter<'a> {
-    decoder: &'a ArrowDecoder,
-    range: Range<usize>,
+macro_rules! impl_decoder_row_iter {
+    ($(#[$meta:meta])* $iter_name:ident => $view_name:ident) => {
+        $(#[$meta])*
+        #[derive(Clone)]
+        pub struct $iter_name<'a> {
+            decoder: &'a ArrowDecoder,
+            range: Range<usize>,
+        }
+
+        impl<'a> Iterator for $iter_name<'a> {
+            type Item = $view_name<'a>;
+
+            #[inline]
+            fn next(&mut self) -> Option<Self::Item> {
+                let row = self.range.next()?;
+                Some($view_name {
+                    decoder: self.decoder,
+                    row,
+                })
+            }
+
+            #[inline]
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                self.range.size_hint()
+            }
+        }
+
+        impl ExactSizeIterator for $iter_name<'_> {}
+        impl FusedIterator for $iter_name<'_> {}
+    };
 }
 
-impl<'a> Iterator for DecodedMetricIter<'a> {
-    type Item = DecodedMetricView<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let row = self.range.next()?;
-        Some(DecodedMetricView {
-            decoder: self.decoder,
-            row,
-        })
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.range.size_hint()
-    }
-}
-
-impl ExactSizeIterator for DecodedMetricIter<'_> {}
-impl FusedIterator for DecodedMetricIter<'_> {}
+impl_decoder_row_iter!(
+    /// Iterator over [`DecodedMetricView`] entries in a [`DecodedScopeMetricsView`].
+    DecodedMetricIter => DecodedMetricView
+);
 
 /// Zero-copy [`MetricView`] over a single metric family row in [`ArrowDecoder`].
 #[derive(Clone, Copy)]
@@ -505,33 +514,10 @@ impl<'a> SumView for DecodedSumView<'a> {
     }
 }
 
-/// Iterator over [`DecodedNumberDataPointView`] rows for a Gauge or Sum metric family.
-#[derive(Clone)]
-pub struct DecodedNumberDpIter<'a> {
-    decoder: &'a ArrowDecoder,
-    range: Range<usize>,
-}
-
-impl<'a> Iterator for DecodedNumberDpIter<'a> {
-    type Item = DecodedNumberDataPointView<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let row = self.range.next()?;
-        Some(DecodedNumberDataPointView {
-            decoder: self.decoder,
-            row,
-        })
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.range.size_hint()
-    }
-}
-
-impl ExactSizeIterator for DecodedNumberDpIter<'_> {}
-impl FusedIterator for DecodedNumberDpIter<'_> {}
+impl_decoder_row_iter!(
+    /// Iterator over [`DecodedNumberDataPointView`] rows for a Gauge or Sum metric family.
+    DecodedNumberDpIter => DecodedNumberDataPointView
+);
 
 /// Zero-copy [`NumberDataPointView`] over a single row in `NumberDpTable`.
 #[derive(Clone, Copy)]
@@ -634,33 +620,10 @@ impl<'a> HistogramView for DecodedHistogramView<'a> {
     }
 }
 
-/// Iterator over [`DecodedHistogramDataPointView`] rows for a Histogram metric family.
-#[derive(Clone)]
-pub struct DecodedHistogramDpIter<'a> {
-    decoder: &'a ArrowDecoder,
-    range: Range<usize>,
-}
-
-impl<'a> Iterator for DecodedHistogramDpIter<'a> {
-    type Item = DecodedHistogramDataPointView<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let row = self.range.next()?;
-        Some(DecodedHistogramDataPointView {
-            decoder: self.decoder,
-            row,
-        })
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.range.size_hint()
-    }
-}
-
-impl ExactSizeIterator for DecodedHistogramDpIter<'_> {}
-impl FusedIterator for DecodedHistogramDpIter<'_> {}
+impl_decoder_row_iter!(
+    /// Iterator over [`DecodedHistogramDataPointView`] rows for a Histogram metric family.
+    DecodedHistogramDpIter => DecodedHistogramDataPointView
+);
 
 /// Zero-copy [`HistogramDataPointView`] over a single row in `HistogramDpTable`.
 #[derive(Clone, Copy)]
@@ -947,33 +910,10 @@ impl<'a> SummaryView for DecodedSummaryView<'a> {
     }
 }
 
-/// Iterator over [`DecodedSummaryDataPointView`] rows for a Summary metric family.
-#[derive(Clone)]
-pub struct DecodedSummaryDpIter<'a> {
-    decoder: &'a ArrowDecoder,
-    range: Range<usize>,
-}
-
-impl<'a> Iterator for DecodedSummaryDpIter<'a> {
-    type Item = DecodedSummaryDataPointView<'a>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let row = self.range.next()?;
-        Some(DecodedSummaryDataPointView {
-            decoder: self.decoder,
-            row,
-        })
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.range.size_hint()
-    }
-}
-
-impl ExactSizeIterator for DecodedSummaryDpIter<'_> {}
-impl FusedIterator for DecodedSummaryDpIter<'_> {}
+impl_decoder_row_iter!(
+    /// Iterator over [`DecodedSummaryDataPointView`] rows for a Summary metric family.
+    DecodedSummaryDpIter => DecodedSummaryDataPointView
+);
 
 /// Zero-copy [`SummaryDataPointView`] over a single row in `SummaryDpTable`.
 #[derive(Clone, Copy)]
