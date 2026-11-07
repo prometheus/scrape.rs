@@ -154,19 +154,22 @@ pub(super) fn metric_attrs_schema() -> SchemaRef {
 static METRIC_ATTRS_KEY_DICT: LazyLock<ArrayRef> =
     LazyLock::new(|| Arc::new(StringArray::from(vec![PROMETHEUS_TYPE_METADATA_KEY])));
 
+/// Static string values for the `prometheus.type` metric metadata attribute, indexed by
+/// `MetricTable::attr_type_keys` (`0..=7`).
+pub(super) const PROMETHEUS_TYPE_VALUES: [&str; 8] = [
+    "unknown",
+    "counter",
+    "gauge",
+    "histogram",
+    "gaugehistogram",
+    "summary",
+    "info",
+    "stateset",
+];
+
 /// Static dictionary values for `prometheus.type` indexed by `0..=7`.
-static METRIC_ATTRS_TYPE_VAL_DICT: LazyLock<ArrayRef> = LazyLock::new(|| {
-    Arc::new(StringArray::from(vec![
-        "unknown",
-        "counter",
-        "gauge",
-        "histogram",
-        "gaugehistogram",
-        "summary",
-        "info",
-        "stateset",
-    ]))
-});
+static METRIC_ATTRS_TYPE_VAL_DICT: LazyLock<ArrayRef> =
+    LazyLock::new(|| Arc::new(StringArray::from(PROMETHEUS_TYPE_VALUES.to_vec())));
 
 #[inline]
 pub(super) fn metric_attrs_key_dict() -> ArrayRef {

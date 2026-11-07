@@ -41,21 +41,8 @@ use super::columns::{AttrTable, ExemplarTable};
 use super::intern::StringInterner;
 use super::schema::{
     OTAP_METRIC_TYPE_GAUGE, OTAP_METRIC_TYPE_HISTOGRAM, OTAP_METRIC_TYPE_SUM,
-    OTAP_METRIC_TYPE_SUMMARY, PROMETHEUS_TYPE_METADATA_KEY,
+    OTAP_METRIC_TYPE_SUMMARY, PROMETHEUS_TYPE_METADATA_KEY, PROMETHEUS_TYPE_VALUES,
 };
-
-/// Static string values for the `prometheus.type` metric metadata attribute, indexed by
-/// `MetricTable::attr_type_keys` (`0..=7`).
-const PROMETHEUS_TYPE_VALUES: [&[u8]; 8] = [
-    b"unknown",
-    b"counter",
-    b"gauge",
-    b"histogram",
-    b"gaugehistogram",
-    b"summary",
-    b"info",
-    b"stateset",
-];
 
 /// Zero-copy [`MetricsView`] borrowing the active batch staged inside an [`ArrowDecoder`].
 #[derive(Clone, Copy)]
@@ -358,8 +345,7 @@ impl<'a> MetricView for DecodedMetricView<'a> {
         let type_idx = usize::from(self.decoder.metrics.attr_type_keys[self.row]);
         let type_val = PROMETHEUS_TYPE_VALUES
             .get(type_idx)
-            .copied()
-            .unwrap_or(b"unknown");
+            .map_or(b"unknown" as &[u8], |s| s.as_bytes());
         std::iter::once(DecodedAttributeView {
             key: PROMETHEUS_TYPE_METADATA_KEY.as_bytes(),
             val: type_val,
