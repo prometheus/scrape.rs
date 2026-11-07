@@ -670,10 +670,10 @@ s{q="x",quantile="0.5"} 4.0
         Some(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
     );
 
-    assert_eq!(dec.num_dp.base.start_time.get_u64(0), 500_000_000);
-    assert_eq!(dec.num_dp.base.time.get_u64(0), 1_000_000_000);
-    assert_eq!(dec.num_dp.base.start_time.get_u64(2), 0);
-    assert_eq!(dec.num_dp.base.time.get_u64(2), 0);
+    assert_eq!(dec.num_dp.base.start_time.get_or_zero(0), 500_000_000);
+    assert_eq!(dec.num_dp.base.time.get_or_zero(0), 1_000_000_000);
+    assert_eq!(dec.num_dp.base.start_time.get_or_zero(2), 0);
+    assert_eq!(dec.num_dp.base.time.get_or_zero(2), 0);
 
     assert_eq!(dec.hist_dp.counts.get(0), Some(5));
     assert_eq!(dec.hist_dp.sums.get(0), Some(12.5));

@@ -511,7 +511,7 @@ impl SparseTimestampCol {
     }
 
     #[inline]
-    pub(super) fn get_u64(&self, row: usize) -> u64 {
+    pub(super) fn get_or_zero(&self, row: usize) -> u64 {
         if self.values.is_empty() || (!self.valid.is_empty() && !self.valid[row]) {
             0
         } else {

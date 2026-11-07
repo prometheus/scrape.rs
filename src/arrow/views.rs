@@ -563,12 +563,12 @@ impl<'a> NumberDataPointView for DecodedNumberDataPointView<'a> {
 
     #[inline]
     fn start_time_unix_nano(&self) -> u64 {
-        self.decoder.num_dp.base.start_time.get_u64(self.row)
+        self.decoder.num_dp.base.start_time.get_or_zero(self.row)
     }
 
     #[inline]
     fn time_unix_nano(&self) -> u64 {
-        self.decoder.num_dp.base.time.get_u64(self.row)
+        self.decoder.num_dp.base.time.get_or_zero(self.row)
     }
 
     #[inline]
@@ -712,12 +712,12 @@ impl<'a> HistogramDataPointView for DecodedHistogramDataPointView<'a> {
 
     #[inline]
     fn start_time_unix_nano(&self) -> u64 {
-        self.decoder.hist_dp.base.start_time.get_u64(self.row)
+        self.decoder.hist_dp.base.start_time.get_or_zero(self.row)
     }
 
     #[inline]
     fn time_unix_nano(&self) -> u64 {
-        self.decoder.hist_dp.base.time.get_u64(self.row)
+        self.decoder.hist_dp.base.time.get_or_zero(self.row)
     }
 
     #[inline]
@@ -1015,12 +1015,12 @@ impl<'a> SummaryDataPointView for DecodedSummaryDataPointView<'a> {
 
     #[inline]
     fn start_time_unix_nano(&self) -> u64 {
-        self.decoder.sum_dp.base.start_time.get_u64(self.row)
+        self.decoder.sum_dp.base.start_time.get_or_zero(self.row)
     }
 
     #[inline]
     fn time_unix_nano(&self) -> u64 {
-        self.decoder.sum_dp.base.time.get_u64(self.row)
+        self.decoder.sum_dp.base.time.get_or_zero(self.row)
     }
 
     #[inline]
