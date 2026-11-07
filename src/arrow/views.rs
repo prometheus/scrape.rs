@@ -116,7 +116,7 @@ pub struct DecodedResourceMetricsView<'a> {
 
 impl<'a> ResourceMetricsView for DecodedResourceMetricsView<'a> {
     type Resource<'res>
-        = DecodedEmptyResourceView
+        = EmptyView
     where
         Self: 'res;
 
@@ -148,12 +148,12 @@ impl<'a> ResourceMetricsView for DecodedResourceMetricsView<'a> {
     }
 }
 
-/// Uninhabited/empty [`ResourceView`] and [`InstrumentationScopeView`] placeholder for scrape
-/// batches, which carry no embedded OTLP resource or scope descriptors in exposition wire format.
+/// Empty [`ResourceView`] and [`InstrumentationScopeView`] unit view for scrape batches, which
+/// carry no embedded OTLP resource or scope descriptors in exposition wire format.
 #[derive(Clone, Copy, Debug)]
-pub struct DecodedEmptyResourceView;
+pub struct EmptyView;
 
-impl ResourceView for DecodedEmptyResourceView {
+impl ResourceView for EmptyView {
     type Attribute<'att>
         = DecodedAttributeView<'att>
     where
@@ -175,7 +175,7 @@ impl ResourceView for DecodedEmptyResourceView {
     }
 }
 
-impl InstrumentationScopeView for DecodedEmptyResourceView {
+impl InstrumentationScopeView for EmptyView {
     type Attribute<'att>
         = DecodedAttributeView<'att>
     where
@@ -215,7 +215,7 @@ pub struct DecodedScopeMetricsView<'a> {
 
 impl<'a> ScopeMetricsView for DecodedScopeMetricsView<'a> {
     type Scope<'scp>
-        = DecodedEmptyResourceView
+        = EmptyView
     where
         Self: 'scp;
 
