@@ -160,6 +160,7 @@ impl<'a> ResourceMetricsView for DecodedResourceMetricsView<'a> {
 /// Empty [`ResourceView`] and [`InstrumentationScopeView`] unit view for scrape batches, which
 /// carry no embedded OTLP resource or scope descriptors in exposition wire format.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct EmptyView;
 
 impl ResourceView for EmptyView {
@@ -373,6 +374,7 @@ impl<'a> MetricView for DecodedMetricView<'a> {
 
 /// Zero-copy [`DataView`] enum dispatching across Gauge, Sum, Histogram, and Summary metric data.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum DecodedDataView<'a> {
     /// Gauge data points.
     Gauge(DecodedGaugeView<'a>),
@@ -747,6 +749,7 @@ impl<'a> HistogramDataPointView for DecodedHistogramDataPointView<'a> {
 /// Placeholder [`ExponentialHistogramView`] (exponential histograms are not produced by
 /// [`ArrowDecoder`] yet).
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct DecodedExpHistogramView;
 
 impl ExponentialHistogramView for DecodedExpHistogramView {
@@ -773,6 +776,7 @@ impl ExponentialHistogramView for DecodedExpHistogramView {
 
 /// Placeholder [`ExponentialHistogramDataPointView`].
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct DecodedExpHistogramDataPointView;
 
 impl ExponentialHistogramDataPointView for DecodedExpHistogramDataPointView {
@@ -874,6 +878,7 @@ impl ExponentialHistogramDataPointView for DecodedExpHistogramDataPointView {
 
 /// Placeholder [`BucketsView`].
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct DecodedBucketsView;
 
 impl BucketsView for DecodedBucketsView {
