@@ -1283,11 +1283,16 @@ impl DecodeStream<'_, '_> {
             Ok(true) => Some(Ok(())),
             Ok(false) => None,
             Err(err) => {
-                self.done = true;
-                self.decoder.reset_scrape();
+                self.fail();
                 Some(Err(err))
             }
         }
+    }
+
+    #[cold]
+    fn fail(&mut self) {
+        self.done = true;
+        self.decoder.reset_scrape();
     }
 }
 
@@ -1299,8 +1304,7 @@ impl Iterator for DecodeStream<'_, '_> {
             Ok(()) => {
                 let res = self.decoder.finish_batches(self.default_ts_ns.is_some());
                 if res.is_err() {
-                    self.done = true;
-                    self.decoder.reset_scrape();
+                    self.fail();
                 }
                 Some(res)
             }
