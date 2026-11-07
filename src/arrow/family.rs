@@ -653,7 +653,7 @@ impl FamilyAssembly {
                     })?;
                     sum_dp.quantile_offsets.push(q_off);
                 }
-                metrics.dp_ranges[parent_id as usize].1 = sum_dp.base.len() as u32;
+                metrics.set_dp_end(parent_id, sum_dp.base.len() as u32);
             }
             MetricType::Histogram | MetricType::GaugeHistogram => {
                 if hist_dp.bucket_offsets.is_empty() {
@@ -739,7 +739,7 @@ impl FamilyAssembly {
                         );
                     }
                 }
-                metrics.dp_ranges[parent_id as usize].1 = hist_dp.base.len() as u32;
+                metrics.set_dp_end(parent_id, hist_dp.base.len() as u32);
             }
             _ => {}
         }

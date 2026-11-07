@@ -736,7 +736,7 @@ impl ArrowDecoder {
             .base
             .push(parent_id, start_ts_ns, resolved_ts_ns);
         self.num_dp.values.push(value);
-        self.metrics.dp_ranges[parent_id as usize].1 = dp_id + 1;
+        self.metrics.set_dp_end(parent_id, dp_id + 1);
         Ok(())
     }
 

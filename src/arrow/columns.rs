@@ -351,6 +351,11 @@ impl MetricTable {
     }
 
     #[inline]
+    pub(super) fn set_dp_end(&mut self, parent_id: u16, end: u32) {
+        self.dp_ranges[parent_id as usize].1 = end;
+    }
+
+    #[inline]
     pub(super) fn len(&self) -> usize {
         self.metric_types.len()
     }
