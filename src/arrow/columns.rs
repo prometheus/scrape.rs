@@ -731,7 +731,7 @@ pub(super) struct AttrTable {
     pub(super) parent_ids: Vec<u32>,
     pub(super) pairs: Vec<(u32, u32)>,
     /// CSR-style row offsets indexed by `parent_id` so `range_for_parent` slices a parent's
-    /// contiguous attribute run in $O(1)$ without scanning `parent_ids`. Stays empty when no
+    /// contiguous attribute run in O(1) without scanning `parent_ids`. Stays empty when no
     /// attributes are present in the table.
     pub(super) parent_offsets: Vec<u32>,
 }

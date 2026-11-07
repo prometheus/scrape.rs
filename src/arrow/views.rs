@@ -17,7 +17,7 @@
 //! [`DecodedMetricsView`] borrows [`ArrowDecoder`]'s columnar staging tables and string interners
 //! directly after parsing and family assembly without materializing intermediate Arrow
 //! [`arrow_array::RecordBatch`]es or per-sample heap allocations. Downstream callers such as
-//! `otel-arrow-dfe-pdata`'s `encode_metrics_otap_batch` can traverse the view hierarchy in $O(1)$
+//! `otel-arrow-dfe-pdata`'s `encode_metrics_otap_batch` can traverse the view hierarchy in O(1)
 //! per family, data point, exemplar, and attribute.
 
 use std::iter::{Copied, Empty, FusedIterator, Once, Zip};
