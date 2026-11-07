@@ -17,7 +17,7 @@
 //!
 //! Recommended CLI invocation:
 //! ```sh
-//! cargo bench --manifest-path tests/otap-compat/Cargo.toml --bench otap_encode -- -bench '^BenchmarkOtapEncode' -benchtime 500ms -count 6 -cpu 2 -benchmem | tee ${bench}.txt
+//! cargo bench --manifest-path tests/otap-compat/Cargo.toml --bench otap_encode -- -bench '^BenchmarkOtapEncode' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt
 //! ```
 
 use std::fs;
