@@ -810,7 +810,20 @@ s_count{q="p"} 10
     assert_eq!(hdp.sum(), Some(9.25));
     assert_eq!(hdp.explicit_bounds().collect::<Vec<_>>(), vec![1.0]);
     assert_eq!(hdp.bucket_counts().collect::<Vec<_>>(), vec![2, 3]);
-    assert_eq!(hdp.exemplars().count(), 1);
+    let hdp_attr = hdp.attributes().next().unwrap();
+    assert_eq!(hdp_attr.key(), b"svc");
+    assert_eq!(hdp_attr.value().unwrap().as_string(), Some(&b"api"[..]));
+    let hex0 = hdp.exemplars().next().unwrap();
+    assert_eq!(hex0.value(), Some(Value::Double(0.5)));
+    assert_eq!(hex0.time_unix_nano(), 3_000_000_000);
+    assert_eq!(
+        hex0.span_id(),
+        Some(&[0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18])
+    );
+    assert_eq!(hex0.trace_id(), None);
+    let hex0_attr = hex0.filtered_attributes().next().unwrap();
+    assert_eq!(hex0_attr.key(), b"route");
+    assert_eq!(hex0_attr.value().unwrap().as_string(), Some(&b"/v1"[..]));
 
     // 3: Summary
     let d3 = metrics[3].data().unwrap();
@@ -818,6 +831,9 @@ s_count{q="p"} 10
     let sdp = s3.data_points().next().unwrap();
     assert_eq!(sdp.count(), 10);
     assert_eq!(sdp.sum(), 15.0);
+    let sdp_attr = sdp.attributes().next().unwrap();
+    assert_eq!(sdp_attr.key(), b"q");
+    assert_eq!(sdp_attr.value().unwrap().as_string(), Some(&b"p"[..]));
     let qvs: Vec<_> = sdp
         .quantile_values()
         .map(|qv| (qv.quantile(), qv.value()))
@@ -835,5 +851,42 @@ s_count{q="p"} 10
         let v = res.unwrap();
         chunk_counts.push((v.num_metrics(), v.num_data_points()));
     }
+    drop(stream);
     assert_eq!(chunk_counts, vec![(2, 2), (2, 2)]);
+
+    // Verify `decode_view` and `DecodeStream::next_view` error paths reset the staged batch.
+    assert!(matches!(
+        dec.decode_view(b"m1 1\nm2{a=\"1\",a=\"2\"} 2\n", &Format::TEXT, &opts),
+        Err(DecodeError::DuplicateLabel { .. })
+    ));
+    assert!(dec.view().is_empty());
+
+    let mut bad_fmt_stream = dec.decode_stream(b"m 1\n", &Format::UNKNOWN, &opts);
+    assert!(matches!(
+        bad_fmt_stream.next_view(),
+        Some(Err(DecodeError::UnsupportedFormat(_)))
+    ));
+    assert!(bad_fmt_stream.next_view().is_none());
+    drop(bad_fmt_stream);
+
+    let mut mid_err_stream = dec.decode_stream(
+        b"m{a=\"1\"} 1\nm{a=\"2\"} 2\n# HELP m late\nm{a=\"3\"} 3\n",
+        &Format::TEXT,
+        &opts,
+    );
+    assert_eq!(
+        mid_err_stream
+            .next_view()
+            .unwrap()
+            .unwrap()
+            .num_data_points(),
+        2
+    );
+    assert!(matches!(
+        mid_err_stream.next_view(),
+        Some(Err(DecodeError::DuplicateOrLateHelp { .. }))
+    ));
+    assert!(mid_err_stream.next_view().is_none());
+    drop(mid_err_stream);
+    assert!(dec.view().is_empty());
 }
