@@ -735,7 +735,8 @@ impl<'a> HistogramDataPointView for DecodedHistogramDataPointView<'a> {
     }
 }
 
-/// Placeholder [`ExponentialHistogramView`] (native histograms will be populated in Phase 3).
+/// Placeholder [`ExponentialHistogramView`] (exponential histograms are not produced by
+/// [`ArrowDecoder`] yet).
 #[derive(Clone, Copy, Debug)]
 pub struct DecodedExpHistogramView;
 
