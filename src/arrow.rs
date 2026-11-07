@@ -267,9 +267,15 @@ impl ArrowDecoder {
     /// [`otel_arrow_dfe_pdata_views::views::metrics::MetricsView`].
     ///
     /// Unlike [`ArrowDecoder::decode`], `decode_view` skips materializing Arrow
-    /// [`arrow_array::RecordBatch`]es, allowing downstream OTAP encoders such as
-    /// `otel_arrow_dfe_pdata::encode::encode_metrics_otap_batch` to traverse the staged metric
-    /// families, data points, exemplars, and interned attributes directly.
+    /// [`arrow_array::RecordBatch`]es, allowing downstream [`MetricsView`] consumers to traverse
+    /// the staged metric families, data points, exemplars, and interned attributes directly.
+    /// Callers that need OTAP Arrow [`arrow_array::RecordBatch`]es should prefer
+    /// [`ArrowDecoder::decode`] (or [`DecodeStream::next`]), which builds dictionary-encoded
+    /// Arrow columns directly from the decoder's interners and is faster and lower-allocation
+    /// than passing [`DecodedMetricsView`] through
+    /// `otel_arrow_dfe_pdata::encode::encode_metrics_otap_batch`.
+    ///
+    /// [`MetricsView`]: otel_arrow_dfe_pdata_views::views::metrics::MetricsView
     ///
     /// # Errors
     ///
