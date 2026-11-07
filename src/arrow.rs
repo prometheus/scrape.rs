@@ -275,6 +275,12 @@ impl ArrowDecoder {
     /// than passing [`DecodedMetricsView`] through
     /// `otel_arrow_dfe_pdata::encode::encode_metrics_otap_batch`.
     ///
+    /// Note that [`views::DecodedHistogramDataPointView::sum`] preserves explicit `Some(0.0)`
+    /// histogram sums (matching [`ArrowDecoder::decode`]), whereas passing the view into
+    /// `otel_arrow_dfe_pdata::encode::encode_metrics_otap_batch` elides the
+    /// `HistogramDataPoints.sum` column when every histogram in the batch has `sum == 0.0`
+    /// because upstream configures that column with `default_values_optional: true`.
+    ///
     /// [`MetricsView`]: otel_arrow_dfe_pdata_views::views::metrics::MetricsView
     ///
     /// # Errors
@@ -1263,6 +1269,10 @@ impl DecodeStream<'_, '_> {
     /// Advances the stream to the next bounded chunk and returns a zero-copy
     /// [`DecodedMetricsView`] borrowing the staged batch without materializing Arrow
     /// [`arrow_array::RecordBatch`]es.
+    ///
+    /// See [`ArrowDecoder::decode_view`] for notes on `HistogramDataPoints.sum` elision when
+    /// encoding chunks where every histogram has `sum == 0.0` via
+    /// `otel_arrow_dfe_pdata::encode::encode_metrics_otap_batch`.
     pub fn next_view(&mut self) -> Option<Result<DecodedMetricsView<'_>, DecodeError>> {
         match self.step_chunk() {
             Some(Ok(())) => Some(Ok(self.decoder.view())),
