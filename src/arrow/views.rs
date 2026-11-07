@@ -20,7 +20,7 @@
 //! `otel-arrow-dfe-pdata`'s `encode_metrics_otap_batch` can traverse the view hierarchy in $O(1)$
 //! per family, data point, exemplar, and attribute.
 
-use std::iter::{Copied, Empty, FusedIterator, Once};
+use std::iter::{Copied, Empty, FusedIterator, Once, Zip};
 use std::ops::Range;
 use std::slice;
 
@@ -978,9 +978,9 @@ impl<'a> SummaryDataPointView for DecodedSummaryDataPointView<'a> {
         let start = self.decoder.sum_dp.quantile_offsets[self.row] as usize;
         let end = self.decoder.sum_dp.quantile_offsets[self.row + 1] as usize;
         DecodedQuantileIter {
-            bounds: &self.decoder.sum_dp.quantile_bounds[start..end],
-            vals: &self.decoder.sum_dp.quantile_vals[start..end],
-            pos: 0,
+            iter: self.decoder.sum_dp.quantile_bounds[start..end]
+                .iter()
+                .zip(self.decoder.sum_dp.quantile_vals[start..end].iter()),
         }
     }
 
@@ -993,9 +993,7 @@ impl<'a> SummaryDataPointView for DecodedSummaryDataPointView<'a> {
 /// Iterator over [`DecodedValueAtQuantileView`] entries for a Summary data point.
 #[derive(Clone)]
 pub struct DecodedQuantileIter<'a> {
-    bounds: &'a [f64],
-    vals: &'a [f64],
-    pos: usize,
+    iter: Zip<slice::Iter<'a, f64>, slice::Iter<'a, f64>>,
 }
 
 impl Iterator for DecodedQuantileIter<'_> {
@@ -1003,21 +1001,13 @@ impl Iterator for DecodedQuantileIter<'_> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.bounds.len() {
-            return None;
-        }
-        let item = DecodedValueAtQuantileView {
-            quantile: self.bounds[self.pos],
-            value: self.vals[self.pos],
-        };
-        self.pos += 1;
-        Some(item)
+        let (&quantile, &value) = self.iter.next()?;
+        Some(DecodedValueAtQuantileView { quantile, value })
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let rem = self.bounds.len() - self.pos;
-        (rem, Some(rem))
+        self.iter.size_hint()
     }
 }
 
@@ -1146,10 +1136,9 @@ impl<'a> ExemplarView for DecodedExemplarView<'a> {
 /// Iterator over [`DecodedAttributeView`] key-value pairs for a single parent row.
 #[derive(Clone)]
 pub struct DecodedAttrIter<'a> {
-    pairs: &'a [(u32, u32)],
+    pairs: slice::Iter<'a, (u32, u32)>,
     key_interner: &'a StringInterner,
     val_interner: &'a StringInterner,
-    pos: usize,
 }
 
 impl<'a> DecodedAttrIter<'a> {
@@ -1162,10 +1151,9 @@ impl<'a> DecodedAttrIter<'a> {
     ) -> Self {
         let range = table.range_for_parent(parent_row);
         Self {
-            pairs: &table.pairs[range],
+            pairs: table.pairs[range].iter(),
             key_interner,
             val_interner,
-            pos: 0,
         }
     }
 }
@@ -1175,11 +1163,7 @@ impl<'a> Iterator for DecodedAttrIter<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.pairs.len() {
-            return None;
-        }
-        let (key_id, val_id) = self.pairs[self.pos];
-        self.pos += 1;
+        let &(key_id, val_id) = self.pairs.next()?;
         Some(DecodedAttributeView {
             key: self.key_interner.get_bytes(key_id),
             val: self.val_interner.get_bytes(val_id),
@@ -1188,8 +1172,7 @@ impl<'a> Iterator for DecodedAttrIter<'a> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let rem = self.pairs.len() - self.pos;
-        (rem, Some(rem))
+        self.pairs.size_hint()
     }
 }
 
