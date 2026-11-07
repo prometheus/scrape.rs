@@ -1208,18 +1208,12 @@ impl<'a> ExemplarView for DecodedExemplarView<'a> {
 
     #[inline]
     fn span_id(&self) -> Option<&SpanId> {
-        self.table
-            .span_ids
-            .get(self.row)
-            .filter(|id| **id != [0u8; 8])
+        self.table.span_ids.get(self.row)
     }
 
     #[inline]
     fn trace_id(&self) -> Option<&TraceId> {
-        self.table
-            .trace_ids
-            .get(self.row)
-            .filter(|id| **id != [0u8; 16])
+        self.table.trace_ids.get(self.row)
     }
 }
 

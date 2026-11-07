@@ -1026,7 +1026,9 @@ impl ArrowDecoder {
                 seen_span_id = true;
                 let val = unescape_bytes_into(raw_val, true, &mut self.unescape_buf);
                 if let Some(parsed) = parse_hex_array::<8>(val) {
-                    span_id = Some(parsed);
+                    if parsed != [0u8; 8] {
+                        span_id = Some(parsed);
+                    }
                     continue;
                 }
             } else if key == b"trace_id" {
@@ -1039,7 +1041,9 @@ impl ArrowDecoder {
                 seen_trace_id = true;
                 let val = unescape_bytes_into(raw_val, true, &mut self.unescape_buf);
                 if let Some(parsed) = parse_hex_array::<16>(val) {
-                    trace_id = Some(parsed);
+                    if parsed != [0u8; 16] {
+                        trace_id = Some(parsed);
+                    }
                     continue;
                 }
             }

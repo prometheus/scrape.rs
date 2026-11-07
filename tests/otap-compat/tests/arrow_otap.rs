@@ -1065,6 +1065,7 @@ fn pdata_views_encode_metrics_otap_batch_matches_direct_decode_across_fixtures_a
         "# HELP calls_total Total calls.\n",
         "# TYPE calls counter\n",
         "calls_total{env=\"prod\"} 15 1710000000.0 # {trace_id=\"non-hex-id\"} 1.0 1709999999.0\n",
+        "calls_total{env=\"staging\"} 3 1710000000.0 # {trace_id=\"00000000000000000000000000000000\",span_id=\"0000000000000000\"} 1.0 1709999999.0\n",
         "calls_created{env=\"prod\"} 1709000000.0\n",
         "# TYPE target info\n",
         "target_info{version=\"1.2.3\"} 1 1710000000.0\n",
