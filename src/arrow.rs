@@ -297,6 +297,10 @@ impl ArrowDecoder {
     }
 
     /// Returns a zero-copy [`DecodedMetricsView`] over the metric batch currently staged in `self`.
+    ///
+    /// The returned view borrows `self`'s reusable staging tables and string interners, which are
+    /// cleared and overwritten on the next decode or stream step; callers must copy or encode any
+    /// slices they wish to keep across scrapes.
     #[inline]
     #[must_use]
     pub fn view(&self) -> DecodedMetricsView<'_> {
@@ -1269,6 +1273,10 @@ impl DecodeStream<'_, '_> {
     /// Advances the stream to the next bounded chunk and returns a zero-copy
     /// [`DecodedMetricsView`] borrowing the staged batch without materializing Arrow
     /// [`arrow_array::RecordBatch`]es.
+    ///
+    /// The returned view borrows the decoder's reusable per-chunk staging buffers, which are
+    /// cleared and overwritten on the next [`DecodeStream::next`] or [`DecodeStream::next_view`]
+    /// call; callers must copy or encode any values they need to retain across chunks.
     ///
     /// See [`ArrowDecoder::decode_view`] for notes on `HistogramDataPoints.sum` elision when
     /// encoding chunks where every histogram has `sum == 0.0` via

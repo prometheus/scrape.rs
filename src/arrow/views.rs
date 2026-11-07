@@ -45,6 +45,15 @@ use super::schema::{
 };
 
 /// Zero-copy [`MetricsView`] borrowing the active batch staged inside an [`ArrowDecoder`].
+///
+/// # Buffer reuse and lifetime
+///
+/// All child views and byte slices (`Str<'_>`) yielded by [`DecodedMetricsView`] borrow
+/// [`ArrowDecoder`]'s reusable per-batch staging tables and string interner arenas directly. Those
+/// backing buffers are cleared and overwritten on the next [`ArrowDecoder::decode`],
+/// [`ArrowDecoder::decode_view`], [`ArrowDecoder::decode_stream`], [`super::DecodeStream::next`],
+/// or [`super::DecodeStream::next_view`] call, so callers must copy or encode any values they need
+/// to retain beyond the lifetime of this view borrow.
 #[derive(Clone, Copy)]
 pub struct DecodedMetricsView<'a> {
     decoder: &'a ArrowDecoder,
