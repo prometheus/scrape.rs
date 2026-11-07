@@ -311,7 +311,10 @@ impl ArrowDecoder {
             &mut done,
         );
         parser.take_scratch_into(self);
-        res?;
+        if let Err(err) = res {
+            self.reset_scrape();
+            return Err(err);
+        }
         Ok(default_ts_ns.is_some())
     }
 
