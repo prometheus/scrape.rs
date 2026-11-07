@@ -775,14 +775,12 @@ impl AttrTable {
     #[inline]
     pub(super) fn push(&mut self, parent_id: u32, key_id: u32, val_id: u32) {
         let start_idx = self.pairs.len();
-        let end_idx = start_idx + 1;
-        let p_idx = parent_id as usize;
-        if self.parent_offsets.len() <= p_idx + 1 {
-            self.parent_offsets.resize(p_idx + 1, start_idx as u32);
-            self.parent_offsets.push(end_idx as u32);
-        } else {
-            self.parent_offsets[p_idx + 1] = end_idx as u32;
-        }
+        record_csr_range(
+            &mut self.parent_offsets,
+            parent_id,
+            start_idx,
+            start_idx + 1,
+        );
         self.parent_ids.push(parent_id);
         self.pairs.push((key_id, val_id));
     }
@@ -793,14 +791,12 @@ impl AttrTable {
             return;
         }
         let start_idx = self.pairs.len();
-        let end_idx = start_idx + attrs.len();
-        let p_idx = parent_id as usize;
-        if self.parent_offsets.len() <= p_idx + 1 {
-            self.parent_offsets.resize(p_idx + 1, start_idx as u32);
-            self.parent_offsets.push(end_idx as u32);
-        } else {
-            self.parent_offsets[p_idx + 1] = end_idx as u32;
-        }
+        record_csr_range(
+            &mut self.parent_offsets,
+            parent_id,
+            start_idx,
+            start_idx + attrs.len(),
+        );
         self.parent_ids
             .extend(std::iter::repeat_n(parent_id, attrs.len()));
         self.pairs.extend_from_slice(attrs);
@@ -822,6 +818,22 @@ impl AttrTable {
             dp_attrs_schema(enc.key_enc, enc.val_enc),
             vec![parent_id_arr, key_arr, type_arr, val_arr],
         )?))
+    }
+}
+
+#[inline]
+fn record_csr_range(offsets: &mut Vec<u32>, parent_id: u32, start_idx: usize, end_idx: usize) {
+    let p_idx = parent_id as usize;
+    debug_assert!(
+        offsets.len() <= p_idx + 2,
+        "CSR parent_id {parent_id} arrived out of order (offsets len {})",
+        offsets.len()
+    );
+    if offsets.len() <= p_idx + 1 {
+        offsets.resize(p_idx + 1, start_idx as u32);
+        offsets.push(end_idx as u32);
+    } else {
+        offsets[p_idx + 1] = end_idx as u32;
     }
 }
 
@@ -966,13 +978,7 @@ impl ExemplarTable {
         trace_id: Option<[u8; 16]>,
     ) {
         let ex_idx = self.parent_ids.len();
-        let dp_idx = parent_id as usize;
-        if self.dp_offsets.len() <= dp_idx + 1 {
-            self.dp_offsets.resize(dp_idx + 1, ex_idx as u32);
-            self.dp_offsets.push((ex_idx + 1) as u32);
-        } else {
-            self.dp_offsets[dp_idx + 1] = (ex_idx + 1) as u32;
-        }
+        record_csr_range(&mut self.dp_offsets, parent_id, ex_idx, ex_idx + 1);
         self.parent_ids.push(parent_id);
         self.timestamps.push(ts_ns);
         self.values.push(value);
