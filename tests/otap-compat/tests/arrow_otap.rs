@@ -34,9 +34,10 @@ use otel_arrow_dfe_pdata::schema::{
 use otel_arrow_dfe_pdata::testing::equiv::assert_equivalent;
 use otel_arrow_dfe_pdata::testing::round_trip::{otap_to_otlp, to_metrics_data};
 use prometheus_expfmt::arrow::{
-    ArrowDecoder, CounterSuffixPolicy, DecodeBudget, DecodeCursor, DecodeError, DecodeOptions,
-    DecodeStep, MetricPayloadType, OtapMetricRecords, PROMETHEUS_TYPE_METADATA_KEY,
-    UnitSuffixPolicy, UntypedPolicy,
+    ArrowDecoder, CounterSuffixPolicy, DATA_POINT_FLAG_NO_RECORDED_VALUE, DecodeBudget,
+    DecodeCursor, DecodeError, DecodeOptions, DecodeStep, MetricPayloadType, OtapMetricRecords,
+    PROMETHEUS_TYPE_METADATA_KEY, STALE_NAN, StalenessTracker, UnitSuffixPolicy, UntypedPolicy,
+    is_stale_nan,
 };
 use prometheus_expfmt::format::Format;
 
@@ -1202,4 +1203,157 @@ fn cooperative_decode_bounds_local_set_timer_scheduling_lateness_and_validates_i
         assert_equivalent(std::slice::from_ref(&expected_otlp), &[job_otlp]);
         assert_equivalent(&[expected_otlp], &streamed_otlp);
     });
+}
+
+#[test]
+fn staleness_tracker_and_flags_round_trip_through_otap_and_otlp() {
+    let mut decoder = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+
+    let scrape1 = concat!(
+        "# HELP req_total Total requests.\n",
+        "# TYPE req_total counter\n",
+        "req_total{instance=\"a\",job=\"api\"} 10\n",
+        "req_total{instance=\"b\",job=\"api\"} 20\n",
+        "# HELP rpc_seconds RPC duration.\n",
+        "# TYPE rpc_seconds summary\n",
+        "rpc_seconds{service=\"auth\",quantile=\"0.5\"} 0.02\n",
+        "rpc_seconds_sum{service=\"auth\"} 4.5\n",
+        "rpc_seconds_count{service=\"auth\"} 100\n",
+        "# HELP lat_seconds Latency histogram.\n",
+        "# TYPE lat_seconds histogram\n",
+        "lat_seconds_bucket{route=\"/v1\",le=\"0.1\"} 2\n",
+        "lat_seconds_bucket{route=\"/v1\",le=\"+Inf\"} 5\n",
+        "lat_seconds_sum{route=\"/v1\"} 1.25\n",
+        "lat_seconds_count{route=\"/v1\"} 5\n",
+    );
+
+    let opts1 = DecodeOptions::new().with_timestamp_ms(1_700_000_000_000);
+    let rec1 = decoder
+        .decode_with_staleness(scrape1.as_bytes(), &Format::TEXT, &opts1, &mut tracker)
+        .expect("scrape 1 decodes");
+    assert_matches_otap_schema(&rec1);
+    assert_eq!(tracker.active_series_len(), 4);
+
+    // Scrape 2 omits `req_total{instance="b",job="api"}`, `rpc_seconds{service="auth"}`, and
+    // `lat_seconds{route="/v1"}`, leaving only `req_total{instance="a",job="api"}` live.
+    let scrape2 = concat!(
+        "# HELP req_total Total requests.\n",
+        "# TYPE req_total counter\n",
+        "req_total{instance=\"a\",job=\"api\"} 15\n",
+    );
+    let opts2 = DecodeOptions::new().with_timestamp_ms(1_700_000_015_000);
+    let rec2 = decoder
+        .decode_with_staleness(scrape2.as_bytes(), &Format::TEXT, &opts2, &mut tracker)
+        .expect("scrape 2 decodes with staleness");
+    assert_eq!(tracker.active_series_len(), 1);
+
+    let mut otap2 = to_otap_arrow_records(&rec2);
+    let plain_otlp2 = otap_to_otlp(&otap2);
+
+    otap2
+        .encode_transport_optimized()
+        .expect("transport optimize succeeds on batches with flags");
+    otap2
+        .decode_transport_optimized_ids()
+        .expect("transport decode IDs succeeds on batches with flags");
+    let round_tripped_otlp2 = otap_to_otlp(&otap2);
+
+    let ts2_ns = 1_700_000_015_000_000_000_u64;
+    let expected2 = OtlpProtoMessage::Metrics(to_metrics_data(vec![
+        Metric {
+            name: "req_total".to_owned(),
+            description: "Total requests.".to_owned(),
+            unit: String::new(),
+            metadata: vec![kv_str(PROMETHEUS_TYPE_METADATA_KEY, "counter")],
+            data: Some(metric::Data::Sum(Sum {
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                is_monotonic: true,
+                data_points: vec![
+                    number_dp(&[("instance", "a"), ("job", "api")], ts2_ns, 15.0),
+                    NumberDataPoint {
+                        attributes: vec![kv_str("instance", "b"), kv_str("job", "api")],
+                        start_time_unix_nano: 0,
+                        time_unix_nano: ts2_ns,
+                        exemplars: Vec::new(),
+                        flags: DATA_POINT_FLAG_NO_RECORDED_VALUE,
+                        value: Some(number_data_point::Value::AsDouble(STALE_NAN)),
+                    },
+                ],
+            })),
+        },
+        Metric {
+            name: "rpc_seconds".to_owned(),
+            description: "RPC duration.".to_owned(),
+            unit: String::new(),
+            metadata: vec![kv_str(PROMETHEUS_TYPE_METADATA_KEY, "summary")],
+            data: Some(metric::Data::Summary(Summary {
+                data_points: vec![SummaryDataPoint {
+                    attributes: vec![kv_str("service", "auth")],
+                    start_time_unix_nano: 0,
+                    time_unix_nano: ts2_ns,
+                    count: 0,
+                    sum: STALE_NAN,
+                    quantile_values: Vec::new(),
+                    flags: DATA_POINT_FLAG_NO_RECORDED_VALUE,
+                }],
+            })),
+        },
+        Metric {
+            name: "lat_seconds".to_owned(),
+            description: "Latency histogram.".to_owned(),
+            unit: String::new(),
+            metadata: vec![kv_str(PROMETHEUS_TYPE_METADATA_KEY, "histogram")],
+            data: Some(metric::Data::Histogram(Histogram {
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                data_points: vec![HistogramDataPoint {
+                    attributes: vec![kv_str("route", "/v1")],
+                    start_time_unix_nano: 0,
+                    time_unix_nano: ts2_ns,
+                    count: 0,
+                    sum: Some(STALE_NAN),
+                    bucket_counts: Vec::new(),
+                    explicit_bounds: Vec::new(),
+                    exemplars: Vec::new(),
+                    flags: DATA_POINT_FLAG_NO_RECORDED_VALUE,
+                    min: None,
+                    max: None,
+                }],
+            })),
+        },
+    ]));
+
+    assert_equivalent(std::slice::from_ref(&expected2), &[plain_otlp2]);
+    assert_equivalent(&[expected2], &[round_tripped_otlp2]);
+
+    // Target scrape failure: `flush_target_stale` marks the remaining active series stale.
+    let opts3 = DecodeOptions::new().with_timestamp_ms(1_700_000_030_000);
+    let rec3 = decoder
+        .flush_target_stale(&mut tracker, &opts3)
+        .expect("flush_target_stale succeeds");
+    assert!(tracker.is_empty());
+
+    let mut otap3 = to_otap_arrow_records(&rec3);
+    otap3
+        .encode_transport_optimized()
+        .expect("transport optimize succeeds on flushed stale batch");
+    otap3
+        .decode_transport_optimized_ids()
+        .expect("transport decode IDs succeeds on flushed stale batch");
+    let OtlpProtoMessage::Metrics(otlp3) = otap_to_otlp(&otap3) else {
+        panic!("expected OTLP MetricsData");
+    };
+    let m3 = &otlp3.resource_metrics[0].scope_metrics[0].metrics[0];
+    let Some(metric::Data::Sum(sum3)) = &m3.data else {
+        panic!("expected Sum metric");
+    };
+    assert_eq!(sum3.data_points.len(), 1);
+    assert_eq!(
+        sum3.data_points[0].flags,
+        DATA_POINT_FLAG_NO_RECORDED_VALUE
+    );
+    let Some(number_data_point::Value::AsDouble(v3)) = sum3.data_points[0].value else {
+        panic!("expected double value");
+    };
+    assert!(is_stale_nan(v3));
 }

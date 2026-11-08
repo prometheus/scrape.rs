@@ -184,8 +184,9 @@ fn build_number_dp_schema(
     start_time_nullable: bool,
     has_time: bool,
     time_nullable: bool,
+    has_flags: bool,
 ) -> SchemaRef {
-    let mut fields = Vec::with_capacity(5);
+    let mut fields = Vec::with_capacity(6);
     if has_id {
         fields.push(Field::new("id", DataType::UInt32, false).with_metadata(plain_id_metadata()));
     }
@@ -206,22 +207,27 @@ fn build_number_dp_schema(
         ));
     }
     fields.push(Field::new("double_value", DataType::Float64, false));
+    if has_flags {
+        fields.push(Field::new("flags", DataType::UInt32, false));
+    }
     Arc::new(Schema::new(fields))
 }
 
-static NUMBER_DP_SCHEMAS: LazyLock<[SchemaRef; 32]> = LazyLock::new(|| {
+static NUMBER_DP_SCHEMAS: LazyLock<[SchemaRef; 64]> = LazyLock::new(|| {
     std::array::from_fn(|mask| {
         let has_id = (mask & 1) != 0;
         let has_start_time = (mask & 2) != 0;
         let start_time_nullable = (mask & 4) != 0;
         let has_time = (mask & 8) != 0;
         let time_nullable = (mask & 16) != 0;
+        let has_flags = (mask & 32) != 0;
         build_number_dp_schema(
             has_id,
             has_start_time,
             start_time_nullable,
             has_time,
             time_nullable,
+            has_flags,
         )
     })
 });
@@ -233,12 +239,14 @@ pub(super) fn number_dp_schema(
     start_time_nullable: bool,
     has_time: bool,
     time_nullable: bool,
+    has_flags: bool,
 ) -> SchemaRef {
     let mask = usize::from(has_id)
         | (usize::from(has_start_time) << 1)
         | (usize::from(start_time_nullable) << 2)
         | (usize::from(has_time) << 3)
-        | (usize::from(time_nullable) << 4);
+        | (usize::from(time_nullable) << 4)
+        | (usize::from(has_flags) << 5);
     Arc::clone(&NUMBER_DP_SCHEMAS[mask])
 }
 
@@ -267,6 +275,7 @@ pub(super) fn summary_quantile_item_field() -> FieldRef {
     Arc::clone(&SUMMARY_QUANTILE_ITEM_FIELD)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_summary_dp_schema(
     has_id: bool,
     has_start_time: bool,
@@ -275,8 +284,9 @@ fn build_summary_dp_schema(
     time_nullable: bool,
     count_nullable: bool,
     sum_nullable: bool,
+    has_flags: bool,
 ) -> SchemaRef {
-    let mut fields = Vec::with_capacity(7);
+    let mut fields = Vec::with_capacity(8);
     if has_id {
         fields.push(Field::new("id", DataType::UInt32, false).with_metadata(plain_id_metadata()));
     }
@@ -303,10 +313,13 @@ fn build_summary_dp_schema(
         DataType::List(summary_quantile_item_field()),
         false,
     ));
+    if has_flags {
+        fields.push(Field::new("flags", DataType::UInt32, false));
+    }
     Arc::new(Schema::new(fields))
 }
 
-static SUMMARY_DP_SCHEMAS: LazyLock<[SchemaRef; 128]> = LazyLock::new(|| {
+static SUMMARY_DP_SCHEMAS: LazyLock<[SchemaRef; 256]> = LazyLock::new(|| {
     std::array::from_fn(|mask| {
         build_summary_dp_schema(
             (mask & 1) != 0,
@@ -316,11 +329,13 @@ static SUMMARY_DP_SCHEMAS: LazyLock<[SchemaRef; 128]> = LazyLock::new(|| {
             (mask & 16) != 0,
             (mask & 32) != 0,
             (mask & 64) != 0,
+            (mask & 128) != 0,
         )
     })
 });
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn summary_dp_schema(
     has_id: bool,
     has_start_time: bool,
@@ -329,6 +344,7 @@ pub(super) fn summary_dp_schema(
     time_nullable: bool,
     count_nullable: bool,
     sum_nullable: bool,
+    has_flags: bool,
 ) -> SchemaRef {
     let mask = usize::from(has_id)
         | (usize::from(has_start_time) << 1)
@@ -336,7 +352,8 @@ pub(super) fn summary_dp_schema(
         | (usize::from(has_time) << 3)
         | (usize::from(time_nullable) << 4)
         | (usize::from(count_nullable) << 5)
-        | (usize::from(sum_nullable) << 6);
+        | (usize::from(sum_nullable) << 6)
+        | (usize::from(has_flags) << 7);
     Arc::clone(&SUMMARY_DP_SCHEMAS[mask])
 }
 
@@ -356,6 +373,7 @@ pub(super) fn histogram_explicit_bounds_item_field() -> FieldRef {
     Arc::clone(&HISTOGRAM_EXPLICIT_BOUNDS_ITEM_FIELD)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_histogram_dp_schema(
     has_id: bool,
     has_start_time: bool,
@@ -364,8 +382,9 @@ fn build_histogram_dp_schema(
     time_nullable: bool,
     count_nullable: bool,
     sum_nullable: bool,
+    has_flags: bool,
 ) -> SchemaRef {
-    let mut fields = Vec::with_capacity(8);
+    let mut fields = Vec::with_capacity(9);
     if has_id {
         fields.push(Field::new("id", DataType::UInt32, false).with_metadata(plain_id_metadata()));
     }
@@ -397,10 +416,13 @@ fn build_histogram_dp_schema(
         DataType::List(histogram_explicit_bounds_item_field()),
         false,
     ));
+    if has_flags {
+        fields.push(Field::new("flags", DataType::UInt32, false));
+    }
     Arc::new(Schema::new(fields))
 }
 
-static HISTOGRAM_DP_SCHEMAS: LazyLock<[SchemaRef; 128]> = LazyLock::new(|| {
+static HISTOGRAM_DP_SCHEMAS: LazyLock<[SchemaRef; 256]> = LazyLock::new(|| {
     std::array::from_fn(|mask| {
         build_histogram_dp_schema(
             (mask & 1) != 0,
@@ -410,11 +432,13 @@ static HISTOGRAM_DP_SCHEMAS: LazyLock<[SchemaRef; 128]> = LazyLock::new(|| {
             (mask & 16) != 0,
             (mask & 32) != 0,
             (mask & 64) != 0,
+            (mask & 128) != 0,
         )
     })
 });
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn histogram_dp_schema(
     has_id: bool,
     has_start_time: bool,
@@ -423,6 +447,7 @@ pub(super) fn histogram_dp_schema(
     time_nullable: bool,
     count_nullable: bool,
     sum_nullable: bool,
+    has_flags: bool,
 ) -> SchemaRef {
     let mask = usize::from(has_id)
         | (usize::from(has_start_time) << 1)
@@ -430,7 +455,8 @@ pub(super) fn histogram_dp_schema(
         | (usize::from(has_time) << 3)
         | (usize::from(time_nullable) << 4)
         | (usize::from(count_nullable) << 5)
-        | (usize::from(sum_nullable) << 6);
+        | (usize::from(sum_nullable) << 6)
+        | (usize::from(has_flags) << 7);
     Arc::clone(&HISTOGRAM_DP_SCHEMAS[mask])
 }
 

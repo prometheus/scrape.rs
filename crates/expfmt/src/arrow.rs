@@ -25,6 +25,7 @@ mod intern;
 mod options;
 mod records;
 mod schema;
+mod staleness;
 #[cfg(test)]
 mod tests;
 
@@ -54,6 +55,10 @@ pub use self::options::{
 };
 pub use self::records::{MetricPayloadType, OtapMetricRecords};
 pub use self::schema::PROMETHEUS_TYPE_METADATA_KEY;
+use self::staleness::DpKind;
+pub use self::staleness::{
+    DATA_POINT_FLAG_NO_RECORDED_VALUE, STALE_NAN, STALE_NAN_BITS, StalenessTracker, is_stale_nan,
+};
 
 /// Maximum distinct `UnivariateMetrics` rows representable in a single OTAP batch (`u16` IDs).
 const MAX_METRICS_PER_BATCH: usize = (u16::MAX as usize) + 1;
@@ -414,6 +419,7 @@ impl ArrowDecoder {
 
         let mut pending_series = false;
         let mut done = false;
+        let mut tracker = None;
         let res = self.ingest_entries::<false, false>(
             &mut parser,
             opts,
@@ -422,6 +428,7 @@ impl ArrowDecoder {
             None,
             &mut pending_series,
             &mut done,
+            &mut tracker,
         );
         parser.take_scratch_into(self);
         match res? {
@@ -539,7 +546,8 @@ impl ArrowDecoder {
         input: &[u8],
         budget: DecodeBudget,
     ) -> Result<DecodeStep, DecodeError> {
-        self.step_cursor::<true>(cursor, input, Some(budget))
+        let mut tracker = None;
+        self.step_cursor::<true>(cursor, input, Some(budget), &mut tracker)
     }
 
     fn step_cursor<const BUDGETED: bool>(
@@ -547,12 +555,16 @@ impl ArrowDecoder {
         cursor: &mut DecodeCursor,
         input: &[u8],
         budget: Option<DecodeBudget>,
+        tracker: &mut Option<&mut StalenessTracker>,
     ) -> Result<DecodeStep, DecodeError> {
         if cursor.done {
             return Ok(DecodeStep::Done);
         }
         if cursor.scrape_id != self.scrape_id {
             cursor.done = true;
+            if let Some(tr) = tracker.as_deref_mut() {
+                tr.abort_scrape();
+            }
             cursor.parser_state.take_scratch_into(self);
             return Err(DecodeError::InvalidCursor(
                 "cursor does not belong to current decoder scrape",
@@ -560,6 +572,9 @@ impl ArrowDecoder {
         }
         let expected_len = *cursor.input_len.get_or_insert(input.len());
         if input.len() != expected_len {
+            if let Some(tr) = tracker.as_deref_mut() {
+                tr.abort_scrape();
+            }
             self.finish_decode(cursor);
             return Err(DecodeError::InvalidCursor(
                 "scrape input buffer length changed across decode steps",
@@ -576,6 +591,7 @@ impl ArrowDecoder {
                 budget,
                 &mut cursor.pending_series,
                 &mut cursor.done,
+                tracker,
             )
         } else {
             self.ingest_entries::<false, BUDGETED>(
@@ -586,6 +602,7 @@ impl ArrowDecoder {
                 budget,
                 &mut cursor.pending_series,
                 &mut cursor.done,
+                tracker,
             )
         };
         cursor.pos = parser.pos();
@@ -600,6 +617,9 @@ impl ArrowDecoder {
             }
             Err(err) => {
                 cursor.done = true;
+                if let Some(tr) = tracker.as_deref_mut() {
+                    tr.abort_scrape();
+                }
                 parser.take_scratch_into(self);
                 self.reset_scrape();
                 Err(err)
@@ -619,6 +639,66 @@ impl ArrowDecoder {
         }
     }
 
+    /// Decodes a single exposition scrape buffer of `format` into OTAP metric
+    /// [`arrow_array::RecordBatch`]es while tracking active series in `tracker` and emitting stale
+    /// data points (`flags = DATA_POINT_FLAG_NO_RECORDED_VALUE`, [`STALE_NAN`]) for any series
+    /// that was active in the previous scrape of this target and disappeared from `input`.
+    ///
+    /// Series present in `input` whose sample value already carries [`STALE_NAN`] are emitted with
+    /// `flags = DATA_POINT_FLAG_NO_RECORDED_VALUE` and removed from `tracker`'s active set. If
+    /// decoding fails with [`DecodeError`], `tracker` rolls back to the active series set from the
+    /// previous successful scrape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] under the same conditions as [`ArrowDecoder::decode`].
+    pub fn decode_with_staleness(
+        &mut self,
+        input: &[u8],
+        format: &Format,
+        opts: &DecodeOptions,
+        tracker: &mut StalenessTracker,
+    ) -> Result<OtapMetricRecords, DecodeError> {
+        self.reset_scrape();
+        tracker.begin_scrape();
+        let (mut parser, default_ts_ns) = match self.init_scrape_parser(input, format, opts) {
+            Ok(v) => v,
+            Err(err) => {
+                tracker.abort_scrape();
+                return Err(err);
+            }
+        };
+
+        let mut pending_series = false;
+        let mut done = false;
+        let mut tracker_opt = Some(tracker);
+        let res = self.ingest_entries::<false, false>(
+            &mut parser,
+            opts,
+            default_ts_ns,
+            0,
+            None,
+            &mut pending_series,
+            &mut done,
+            &mut tracker_opt,
+        );
+        parser.take_scratch_into(self);
+        match res {
+            Ok(DecodeStep::Batch(records)) => Ok(records),
+            Ok(DecodeStep::Done) => Ok(OtapMetricRecords::default()),
+            Ok(DecodeStep::Pending) => {
+                unreachable!("unbudgeted decode never returns DecodeStep::Pending")
+            }
+            Err(err) => {
+                if let Some(tr) = tracker_opt {
+                    tr.abort_scrape();
+                }
+                self.reset_scrape();
+                Err(err)
+            }
+        }
+    }
+
     /// Streams `input` as a sequence of non-empty [`OtapMetricRecords`] chunks bounded by
     /// [`DecodeOptions::max_data_points_per_batch`] and OTAP's 65,536-metric per-batch `u16` ID
     /// limit.
@@ -634,17 +714,117 @@ impl ArrowDecoder {
         format: &Format,
         opts: &DecodeOptions,
     ) -> DecodeStream<'dec, 'input> {
+        self.decode_stream_inner(input, format, opts, None)
+    }
+
+    /// Streams `input` as a sequence of non-empty [`OtapMetricRecords`] chunks bounded by
+    /// [`DecodeOptions::max_data_points_per_batch`] while tracking active series in `tracker` and
+    /// emitting stale data points (`flags = DATA_POINT_FLAG_NO_RECORDED_VALUE`, [`STALE_NAN`]) at
+    /// end-of-scrape for any series that disappeared since the previous scrape.
+    ///
+    /// If a stream chunk returns [`DecodeError`] or [`DecodeStream`] is dropped before reaching
+    /// end-of-input, `tracker` rolls back to the committed active series set from the previous
+    /// successful scrape.
+    pub fn decode_stream_with_staleness<'dec, 'input>(
+        &'dec mut self,
+        input: &'input [u8],
+        format: &Format,
+        opts: &DecodeOptions,
+        tracker: &'dec mut StalenessTracker,
+    ) -> DecodeStream<'dec, 'input> {
+        self.decode_stream_inner(input, format, opts, Some(tracker))
+    }
+
+    /// Emits stale data points (`flags = DATA_POINT_FLAG_NO_RECORDED_VALUE`, [`STALE_NAN`]) at
+    /// `opts.timestamp_ms` for every currently active series in `tracker` and clears the active
+    /// set.
+    ///
+    /// Call this when an entire target scrape fails (for example, on an HTTP or connection error)
+    /// or when a scrape target is decommissioned so downstream consumers mark all previously
+    /// active series for that target stale without re-emitting them on subsequent scrapes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] if `opts.timestamp_ms` overflows `i64` nanoseconds or an OTAP table
+    /// exceeds its integer ID width.
+    pub fn flush_target_stale(
+        &mut self,
+        tracker: &mut StalenessTracker,
+        opts: &DecodeOptions,
+    ) -> Result<OtapMetricRecords, DecodeError> {
+        self.reset_scrape();
+        if tracker.is_empty() {
+            return Ok(OtapMetricRecords::default());
+        }
+        let default_ts_ns = match opts.timestamp_ms {
+            Some(ms) => Some(ms_to_ns(ms)?),
+            None => None,
+        };
+        tracker.begin_scrape();
+        let res = tracker.finish_scrape_step(
+            &mut self.metrics,
+            &mut self.num_dp,
+            &mut self.sum_dp,
+            &mut self.hist_dp,
+            &mut self.key_interner,
+            &mut self.val_interner,
+            opts,
+            default_ts_ns,
+            None,
+            MAX_METRICS_PER_BATCH,
+        );
+        if let Err(err) = res {
+            tracker.abort_scrape();
+            self.reset_scrape();
+            return Err(err);
+        }
+        let batches = self.finish_batches(default_ts_ns.is_some());
+        if batches.is_err() {
+            self.reset_scrape();
+        }
+        batches
+    }
+
+    /// Alias for [`ArrowDecoder::flush_target_stale`]: emits stale data points for all currently
+    /// active series in `tracker` and deactivates them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] under the same conditions as [`ArrowDecoder::flush_target_stale`].
+    #[inline]
+    pub fn encode_stale_target(
+        &mut self,
+        tracker: &mut StalenessTracker,
+        opts: &DecodeOptions,
+    ) -> Result<OtapMetricRecords, DecodeError> {
+        self.flush_target_stale(tracker, opts)
+    }
+
+    fn decode_stream_inner<'dec, 'input>(
+        &'dec mut self,
+        input: &'input [u8],
+        format: &Format,
+        opts: &DecodeOptions,
+        mut tracker: Option<&'dec mut StalenessTracker>,
+    ) -> DecodeStream<'dec, 'input> {
         match self.start_decode_stream(format, opts) {
             Ok(mut cursor) => {
+                if let Some(tr) = tracker.as_deref_mut() {
+                    tr.begin_scrape();
+                }
                 cursor.input_len = Some(input.len());
                 DecodeStream {
                     decoder: self,
                     input,
                     cursor,
+                    tracker,
                     init_err: None,
                 }
             }
             Err(err) => {
+                if let Some(tr) = tracker.as_deref_mut() {
+                    tr.abort_scrape();
+                }
                 let max_data_points = opts
                     .max_data_points_per_batch
                     .clamp(1, (u32::MAX as usize).saturating_add(1));
@@ -664,6 +844,7 @@ impl ArrowDecoder {
                         pending_series: false,
                         done: false,
                     },
+                    tracker,
                     init_err: Some(err),
                 }
             }
@@ -743,6 +924,13 @@ impl ArrowDecoder {
         self.hist_dp.clear();
     }
 
+    fn reset_batch_with_tracker(&mut self, tracker: &mut Option<&mut StalenessTracker>) {
+        self.reset_batch();
+        if let Some(tr) = tracker.as_deref_mut() {
+            tr.reset_batch_ids();
+        }
+    }
+
     #[inline]
     fn total_data_points(&self) -> usize {
         self.num_dp.base.len() + self.sum_dp.base.len() + self.hist_dp.base.len()
@@ -756,6 +944,7 @@ impl ArrowDecoder {
     #[inline]
     fn flush_pending_family(
         &mut self,
+        tracker: &mut Option<&mut StalenessTracker>,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
@@ -764,6 +953,9 @@ impl ArrowDecoder {
             &mut self.metrics,
             &mut self.sum_dp,
             &mut self.hist_dp,
+            &self.key_interner,
+            &self.val_interner,
+            tracker.as_deref_mut(),
             opts,
             default_ts_ns,
         )
@@ -774,6 +966,7 @@ impl ArrowDecoder {
         &mut self,
         raw_name: &[u8],
         name_offset: usize,
+        tracker: &mut Option<&mut StalenessTracker>,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
@@ -795,7 +988,7 @@ impl ArrowDecoder {
 
         self.series_name_buf.clear();
         self.series_name_buf.extend_from_slice(unescaped);
-        self.flush_pending_family(opts, default_ts_ns)?;
+        self.flush_pending_family(tracker, opts, default_ts_ns)?;
         self.current_family
             .start_new(raw_name, &self.series_name_buf);
         Ok(())
@@ -816,6 +1009,7 @@ impl ArrowDecoder {
         budget: Option<DecodeBudget>,
         pending_series: &mut bool,
         done: &mut bool,
+        tracker: &mut Option<&mut StalenessTracker>,
     ) -> Result<DecodeStep, DecodeError> {
         let start_pos = if BUDGETED { parser.pos() } else { 0 };
         let max_entries = if let Some(b) = budget.filter(|_| BUDGETED) {
@@ -839,14 +1033,32 @@ impl ArrowDecoder {
                 match parser.next_entry().map_err(DecodeError::from_parse)? {
                     Some(entry) => entry,
                     None => {
-                        self.flush_pending_family(opts, default_ts_ns)?;
-                        *done = true;
+                        self.flush_pending_family(tracker, opts, default_ts_ns)?;
+                        let has_more_stale = if let Some(tr) = tracker.as_deref_mut() {
+                            tr.finish_scrape_step(
+                                &mut self.metrics,
+                                &mut self.num_dp,
+                                &mut self.sum_dp,
+                                &mut self.hist_dp,
+                                &mut self.key_interner,
+                                &mut self.val_interner,
+                                opts,
+                                default_ts_ns,
+                                CHUNKED.then_some(max_data_points),
+                                MAX_METRICS_PER_BATCH,
+                            )?
+                        } else {
+                            false
+                        };
+                        if !has_more_stale {
+                            *done = true;
+                        }
                         if self.metrics.is_empty() {
                             return Ok(DecodeStep::Done);
                         }
                         let batch = self.finish_batches(default_ts_ns.is_some())?;
                         if CHUNKED {
-                            self.reset_batch();
+                            self.reset_batch_with_tracker(tracker);
                         }
                         return Ok(DecodeStep::Batch(batch));
                     }
@@ -856,9 +1068,9 @@ impl ArrowDecoder {
             match entry {
                 // `Entry::Histogram` arrives with #22.
                 Entry::Comment | Entry::Histogram => {}
-                Entry::Help => self.ingest_help_entry(parser, opts, default_ts_ns)?,
-                Entry::Type => self.ingest_type_entry(parser, opts, default_ts_ns)?,
-                Entry::Unit => self.ingest_unit_entry(parser, opts, default_ts_ns)?,
+                Entry::Help => self.ingest_help_entry(parser, tracker, opts, default_ts_ns)?,
+                Entry::Type => self.ingest_type_entry(parser, tracker, opts, default_ts_ns)?,
+                Entry::Unit => self.ingest_unit_entry(parser, tracker, opts, default_ts_ns)?,
                 Entry::Series => {
                     let (raw_name, name_offset) = {
                         let (rn, _, _, _, _) = parser.raw_series_parts();
@@ -887,13 +1099,13 @@ impl ArrowDecoder {
                         } else {
                             self.series_name_buf.clear();
                             self.series_name_buf.extend_from_slice(unescaped);
-                            self.flush_pending_family(opts, default_ts_ns)?;
+                            self.flush_pending_family(tracker, opts, default_ts_ns)?;
                             if CHUNKED && self.total_data_points() >= max_data_points {
                                 self.current_family
                                     .start_new(raw_name, &self.series_name_buf);
                                 *pending_series = true;
                                 let batch = self.finish_batches(default_ts_ns.is_some())?;
-                                self.reset_batch();
+                                self.reset_batch_with_tracker(tracker);
                                 return Ok(DecodeStep::Batch(batch));
                             }
                             self.current_family
@@ -912,23 +1124,23 @@ impl ArrowDecoder {
                                     && self.metrics.len() >= MAX_METRICS_PER_BATCH));
                         if split_assembled || split_scalar {
                             if split_assembled {
-                                self.flush_pending_family(opts, default_ts_ns)?;
+                                self.flush_pending_family(tracker, opts, default_ts_ns)?;
                             }
                             *pending_series = true;
                             let batch = self.finish_batches(default_ts_ns.is_some())?;
-                            self.reset_batch();
+                            self.reset_batch_with_tracker(tracker);
                             return Ok(DecodeStep::Batch(batch));
                         }
                     }
 
-                    self.ingest_series_entry(parser, role, opts, default_ts_ns)?;
+                    self.ingest_series_entry(parser, role, tracker, opts, default_ts_ns)?;
 
                     if CHUNKED
                         && self.assembly.is_empty()
                         && self.total_data_points() >= max_data_points
                     {
                         let batch = self.finish_batches(default_ts_ns.is_some())?;
-                        self.reset_batch();
+                        self.reset_batch_with_tracker(tracker);
                         return Ok(DecodeStep::Batch(batch));
                     }
                 }
@@ -951,6 +1163,7 @@ impl ArrowDecoder {
     fn ingest_help_entry(
         &mut self,
         parser: &ActiveParser<'_>,
+        tracker: &mut Option<&mut StalenessTracker>,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
@@ -966,7 +1179,7 @@ impl ArrowDecoder {
             }
             return Ok(());
         }
-        self.transition_family_for_metadata(raw_name, name_offset, opts, default_ts_ns)?;
+        self.transition_family_for_metadata(raw_name, name_offset, tracker, opts, default_ts_ns)?;
         if self.current_family.has_help
             || self.current_family.has_samples
             || !self.assembly.is_empty()
@@ -987,12 +1200,13 @@ impl ArrowDecoder {
     fn ingest_type_entry(
         &mut self,
         parser: &ActiveParser<'_>,
+        tracker: &mut Option<&mut StalenessTracker>,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
         let (raw_name, metric_type) = parser.metric_type();
         let name_offset = parser.name_offset();
-        self.transition_family_for_metadata(raw_name, name_offset, opts, default_ts_ns)?;
+        self.transition_family_for_metadata(raw_name, name_offset, tracker, opts, default_ts_ns)?;
         if self.current_family.has_type
             || self.current_family.has_samples
             || !self.assembly.is_empty()
@@ -1010,6 +1224,7 @@ impl ArrowDecoder {
     fn ingest_unit_entry(
         &mut self,
         parser: &ActiveParser<'_>,
+        tracker: &mut Option<&mut StalenessTracker>,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
@@ -1018,7 +1233,7 @@ impl ArrowDecoder {
         if raw_unit.is_empty() {
             return Ok(());
         }
-        self.transition_family_for_metadata(raw_name, name_offset, opts, default_ts_ns)?;
+        self.transition_family_for_metadata(raw_name, name_offset, tracker, opts, default_ts_ns)?;
         if self.current_family.has_unit
             || self.current_family.has_samples
             || !self.assembly.is_empty()
@@ -1039,11 +1254,12 @@ impl ArrowDecoder {
         &mut self,
         parser: &mut ActiveParser<'_>,
         role: SeriesRole,
+        tracker: &mut Option<&mut StalenessTracker>,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
         match role {
-            SeriesRole::Scalar => self.append_scalar_series(parser, opts, default_ts_ns),
+            SeriesRole::Scalar => self.append_scalar_series(parser, tracker, opts, default_ts_ns),
             SeriesRole::HistogramBucket
             | SeriesRole::HistogramSum
             | SeriesRole::HistogramCount
@@ -1057,6 +1273,7 @@ impl ArrowDecoder {
     fn append_scalar_series(
         &mut self,
         parser: &mut ActiveParser<'_>,
+        tracker: &mut Option<&mut StalenessTracker>,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
@@ -1108,10 +1325,27 @@ impl ArrowDecoder {
             Some(ms) => Some(ms_to_ns(ms)?),
             None => default_ts_ns,
         };
+        let is_stale = is_stale_nan(value);
+        let flags = if is_stale {
+            DATA_POINT_FLAG_NO_RECORDED_VALUE
+        } else {
+            0
+        };
         self.num_dp
             .base
-            .push(parent_id, start_ts_ns, resolved_ts_ns);
+            .push_with_flags(parent_id, start_ts_ns, resolved_ts_ns, flags);
         self.num_dp.values.push(value);
+
+        if let Some(tr) = tracker.as_deref_mut() {
+            tr.record_series(
+                &mut self.current_family,
+                DpKind::Number,
+                &self.temp_attrs,
+                &self.key_interner,
+                &self.val_interner,
+                is_stale,
+            )?;
+        }
         Ok(())
     }
 
@@ -1157,6 +1391,9 @@ impl ArrowDecoder {
         }
         if group.start_ts_ns.is_none() && om_start_ts_ns.is_some() {
             group.start_ts_ns = om_start_ts_ns;
+        }
+        if is_stale_nan(value) {
+            group.is_stale = true;
         }
 
         match role {
@@ -1617,6 +1854,7 @@ pub struct DecodeStream<'dec, 'input> {
     decoder: &'dec mut ArrowDecoder,
     input: &'input [u8],
     cursor: DecodeCursor,
+    tracker: Option<&'dec mut StalenessTracker>,
     init_err: Option<DecodeError>,
 }
 
@@ -1654,10 +1892,14 @@ impl DecodeStream<'_, '_> {
         }
         if let Some(err) = self.init_err.take() {
             self.cursor.done = true;
+            if let Some(tr) = self.tracker.as_deref_mut() {
+                tr.abort_scrape();
+            }
             return Err(err);
         }
+        let mut tracker = self.tracker.as_deref_mut();
         self.decoder
-            .step_decode(&mut self.cursor, self.input, budget)
+            .step_cursor::<true>(&mut self.cursor, self.input, Some(budget), &mut tracker)
     }
 
     /// Cooperatively pulls the next non-empty [`OtapMetricRecords`] chunk from the stream,
@@ -1687,11 +1929,15 @@ impl Iterator for DecodeStream<'_, '_> {
         }
         if let Some(err) = self.init_err.take() {
             self.cursor.done = true;
+            if let Some(tr) = self.tracker.as_deref_mut() {
+                tr.abort_scrape();
+            }
             return Some(Err(err));
         }
+        let mut tracker = self.tracker.as_deref_mut();
         match self
             .decoder
-            .step_cursor::<false>(&mut self.cursor, self.input, None)
+            .step_cursor::<false>(&mut self.cursor, self.input, None, &mut tracker)
         {
             Ok(DecodeStep::Batch(batch)) => Some(Ok(batch)),
             Ok(DecodeStep::Done) => None,
@@ -1707,6 +1953,9 @@ impl FusedIterator for DecodeStream<'_, '_> {}
 
 impl Drop for DecodeStream<'_, '_> {
     fn drop(&mut self) {
+        if let Some(tr) = self.tracker.as_deref_mut() {
+            tr.abort_scrape();
+        }
         self.decoder.finish_decode(&mut self.cursor);
     }
 }

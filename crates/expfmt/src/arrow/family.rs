@@ -16,6 +16,7 @@
 use crate::parse::MetricType;
 
 use super::columns::{HistogramDpTable, MetricTable, SummaryDpTable, f64_to_u64_count};
+use super::intern::StringInterner;
 use super::options::{
     CounterSuffixPolicy, DecodeError, DecodeOptions, UnitSuffixPolicy, UntypedPolicy,
 };
@@ -23,6 +24,7 @@ use super::schema::{
     OTAP_METRIC_TYPE_GAUGE, OTAP_METRIC_TYPE_HISTOGRAM, OTAP_METRIC_TYPE_SUM,
     OTAP_METRIC_TYPE_SUMMARY,
 };
+use super::staleness::{DATA_POINT_FLAG_NO_RECORDED_VALUE, DpKind, StalenessTracker};
 
 /// Role of a series line within the active [`CurrentFamily`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +58,7 @@ pub(super) struct CurrentFamily {
     pub(super) help: Vec<u8>,
     pub(super) unit: Vec<u8>,
     pub(super) batch_id: Option<u16>,
+    pub(super) tracker_family_idx: Option<u32>,
 }
 
 impl CurrentFamily {
@@ -82,6 +85,7 @@ impl CurrentFamily {
         self.help.clear();
         self.unit.clear();
         self.batch_id = None;
+        self.tracker_family_idx = None;
     }
 
     pub(super) fn retained_memory_bytes(&self) -> usize {
@@ -111,6 +115,7 @@ impl CurrentFamily {
         self.help.clear();
         self.unit.clear();
         self.batch_id = None;
+        self.tracker_family_idx = None;
     }
 
     #[inline]
@@ -184,104 +189,124 @@ impl CurrentFamily {
             return Ok(id);
         }
 
-        let m_idx = metrics.len();
-        let id = u16::try_from(m_idx).map_err(|_| DecodeError::CapacityOverflow {
-            table: "UnivariateMetrics",
-            count: m_idx + 1,
-        })?;
-
-        let fam_name = self.unescaped_name.as_slice();
-        let unit = self.unit.as_slice();
-        let inferred_counter = self.metric_type == MetricType::Unknown
-            && opts.untyped_policy == UntypedPolicy::InferFromSuffix
-            && fam_name.len() > 6
-            && fam_name.ends_with(b"_total");
-        let is_counter = self.metric_type == MetricType::Counter || inferred_counter;
-
-        let mut base_name = if is_counter && fam_name.len() > 6 && fam_name.ends_with(b"_total") {
-            &fam_name[..fam_name.len() - 6]
-        } else {
-            fam_name
-        };
-
-        if opts.unit_suffix_policy == UnitSuffixPolicy::Strip
-            && self.has_unit
-            && !unit.is_empty()
-            && base_name.len() > unit.len() + 1
-            && base_name.ends_with(unit)
-            && base_name[base_name.len() - unit.len() - 1] == b'_'
-        {
-            base_name = &base_name[..base_name.len() - unit.len() - 1];
-        }
-
-        let append_total = is_counter
-            && opts.counter_suffix_policy == CounterSuffixPolicy::Keep
-            && self.saw_total_suffix;
-        let emitted_name_len = base_name.len() + if append_total { 6 } else { 0 };
-
-        let next_name_len = metrics.name_bytes.len().saturating_add(emitted_name_len);
-        let name_end_off =
-            i32::try_from(next_name_len).map_err(|_| DecodeError::CapacityOverflow {
-                table: "UnivariateMetrics.name",
-                count: next_name_len,
-            })?;
-
-        let next_desc_len = metrics.desc.check_next_offset(
+        let id = emit_family_row(
+            &self.unescaped_name,
+            self.metric_type,
+            self.saw_total_suffix,
             self.has_help,
             &self.help,
-            "UnivariateMetrics.description",
+            self.has_unit,
+            &self.unit,
+            metrics,
+            opts,
         )?;
-        let next_unit_len =
-            metrics
-                .unit
-                .check_next_offset(self.has_unit, &self.unit, "UnivariateMetrics.unit")?;
-
-        metrics.name_bytes.extend_from_slice(base_name);
-        if append_total {
-            metrics.name_bytes.extend_from_slice(b"_total");
-        }
-        metrics.name_offsets.push(name_end_off);
-
-        let (otap_type, attr_type_key, is_monotonic) = match self.metric_type {
-            MetricType::Counter => (OTAP_METRIC_TYPE_SUM, 1u16, true),
-            MetricType::Gauge => (OTAP_METRIC_TYPE_GAUGE, 2u16, false),
-            MetricType::Histogram => (OTAP_METRIC_TYPE_HISTOGRAM, 3u16, false),
-            MetricType::GaugeHistogram => (OTAP_METRIC_TYPE_HISTOGRAM, 4u16, false),
-            MetricType::Summary => (OTAP_METRIC_TYPE_SUMMARY, 5u16, false),
-            MetricType::Info => (OTAP_METRIC_TYPE_GAUGE, 6u16, false),
-            MetricType::Stateset => (OTAP_METRIC_TYPE_GAUGE, 7u16, false),
-            MetricType::Unknown => {
-                if inferred_counter {
-                    (OTAP_METRIC_TYPE_SUM, 0u16, true)
-                } else {
-                    (OTAP_METRIC_TYPE_GAUGE, 0u16, false)
-                }
-            }
-        };
-
-        let has_temporality =
-            otap_type == OTAP_METRIC_TYPE_SUM || otap_type == OTAP_METRIC_TYPE_HISTOGRAM;
-        let has_sum = otap_type == OTAP_METRIC_TYPE_SUM;
-
-        metrics.metric_types.push(otap_type);
-        metrics.is_monotonic.push(is_monotonic);
-        metrics.attr_type_keys.push(attr_type_key);
-        metrics.any_temporality |= has_temporality;
-        metrics.all_temporality &= has_temporality;
-        metrics.any_sum |= has_sum;
-        metrics.all_sum &= has_sum;
-
-        metrics
-            .desc
-            .append_checked(m_idx, next_desc_len, &self.help);
-        metrics
-            .unit
-            .append_checked(m_idx, next_unit_len, &self.unit);
 
         self.has_samples = true;
         self.batch_id = Some(id);
         Ok(id)
     }
+}
+
+/// Appends a `UnivariateMetrics` row and its `MetricAttrs` (`prometheus.type`) entry to `metrics`
+/// for the given family metadata and translation options, returning its `u16` metric ID.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_family_row(
+    fam_name: &[u8],
+    metric_type: MetricType,
+    saw_total_suffix: bool,
+    has_help: bool,
+    help: &[u8],
+    has_unit: bool,
+    unit: &[u8],
+    metrics: &mut MetricTable,
+    opts: &DecodeOptions,
+) -> Result<u16, DecodeError> {
+    let m_idx = metrics.len();
+    let id = u16::try_from(m_idx).map_err(|_| DecodeError::CapacityOverflow {
+        table: "UnivariateMetrics",
+        count: m_idx + 1,
+    })?;
+
+    let inferred_counter = metric_type == MetricType::Unknown
+        && opts.untyped_policy == UntypedPolicy::InferFromSuffix
+        && fam_name.len() > 6
+        && fam_name.ends_with(b"_total");
+    let is_counter = metric_type == MetricType::Counter || inferred_counter;
+
+    let mut base_name = if is_counter && fam_name.len() > 6 && fam_name.ends_with(b"_total") {
+        &fam_name[..fam_name.len() - 6]
+    } else {
+        fam_name
+    };
+
+    if opts.unit_suffix_policy == UnitSuffixPolicy::Strip
+        && has_unit
+        && !unit.is_empty()
+        && base_name.len() > unit.len() + 1
+        && base_name.ends_with(unit)
+        && base_name[base_name.len() - unit.len() - 1] == b'_'
+    {
+        base_name = &base_name[..base_name.len() - unit.len() - 1];
+    }
+
+    let append_total =
+        is_counter && opts.counter_suffix_policy == CounterSuffixPolicy::Keep && saw_total_suffix;
+    let emitted_name_len = base_name.len() + if append_total { 6 } else { 0 };
+
+    let next_name_len = metrics.name_bytes.len().saturating_add(emitted_name_len);
+    let name_end_off = i32::try_from(next_name_len).map_err(|_| DecodeError::CapacityOverflow {
+        table: "UnivariateMetrics.name",
+        count: next_name_len,
+    })?;
+
+    let next_desc_len =
+        metrics
+            .desc
+            .check_next_offset(has_help, help, "UnivariateMetrics.description")?;
+    let next_unit_len = metrics
+        .unit
+        .check_next_offset(has_unit, unit, "UnivariateMetrics.unit")?;
+
+    metrics.name_bytes.extend_from_slice(base_name);
+    if append_total {
+        metrics.name_bytes.extend_from_slice(b"_total");
+    }
+    metrics.name_offsets.push(name_end_off);
+
+    let (otap_type, attr_type_key, is_monotonic) = match metric_type {
+        MetricType::Counter => (OTAP_METRIC_TYPE_SUM, 1u16, true),
+        MetricType::Gauge => (OTAP_METRIC_TYPE_GAUGE, 2u16, false),
+        MetricType::Histogram => (OTAP_METRIC_TYPE_HISTOGRAM, 3u16, false),
+        MetricType::GaugeHistogram => (OTAP_METRIC_TYPE_HISTOGRAM, 4u16, false),
+        MetricType::Summary => (OTAP_METRIC_TYPE_SUMMARY, 5u16, false),
+        MetricType::Info => (OTAP_METRIC_TYPE_GAUGE, 6u16, false),
+        MetricType::Stateset => (OTAP_METRIC_TYPE_GAUGE, 7u16, false),
+        MetricType::Unknown => {
+            if inferred_counter {
+                (OTAP_METRIC_TYPE_SUM, 0u16, true)
+            } else {
+                (OTAP_METRIC_TYPE_GAUGE, 0u16, false)
+            }
+        }
+    };
+
+    let has_temporality =
+        otap_type == OTAP_METRIC_TYPE_SUM || otap_type == OTAP_METRIC_TYPE_HISTOGRAM;
+    let has_sum = otap_type == OTAP_METRIC_TYPE_SUM;
+
+    metrics.metric_types.push(otap_type);
+    metrics.is_monotonic.push(is_monotonic);
+    metrics.attr_type_keys.push(attr_type_key);
+    metrics.any_temporality |= has_temporality;
+    metrics.all_temporality &= has_temporality;
+    metrics.any_sum |= has_sum;
+    metrics.all_sum &= has_sum;
+
+    metrics.desc.append_checked(m_idx, next_desc_len, help);
+    metrics.unit.append_checked(m_idx, next_unit_len, unit);
+
+    Ok(id)
 }
 
 /// Sentinel index (`u32::MAX`) marking an empty linked-list pointer or hash-table slot in
@@ -293,7 +318,7 @@ const NONE_IDX: u32 = u32::MAX;
 const FX_SEED: u64 = 0x517c_c1b7_2722_0a95;
 
 #[inline]
-fn hash_attrs(attrs: &[(u32, u32)]) -> u64 {
+pub(super) fn hash_attrs(attrs: &[(u32, u32)]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for &(k, v) in attrs {
         let word = (u64::from(k) << 32) | u64::from(v);
@@ -327,6 +352,7 @@ pub(super) struct PendingDpGroup {
     pub(super) ts_ns: Option<i64>,
     pub(super) count: Option<u64>,
     pub(super) sum: Option<f64>,
+    pub(super) is_stale: bool,
     pub(super) point_head: u32,
     pub(super) point_tail: u32,
     pub(super) exemplar_head: u32,
@@ -343,6 +369,7 @@ impl PendingDpGroup {
             ts_ns: None,
             count: None,
             sum: None,
+            is_stale: false,
             point_head: NONE_IDX,
             point_tail: NONE_IDX,
             exemplar_head: NONE_IDX,
@@ -592,12 +619,16 @@ impl FamilyAssembly {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn flush(
         &mut self,
         current_family: &mut CurrentFamily,
         metrics: &mut MetricTable,
         sum_dp: &mut SummaryDpTable,
         hist_dp: &mut HistogramDpTable,
+        key_interner: &StringInterner,
+        val_interner: &StringInterner,
+        mut tracker: Option<&mut StalenessTracker>,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
@@ -628,9 +659,17 @@ impl FamilyAssembly {
                         .attrs
                         .extend_for_parent(dp_id, &self.group_attrs[attr_start..attr_end]);
 
-                    sum_dp
-                        .base
-                        .push(parent_id, group.start_ts_ns, group.ts_ns.or(default_ts_ns));
+                    let flags = if group.is_stale {
+                        DATA_POINT_FLAG_NO_RECORDED_VALUE
+                    } else {
+                        0
+                    };
+                    sum_dp.base.push_with_flags(
+                        parent_id,
+                        group.start_ts_ns,
+                        group.ts_ns.or(default_ts_ns),
+                        flags,
+                    );
                     sum_dp.counts.push(dp_index, group.count);
                     sum_dp.sums.push(dp_index, group.sum);
 
@@ -646,6 +685,17 @@ impl FamilyAssembly {
                         }
                     })?;
                     sum_dp.quantile_offsets.push(q_off);
+
+                    if let Some(tr) = tracker.as_deref_mut() {
+                        tr.record_series(
+                            current_family,
+                            DpKind::Summary,
+                            &self.group_attrs[attr_start..attr_end],
+                            key_interner,
+                            val_interner,
+                            group.is_stale,
+                        )?;
+                    }
                 }
             }
             MetricType::Histogram | MetricType::GaugeHistogram => {
@@ -668,9 +718,17 @@ impl FamilyAssembly {
                         .attrs
                         .extend_for_parent(dp_id, &self.group_attrs[attr_start..attr_end]);
 
-                    hist_dp
-                        .base
-                        .push(parent_id, group.start_ts_ns, group.ts_ns.or(default_ts_ns));
+                    let flags = if group.is_stale {
+                        DATA_POINT_FLAG_NO_RECORDED_VALUE
+                    } else {
+                        0
+                    };
+                    hist_dp.base.push_with_flags(
+                        parent_id,
+                        group.start_ts_ns,
+                        group.ts_ns.or(default_ts_ns),
+                        flags,
+                    );
 
                     self.collect_sorted_group_points(group.point_head);
 
@@ -730,6 +788,17 @@ impl FamilyAssembly {
                             hist_ex_id,
                             &self.exemplar_attrs[ex_attr_start..ex_attr_end],
                         );
+                    }
+
+                    if let Some(tr) = tracker.as_deref_mut() {
+                        tr.record_series(
+                            current_family,
+                            DpKind::Histogram,
+                            &self.group_attrs[attr_start..attr_end],
+                            key_interner,
+                            val_interner,
+                            group.is_stale,
+                        )?;
                     }
                 }
             }

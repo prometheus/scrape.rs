@@ -1194,3 +1194,273 @@ fn cooperative_async_helpers_respect_fast_path_and_yield_budgets() {
     assert!(stream_err_res.1.is_none());
     assert_eq!(stream_err_polls, 1);
 }
+
+#[test]
+fn stale_nan_bit_pattern_and_multi_scrape_staleness_lifecycle() {
+    assert!(is_stale_nan(STALE_NAN));
+    assert_eq!(STALE_NAN.to_bits(), STALE_NAN_BITS);
+    assert!(!is_stale_nan(f64::NAN));
+    assert!(!is_stale_nan(f64::from_bits(0x7ff8_0000_0000_0001)));
+    assert!(!is_stale_nan(0.0));
+
+    let mut dec = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    assert!(tracker.is_empty());
+    assert_eq!(tracker.active_series_len(), 0);
+
+    let scrape1 = concat!(
+        "# HELP req_total Total requests.\n",
+        "# TYPE req_total counter\n",
+        "req_total{id=\"1\"} 10\n",
+        "req_total{id=\"2\"} 20\n",
+        "# HELP mem_bytes Memory usage.\n",
+        "# TYPE mem_bytes gauge\n",
+        "mem_bytes 512\n",
+        "# HELP rpc_seconds RPC latency.\n",
+        "# TYPE rpc_seconds summary\n",
+        "rpc_seconds{svc=\"auth\",quantile=\"0.5\"} 0.05\n",
+        "rpc_seconds_sum{svc=\"auth\"} 1.5\n",
+        "rpc_seconds_count{svc=\"auth\"} 10\n",
+        "# HELP lat_seconds Request latency.\n",
+        "# TYPE lat_seconds histogram\n",
+        "lat_seconds_bucket{route=\"/a\",le=\"0.1\"} 3\n",
+        "lat_seconds_bucket{route=\"/a\",le=\"+Inf\"} 5\n",
+        "lat_seconds_sum{route=\"/a\"} 0.8\n",
+        "lat_seconds_count{route=\"/a\"} 5\n",
+    );
+
+    let opts1 = DecodeOptions::new().with_timestamp_ms(1_000);
+    let rec1 = dec
+        .decode_with_staleness(scrape1.as_bytes(), &Format::TEXT, &opts1, &mut tracker)
+        .unwrap();
+    assert_eq!(tracker.active_series_len(), 5);
+    assert!(!tracker.is_empty());
+    assert_eq!(rec1.num_metrics(), 4);
+    assert_eq!(rec1.num_data_points(), 5);
+    // Non-stale batches must omit the optional `flags` column completely.
+    assert!(
+        rec1.number_data_points()
+            .unwrap()
+            .column_by_name("flags")
+            .is_none()
+    );
+    assert!(
+        rec1.summary_data_points()
+            .unwrap()
+            .column_by_name("flags")
+            .is_none()
+    );
+    assert!(
+        rec1.histogram_data_points()
+            .unwrap()
+            .column_by_name("flags")
+            .is_none()
+    );
+
+    // Scrape 2: steady-state scrape with identical series set allocates zero new tracker capacity
+    // and emits no `flags` column.
+    let warmup_tracker_mem = tracker.retained_memory_bytes();
+    let opts2 = DecodeOptions::new().with_timestamp_ms(2_000);
+    let rec2 = dec
+        .decode_with_staleness(scrape1.as_bytes(), &Format::TEXT, &opts2, &mut tracker)
+        .unwrap();
+    assert_eq!(tracker.active_series_len(), 5);
+    assert_eq!(tracker.retained_memory_bytes(), warmup_tracker_mem);
+    assert!(
+        rec2.number_data_points()
+            .unwrap()
+            .column_by_name("flags")
+            .is_none()
+    );
+
+    // Scrape 3: `req_total{id="2"}`, `mem_bytes`, `rpc_seconds{svc="auth"}`, and
+    // `lat_seconds{route="/a"}` disappear; only `req_total{id="1"}` remains live.
+    let scrape3 = concat!(
+        "# HELP req_total Total requests.\n",
+        "# TYPE req_total counter\n",
+        "req_total{id=\"1\"} 15\n",
+    );
+    let opts3 = DecodeOptions::new().with_timestamp_ms(3_000);
+    let rec3 = dec
+        .decode_with_staleness(scrape3.as_bytes(), &Format::TEXT, &opts3, &mut tracker)
+        .unwrap();
+    assert_eq!(tracker.active_series_len(), 1);
+    assert_eq!(rec3.num_metrics(), 4);
+    assert_eq!(rec3.num_data_points(), 5);
+
+    let ndp3 = rec3.number_data_points().unwrap();
+    assert_eq!(ndp3.num_rows(), 3);
+    let ndp3_flags = ndp3
+        .column_by_name("flags")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt32Array>()
+        .unwrap();
+    let ndp3_vals = ndp3
+        .column_by_name("double_value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::Float64Array>()
+        .unwrap();
+    let ndp3_parents = ndp3
+        .column_by_name("parent_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt16Array>()
+        .unwrap();
+    // Row 0 is live `req_total{id="1"}`; Row 1 is stale `req_total{id="2"}` sharing parent_id 0;
+    // Row 2 is stale `mem_bytes` with parent_id 1.
+    assert_eq!(ndp3_flags.value(0), 0);
+    assert_eq!(ndp3_vals.value(0), 15.0);
+    assert_eq!(ndp3_parents.value(0), 0);
+
+    assert_eq!(ndp3_flags.value(1), DATA_POINT_FLAG_NO_RECORDED_VALUE);
+    assert!(is_stale_nan(ndp3_vals.value(1)));
+    assert_eq!(ndp3_parents.value(1), 0);
+
+    assert_eq!(ndp3_flags.value(2), DATA_POINT_FLAG_NO_RECORDED_VALUE);
+    assert!(is_stale_nan(ndp3_vals.value(2)));
+    assert_eq!(ndp3_parents.value(2), 1);
+
+    let sdp3 = rec3.summary_data_points().unwrap();
+    assert_eq!(sdp3.num_rows(), 1);
+    let sdp3_flags = sdp3
+        .column_by_name("flags")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt32Array>()
+        .unwrap();
+    let sdp3_sums = sdp3
+        .column_by_name("sum")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::Float64Array>()
+        .unwrap();
+    assert_eq!(sdp3_flags.value(0), DATA_POINT_FLAG_NO_RECORDED_VALUE);
+    assert!(is_stale_nan(sdp3_sums.value(0)));
+
+    let hdp3 = rec3.histogram_data_points().unwrap();
+    assert_eq!(hdp3.num_rows(), 1);
+    let hdp3_flags = hdp3
+        .column_by_name("flags")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt32Array>()
+        .unwrap();
+    let hdp3_sums = hdp3
+        .column_by_name("sum")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::Float64Array>()
+        .unwrap();
+    assert_eq!(hdp3_flags.value(0), DATA_POINT_FLAG_NO_RECORDED_VALUE);
+    assert!(is_stale_nan(hdp3_sums.value(0)));
+
+    // Scrape 4: disappeared series are not re-emitted, and `req_total{id="2"}` can reappear.
+    let scrape4 = concat!(
+        "# HELP req_total Total requests.\n",
+        "# TYPE req_total counter\n",
+        "req_total{id=\"1\"} 18\n",
+        "req_total{id=\"2\"} 25\n",
+    );
+    let opts4 = DecodeOptions::new().with_timestamp_ms(4_000);
+    let rec4 = dec
+        .decode_with_staleness(scrape4.as_bytes(), &Format::TEXT, &opts4, &mut tracker)
+        .unwrap();
+    assert_eq!(tracker.active_series_len(), 2);
+    assert_eq!(rec4.num_metrics(), 1);
+    assert_eq!(rec4.num_data_points(), 2);
+    assert!(
+        rec4.number_data_points()
+            .unwrap()
+            .column_by_name("flags")
+            .is_none()
+    );
+    assert!(rec4.summary_data_points().is_none());
+    assert!(rec4.histogram_data_points().is_none());
+
+    // Scrape 5: a parse error mid-scrape rolls back the tracker so `active_series_len()` stays 2.
+    let bad_scrape =
+        b"# TYPE req_total counter\nreq_total{id=\"1\"} 20\nreq_total{id=\"1\",id=\"1\"} 21\n";
+    assert!(
+        dec.decode_with_staleness(bad_scrape, &Format::TEXT, &opts4, &mut tracker)
+            .is_err()
+    );
+    assert_eq!(tracker.active_series_len(), 2);
+
+    // `flush_target_stale` marks all remaining active series stale and empties the tracker.
+    let opts5 = DecodeOptions::new().with_timestamp_ms(5_000);
+    let flushed = dec.flush_target_stale(&mut tracker, &opts5).unwrap();
+    assert!(tracker.is_empty());
+    assert_eq!(tracker.active_series_len(), 0);
+    assert_eq!(flushed.num_metrics(), 1);
+    assert_eq!(flushed.num_data_points(), 2);
+    let flushed_flags = flushed
+        .number_data_points()
+        .unwrap()
+        .column_by_name("flags")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt32Array>()
+        .unwrap();
+    assert_eq!(flushed_flags.value(0), DATA_POINT_FLAG_NO_RECORDED_VALUE);
+    assert_eq!(flushed_flags.value(1), DATA_POINT_FLAG_NO_RECORDED_VALUE);
+
+    // A second flush on an already-empty tracker produces an empty record set.
+    let empty_flush = dec.encode_stale_target(&mut tracker, &opts5).unwrap();
+    assert!(empty_flush.is_empty());
+}
+
+#[test]
+fn decode_stream_with_staleness_chunks_disappeared_series_and_rolls_back_on_drop() {
+    let mut dec = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    let opts = DecodeOptions::new()
+        .with_timestamp_ms(1_000)
+        .with_max_data_points_per_batch(2);
+
+    let scrape1 = concat!(
+        "# TYPE g gauge\n",
+        "g{k=\"1\"} 1\n",
+        "g{k=\"2\"} 2\n",
+        "g{k=\"3\"} 3\n",
+        "g{k=\"4\"} 4\n",
+    );
+    let chunks1: Vec<_> = dec
+        .decode_stream_with_staleness(scrape1.as_bytes(), &Format::TEXT, &opts, &mut tracker)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(chunks1.len(), 2);
+    assert_eq!(tracker.active_series_len(), 4);
+
+    // Early drop mid-scrape rolls back uncommitted seen flags.
+    {
+        let mut partial = dec.decode_stream_with_staleness(
+            b"# TYPE g gauge\ng{k=\"1\"} 10\ng{k=\"2\"} 20\ng{k=\"3\"} 30\n",
+            &Format::TEXT,
+            &opts,
+            &mut tracker,
+        );
+        assert!(partial.next().unwrap().is_ok());
+    }
+    assert_eq!(tracker.active_series_len(), 4);
+
+    // Next scrape has only `g{k="1"}`, so 3 series (`k="2"`, `k="3"`, `k="4"`) disappear and are
+    // emitted across chunks of at most 2 data points each (1 live + 1 stale, then 2 stale).
+    let opts2 = DecodeOptions::new()
+        .with_timestamp_ms(2_000)
+        .with_max_data_points_per_batch(2);
+    let chunks2: Vec<_> = dec
+        .decode_stream_with_staleness(
+            b"# TYPE g gauge\ng{k=\"1\"} 10\n",
+            &Format::TEXT,
+            &opts2,
+            &mut tracker,
+        )
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(chunks2.len(), 2);
+    assert_eq!(chunks2[0].num_data_points(), 2);
+    assert_eq!(chunks2[1].num_data_points(), 2);
+    assert_eq!(tracker.active_series_len(), 1);
+}
