@@ -27,7 +27,7 @@ use std::pin::{Pin, pin};
 use std::task::{Context, Poll, Waker};
 
 use benchfmt::{CountingAlloc, Suite};
-use expfmt::arrow::{ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep};
+use expfmt::arrow::{ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep, StalenessTracker};
 use expfmt::format::Format;
 
 #[global_allocator]
@@ -214,6 +214,32 @@ fn main() {
                                 DecodeStep::Done => break,
                             }
                         }
+                    }
+                },
+            )
+            .bench(
+                format!("Decode/case={case}/mode=decode_staleness"),
+                move |b| {
+                    let mut decoder = ArrowDecoder::new();
+                    let mut tracker = StalenessTracker::new();
+                    black_box(
+                        decoder
+                            .decode_with_staleness(payload, &Format::TEXT, &opts, &mut tracker)
+                            .unwrap(),
+                    );
+
+                    b.set_bytes(bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        let records = decoder
+                            .decode_with_staleness(
+                                black_box(payload),
+                                &Format::TEXT,
+                                &opts,
+                                &mut tracker,
+                            )
+                            .unwrap();
+                        black_box(records);
                     }
                 },
             );
