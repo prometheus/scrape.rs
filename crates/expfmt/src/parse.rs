@@ -90,7 +90,8 @@ pub enum CounterResetHint {
 pub struct Histogram<C, B> {
     /// Counter reset hint.
     pub counter_reset_hint: CounterResetHint,
-    /// Resolution of the exponential buckets.
+    /// Resolution of the exponential buckets, or -53 for custom buckets (NHCB), where the
+    /// spans index the bounds in `custom_values`.
     pub schema: i32,
     /// Width of the zero bucket.
     pub zero_threshold: f64,
