@@ -768,6 +768,14 @@ fn insert_nhcb_bucket(
             "bucket count must be non-negative: le={upper_bound}, count={cumulative_count}"
         )));
     }
+    // Go's happy case: buckets usually arrive sorted, so append without a search.
+    if buckets
+        .last()
+        .is_none_or(|&(bound, previous)| bound < upper_bound && previous <= cumulative_count)
+    {
+        buckets.push((upper_bound, cumulative_count));
+        return Ok(());
+    }
     let index = buckets.partition_point(|&(bound, _)| bound < upper_bound);
     let next = buckets.get(index).copied();
     if next.is_some_and(|(bound, _)| bound == upper_bound) {
@@ -849,9 +857,12 @@ fn compact_buckets<B: Bucket>(
         current = absolute(current, bucket);
         current == B::ZERO
     });
+    // The first span's offset is a start index, not a gap, so it never needs compaction.
     if !has_empty_bucket
+        && spans.first().is_none_or(|span| span.length != 0)
         && spans
             .iter()
+            .skip(1)
             .all(|span| i64::from(span.offset) > max_empty_buckets as i64 && span.length != 0)
     {
         return;
