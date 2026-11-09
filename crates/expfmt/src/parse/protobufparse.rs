@@ -675,71 +675,73 @@ fn convert_to_nhcb(
         .iter()
         .all(|&(_, cumulative_count)| is_integer(cumulative_count))
         || count != (count.round() as u64) as f64;
-    let count_mismatch = if is_float {
-        count != last_count
-    } else {
-        count as u64 != last_count as u64
-    };
-    if count_mismatch {
+    if count != last_count {
         return Err(ParseError::InvalidProtobuf(format!(
             "count mismatch: count={count} != le=+Inf count={last_count}"
         )));
     }
     if is_float {
-        reset_nhcb(float_target, source, buckets, counter_reset_hint);
-        float_target.count = count;
         let mut previous = 0.0;
-        for &(_, cumulative_count) in buckets.iter() {
-            float_target
-                .positive_buckets
-                .push(cumulative_count - previous);
+        let bucket_counts = buckets.iter().map(|&(_, cumulative_count)| {
+            let bucket_count = cumulative_count - previous;
             previous = cumulative_count;
-        }
-        compact_buckets(
-            &mut float_target.positive_buckets,
-            &mut float_target.positive_spans,
+            bucket_count
+        });
+        fill_nhcb(
+            float_target,
+            count,
+            source.sample_sum,
+            buckets,
+            bucket_counts,
+            counter_reset_hint,
             0,
         );
     } else {
-        reset_nhcb(int_target, source, buckets, counter_reset_hint);
-        int_target.count = count as u64;
         let (mut previous_cumulative_count, mut previous_bucket_count) = (0i64, 0i64);
-        for &(_, cumulative_count) in buckets.iter() {
+        let deltas = buckets.iter().map(|&(_, cumulative_count)| {
             let cumulative_count = cumulative_count as i64;
             let bucket_count = cumulative_count.wrapping_sub(previous_cumulative_count);
-            int_target
-                .positive_buckets
-                .push(bucket_count.wrapping_sub(previous_bucket_count));
+            let delta = bucket_count.wrapping_sub(previous_bucket_count);
             previous_cumulative_count = cumulative_count;
             previous_bucket_count = bucket_count;
-        }
-        compact_buckets(
-            &mut int_target.positive_buckets,
-            &mut int_target.positive_spans,
+            delta
+        });
+        fill_nhcb(
+            int_target,
+            count as u64,
+            source.sample_sum,
+            buckets,
+            deltas,
+            counter_reset_hint,
             2,
         );
     }
     Ok(is_float)
 }
 
-/// Sets every field of an NHCB except the count and the bucket counts, which it clears.
-fn reset_nhcb<C: Default, B>(
+/// Fills `target` with an NHCB over `buckets`, then compacts it like Go's `Compact`.
+fn fill_nhcb<C: Default, B: Bucket>(
     target: &mut Histogram<C, B>,
-    source: &dto::Histogram,
+    count: C,
+    sum: f64,
     buckets: &[(f64, f64)],
+    bucket_counts: impl Iterator<Item = B>,
     counter_reset_hint: CounterResetHint,
+    max_empty_buckets: usize,
 ) {
     target.counter_reset_hint = counter_reset_hint;
     target.schema = CUSTOM_BUCKETS_SCHEMA;
     target.zero_threshold = 0.0;
     target.zero_count = C::default();
-    target.sum = source.sample_sum;
+    target.count = count;
+    target.sum = sum;
     target.positive_spans.clear();
     target.positive_spans.push(Span {
         offset: 0,
         length: buckets.len() as u32,
     });
     target.positive_buckets.clear();
+    target.positive_buckets.extend(bucket_counts);
     target.negative_spans.clear();
     target.negative_buckets.clear();
     // The last bucket is always +Inf, which Go does not store.
@@ -748,6 +750,11 @@ fn reset_nhcb<C: Default, B>(
         buckets[..buckets.len() - 1]
             .iter()
             .map(|&(upper_bound, _)| upper_bound),
+    );
+    compact_buckets(
+        &mut target.positive_buckets,
+        &mut target.positive_spans,
+        max_empty_buckets,
     );
 }
 
@@ -777,19 +784,20 @@ fn insert_nhcb_bucket(
         return Ok(());
     }
     let index = buckets.partition_point(|&(bound, _)| bound < upper_bound);
-    let next = buckets.get(index).copied();
-    if next.is_some_and(|(bound, _)| bound == upper_bound) {
-        return Ok(());
+    if let Some(&(next_bound, next)) = buckets.get(index) {
+        if next_bound == upper_bound {
+            return Ok(());
+        }
+        if cumulative_count > next {
+            return Err(ParseError::InvalidProtobuf(format!(
+                "count is not cumulative: {cumulative_count} > {next}"
+            )));
+        }
     }
-    let previous = index.checked_sub(1).map(|previous| buckets[previous].1);
-    if let Some(previous) = previous.filter(|&previous| cumulative_count < previous) {
+    if index > 0 && cumulative_count < buckets[index - 1].1 {
         return Err(ParseError::InvalidProtobuf(format!(
-            "count is not cumulative: {cumulative_count} < {previous}"
-        )));
-    }
-    if let Some((_, next)) = next.filter(|&(_, next)| cumulative_count > next) {
-        return Err(ParseError::InvalidProtobuf(format!(
-            "count is not cumulative: {cumulative_count} > {next}"
+            "count is not cumulative: {cumulative_count} < {}",
+            buckets[index - 1].1
         )));
     }
     buckets.insert(index, (upper_bound, cumulative_count));
@@ -845,6 +853,7 @@ fn compact_buckets<B: Bucket>(
     spans: &mut Vec<Span>,
     max_empty_buckets: usize,
 ) {
+    debug_assert!(max_empty_buckets == 0 || spans.len() <= 1);
     let absolute = |current: B, bucket: B| {
         if B::DELTA {
             current.add(bucket)
