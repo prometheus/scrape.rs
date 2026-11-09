@@ -675,6 +675,16 @@ fn convert_to_nhcb(
         .iter()
         .all(|&(_, cumulative_count)| is_integer(cumulative_count))
         || count != (count.round() as u64) as f64;
+    let count_mismatch = if is_float {
+        count != last_count
+    } else {
+        count as u64 != last_count as u64
+    };
+    if count_mismatch {
+        return Err(ParseError::InvalidProtobuf(format!(
+            "count mismatch: count={count} != le=+Inf count={last_count}"
+        )));
+    }
     if is_float {
         reset_nhcb(float_target, source, buckets, counter_reset_hint);
         float_target.count = count;
@@ -685,7 +695,6 @@ fn convert_to_nhcb(
                 .push(cumulative_count - previous);
             previous = cumulative_count;
         }
-        check_nhcb_count(count != last_count, count, last_count)?;
         compact_buckets(
             &mut float_target.positive_buckets,
             &mut float_target.positive_spans,
@@ -694,17 +703,16 @@ fn convert_to_nhcb(
     } else {
         reset_nhcb(int_target, source, buckets, counter_reset_hint);
         int_target.count = count as u64;
-        let (mut previous_count, mut previous_delta) = (0i64, 0i64);
+        let (mut previous_cumulative_count, mut previous_bucket_count) = (0i64, 0i64);
         for &(_, cumulative_count) in buckets.iter() {
-            let current = cumulative_count as i64;
-            let delta = current.wrapping_sub(previous_count);
+            let cumulative_count = cumulative_count as i64;
+            let bucket_count = cumulative_count.wrapping_sub(previous_cumulative_count);
             int_target
                 .positive_buckets
-                .push(delta.wrapping_sub(previous_delta));
-            previous_count = current;
-            previous_delta = delta;
+                .push(bucket_count.wrapping_sub(previous_bucket_count));
+            previous_cumulative_count = cumulative_count;
+            previous_bucket_count = bucket_count;
         }
-        check_nhcb_count(int_target.count != last_count as u64, count, last_count)?;
         compact_buckets(
             &mut int_target.positive_buckets,
             &mut int_target.positive_spans,
@@ -777,15 +785,6 @@ fn insert_nhcb_bucket(
         )));
     }
     buckets.insert(index, (upper_bound, cumulative_count));
-    Ok(())
-}
-
-fn check_nhcb_count(mismatch: bool, count: f64, last_count: f64) -> Result<(), ParseError> {
-    if mismatch {
-        return Err(ParseError::InvalidProtobuf(format!(
-            "count mismatch: count={count} != le=+Inf count={last_count}"
-        )));
-    }
     Ok(())
 }
 
@@ -915,9 +914,6 @@ fn compact_buckets<B: Bucket>(
             && empty <= max_empty_buckets
         {
             bucket_index += empty;
-            if B::DELTA {
-                current = B::ZERO;
-            }
             pos_in_span += empty as u32;
             continue;
         }
