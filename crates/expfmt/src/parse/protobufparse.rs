@@ -644,68 +644,13 @@ fn convert_to_nhcb(
     float_target: &mut Histogram<f64, f64>,
     counter_reset_hint: CounterResetHint,
 ) -> Result<bool, ParseError> {
-    let count = if source.sample_count_float == 0.0 {
-        source.sample_count as f64
-    } else {
-        source.sample_count_float
-    };
-    if count < 0.0 {
-        return Err(ParseError::InvalidProtobuf(format!(
-            "count must be non-negative: count={count}"
-        )));
-    }
-    buckets.clear();
-    for bucket in &source.bucket {
-        let cumulative_count = if bucket.cumulative_count_float == 0.0 {
-            bucket.cumulative_count as f64
-        } else {
-            bucket.cumulative_count_float
-        };
-        insert_nhcb_bucket(buckets, bucket.upper_bound, cumulative_count)?;
-    }
-    if buckets
-        .last()
-        .is_none_or(|&(upper_bound, _)| upper_bound != f64::INFINITY)
-    {
-        buckets.push((f64::INFINITY, count));
-    }
-    let last_count = buckets[buckets.len() - 1].1;
-    let is_integer = |value: f64| value == (value.round() as i64) as f64;
-    let is_float = !buckets
+    let count = float_or_int(source.sample_count_float, source.sample_count);
+    collect_nhcb_buckets(source, count, buckets)?;
+    let cumulative_counts = buckets
         .iter()
-        .all(|&(_, cumulative_count)| is_integer(cumulative_count))
-        || count != (count.round() as u64) as f64;
-    if count != last_count {
-        return Err(ParseError::InvalidProtobuf(format!(
-            "count mismatch: count={count} != le=+Inf count={last_count}"
-        )));
-    }
-    if is_float {
-        let mut previous = 0.0;
-        let bucket_counts = buckets.iter().map(|&(_, cumulative_count)| {
-            let bucket_count = cumulative_count - previous;
-            previous = cumulative_count;
-            bucket_count
-        });
-        fill_nhcb(
-            float_target,
-            count,
-            source.sample_sum,
-            buckets,
-            bucket_counts,
-            counter_reset_hint,
-            0,
-        );
-    } else {
-        let (mut previous_cumulative_count, mut previous_bucket_count) = (0i64, 0i64);
-        let deltas = buckets.iter().map(|&(_, cumulative_count)| {
-            let cumulative_count = cumulative_count as i64;
-            let bucket_count = cumulative_count.wrapping_sub(previous_cumulative_count);
-            let delta = bucket_count.wrapping_sub(previous_bucket_count);
-            previous_cumulative_count = cumulative_count;
-            previous_bucket_count = bucket_count;
-            delta
-        });
+        .map(|&(_, cumulative_count)| cumulative_count);
+    if is_integer_histogram(count, buckets) {
+        let deltas = differences(differences(cumulative_counts.map(|value| value as i64)));
         fill_nhcb(
             int_target,
             count as u64,
@@ -715,8 +660,71 @@ fn convert_to_nhcb(
             counter_reset_hint,
             2,
         );
+        return Ok(false);
     }
-    Ok(is_float)
+    let bucket_counts = differences(cumulative_counts);
+    fill_nhcb(
+        float_target,
+        count,
+        source.sample_sum,
+        buckets,
+        bucket_counts,
+        counter_reset_hint,
+        0,
+    );
+    Ok(true)
+}
+
+/// Go reads the float field of a count unless it is 0.
+fn float_or_int(float: f64, int: u64) -> f64 {
+    Some(float)
+        .filter(|&float| float != 0.0)
+        .unwrap_or(int as f64)
+}
+
+/// Fills `buckets` with the sorted `(upper_bound, cumulative_count)` pairs of `source`, ending
+/// with a `+Inf` bucket, and checks them like Go's `TempHistogram`.
+fn collect_nhcb_buckets(
+    source: &dto::Histogram,
+    count: f64,
+    buckets: &mut Vec<(f64, f64)>,
+) -> Result<(), ParseError> {
+    ensure(count >= 0.0 || count.is_nan(), || {
+        format!("count must be non-negative: count={count}")
+    })?;
+    buckets.clear();
+    for bucket in &source.bucket {
+        let cumulative_count = float_or_int(bucket.cumulative_count_float, bucket.cumulative_count);
+        insert_nhcb_bucket(buckets, bucket.upper_bound, cumulative_count)?;
+    }
+    let has_infinity_bucket = buckets
+        .last()
+        .is_some_and(|&(upper_bound, _)| upper_bound == f64::INFINITY);
+    if !has_infinity_bucket {
+        buckets.push((f64::INFINITY, count));
+    }
+    let last_count = buckets[buckets.len() - 1].1;
+    ensure(count == last_count, || {
+        format!("count mismatch: count={count} != le=+Inf count={last_count}")
+    })
+}
+
+/// Go's `TempHistogram.Convert` returns an integer histogram when every count is a whole number.
+fn is_integer_histogram(count: f64, buckets: &[(f64, f64)]) -> bool {
+    let is_integer = |value: f64| value == (value.round() as i64) as f64;
+    count == (count.round() as u64) as f64
+        && buckets
+            .iter()
+            .all(|&(_, cumulative_count)| is_integer(cumulative_count))
+}
+
+/// Each value minus the value before it, starting from zero.
+fn differences<B: Bucket>(values: impl Iterator<Item = B>) -> impl Iterator<Item = B> {
+    values.scan(B::ZERO, |previous, value| {
+        let difference = value.add(previous.neg());
+        *previous = value;
+        Some(difference)
+    })
 }
 
 /// Fills `target` with an NHCB over `buckets`, then compacts it like Go's `Compact`.
@@ -765,43 +773,48 @@ fn insert_nhcb_bucket(
     upper_bound: f64,
     cumulative_count: f64,
 ) -> Result<(), ParseError> {
-    if upper_bound.is_nan() {
-        return Err(ParseError::InvalidProtobuf(
-            "bucket boundary must not be NaN".to_owned(),
-        ));
-    }
-    if cumulative_count < 0.0 {
-        return Err(ParseError::InvalidProtobuf(format!(
-            "bucket count must be non-negative: le={upper_bound}, count={cumulative_count}"
-        )));
-    }
-    // Go's happy case: buckets usually arrive sorted, so append without a search.
-    if buckets
-        .last()
-        .is_none_or(|&(bound, previous)| bound < upper_bound && previous <= cumulative_count)
-    {
-        buckets.push((upper_bound, cumulative_count));
+    ensure(!upper_bound.is_nan(), || {
+        "bucket boundary must not be NaN".to_owned()
+    })?;
+    ensure(cumulative_count >= 0.0 || cumulative_count.is_nan(), || {
+        format!("bucket count must be non-negative: le={upper_bound}, count={cumulative_count}")
+    })?;
+    let index = buckets.partition_point(|&(bound, _)| bound < upper_bound);
+    let repeated = buckets
+        .get(index)
+        .is_some_and(|&(bound, _)| bound == upper_bound);
+    if repeated {
         return Ok(());
     }
-    let index = buckets.partition_point(|&(bound, _)| bound < upper_bound);
-    if let Some(&(next_bound, next)) = buckets.get(index) {
-        if next_bound == upper_bound {
-            return Ok(());
-        }
-        if cumulative_count > next {
-            return Err(ParseError::InvalidProtobuf(format!(
-                "count is not cumulative: {cumulative_count} > {next}"
-            )));
-        }
-    }
-    if index > 0 && cumulative_count < buckets[index - 1].1 {
-        return Err(ParseError::InvalidProtobuf(format!(
-            "count is not cumulative: {cumulative_count} < {}",
-            buckets[index - 1].1
-        )));
-    }
+    check_cumulative(buckets, index, cumulative_count)?;
     buckets.insert(index, (upper_bound, cumulative_count));
     Ok(())
+}
+
+/// Checks that a bucket inserted at `index` keeps the counts cumulative.
+fn check_cumulative(
+    buckets: &[(f64, f64)],
+    index: usize,
+    cumulative_count: f64,
+) -> Result<(), ParseError> {
+    let previous = index
+        .checked_sub(1)
+        .map_or(f64::NEG_INFINITY, |previous| buckets[previous].1);
+    let next = buckets.get(index).map_or(f64::INFINITY, |&(_, next)| next);
+    ensure(
+        !(cumulative_count < previous || cumulative_count > next),
+        || {
+            format!(
+                "count is not cumulative: {cumulative_count} is not between {previous} and {next}"
+            )
+        },
+    )
+}
+
+fn ensure(condition: bool, message: impl FnOnce() -> String) -> Result<(), ParseError> {
+    condition
+        .then_some(())
+        .ok_or_else(|| ParseError::InvalidProtobuf(message()))
 }
 
 fn copy_spans(target: &mut Vec<Span>, source: &[dto::BucketSpan]) {
