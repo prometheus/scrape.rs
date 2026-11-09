@@ -133,7 +133,7 @@ fn render<'a>(mut parser: impl Parser<'a>, start_timestamps: bool) -> Vec<u8> {
                 match histogram {
                     HistogramRef::Int(histogram) => write!(
                         out,
-                        " int schema={} count={} sum={:016x} zero_threshold={:016x} zero_count={} hint={} pos_spans={} pos={} neg_spans={} neg={}",
+                        " int schema={} count={} sum={:016x} zero_threshold={:016x} zero_count={} hint={} pos_spans={} pos={} neg_spans={} neg={} custom={}",
                         histogram.schema,
                         histogram.count,
                         histogram.sum.to_bits(),
@@ -144,10 +144,11 @@ fn render<'a>(mut parser: impl Parser<'a>, start_timestamps: bool) -> Vec<u8> {
                         ints_text(&histogram.positive_buckets),
                         spans_text(&histogram.negative_spans),
                         ints_text(&histogram.negative_buckets),
+                        floats_text(&histogram.custom_values),
                     ),
                     HistogramRef::Float(histogram) => write!(
                         out,
-                        " float schema={} count={:016x} sum={:016x} zero_threshold={:016x} zero_count={:016x} hint={} pos_spans={} pos={} neg_spans={} neg={}",
+                        " float schema={} count={:016x} sum={:016x} zero_threshold={:016x} zero_count={:016x} hint={} pos_spans={} pos={} neg_spans={} neg={} custom={}",
                         histogram.schema,
                         histogram.count.to_bits(),
                         histogram.sum.to_bits(),
@@ -158,6 +159,7 @@ fn render<'a>(mut parser: impl Parser<'a>, start_timestamps: bool) -> Vec<u8> {
                         floats_text(&histogram.positive_buckets),
                         spans_text(&histogram.negative_spans),
                         floats_text(&histogram.negative_buckets),
+                        floats_text(&histogram.custom_values),
                     ),
                 }
                 .unwrap();

@@ -1,0 +1,8 @@
+name: "count_mismatch"
+type: HISTOGRAM
+metric: <
+  histogram: <
+    sample_count: 3
+    bucket: < cumulative_count: 2 upper_bound: inf >
+  >
+>

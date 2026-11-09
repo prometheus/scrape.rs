@@ -26,6 +26,9 @@ use super::{
 };
 use crate::dto;
 
+/// Go's `histogram.CustomBucketsSchema`.
+const CUSTOM_BUCKETS_SCHEMA: i32 = -53;
+
 /// Go's `binary.MaxVarintLen32`, the longest length prefix Go accepts.
 const MAX_VARINT_LEN_32: usize = 5;
 
@@ -34,9 +37,10 @@ static EMPTY_DTO_HISTOGRAM: LazyLock<dto::Histogram> = LazyLock::new(dto::Histog
 
 /// Parser for varint length-delimited `MetricFamily` messages (`FmtProtoDelim`).
 ///
-/// Mirrors Go's `textparse.NewProtobufParser` with NHCB conversion and type and unit labels
+/// Mirrors Go's `textparse.NewProtobufParser` with NHCB conversion on and type and unit labels
 /// turned off. Histograms are only returned as native histograms: a histogram metric without
-/// native buckets is skipped, and classic buckets are never returned as series.
+/// native buckets is converted to a native histogram with custom buckets (NHCB, schema -53),
+/// and classic buckets are never returned as series.
 pub struct ProtobufParser<'a> {
     input: &'a [u8],
     /// Offset of the next length prefix in `input`.
@@ -62,6 +66,8 @@ pub struct ProtobufParser<'a> {
     int_histogram: Histogram<u64, i64>,
     float_histogram: Histogram<f64, f64>,
     is_float_histogram: bool,
+    /// `(upper_bound, cumulative_count)` of the classic buckets during NHCB conversion.
+    nhcb_buckets: Vec<(f64, f64)>,
 }
 
 impl<'a> ProtobufParser<'a> {
@@ -85,6 +91,7 @@ impl<'a> ProtobufParser<'a> {
             int_histogram: Histogram::default(),
             float_histogram: Histogram::default(),
             is_float_histogram: false,
+            nhcb_buckets: Vec::new(),
         }
     }
 
@@ -118,16 +125,13 @@ impl<'a> ProtobufParser<'a> {
         Ok(true)
     }
 
-    /// Moves to the next metric, skipping histograms without native buckets.
     fn next_metric(&mut self) -> bool {
-        while self.next_metric_index < self.family.metric.len() {
-            self.metric_index = self.next_metric_index;
-            self.next_metric_index += 1;
-            if !self.is_histogram_kind() || is_native_histogram(self.dto_histogram()) {
-                return true;
-            }
+        if self.next_metric_index >= self.family.metric.len() {
+            return false;
         }
-        false
+        self.metric_index = self.next_metric_index;
+        self.next_metric_index += 1;
+        true
     }
 
     fn metric(&self) -> &dto::Metric {
@@ -269,7 +273,8 @@ impl<'a> ProtobufParser<'a> {
         }
     }
 
-    /// Go's `Histogram`, run when the parser reaches a native histogram.
+    /// Go's `Histogram`, or Go's `convertToNHCB` for a histogram without native buckets, run
+    /// when the parser reaches a histogram.
     fn load_histogram(&mut self) -> Result<(), ParseError> {
         let counter_reset_hint = if self.kind() == dto::MetricType::GaugeHistogram {
             CounterResetHint::Gauge
@@ -278,6 +283,16 @@ impl<'a> ProtobufParser<'a> {
         };
         // Not `dto_histogram()`, so the targets below can be borrowed mutably.
         let source = histogram_of(&self.family, self.metric_index).unwrap_or(&EMPTY_DTO_HISTOGRAM);
+        if !is_native_histogram(source) {
+            self.is_float_histogram = convert_to_nhcb(
+                source,
+                &mut self.nhcb_buckets,
+                &mut self.int_histogram,
+                &mut self.float_histogram,
+                counter_reset_hint,
+            )?;
+            return Ok(());
+        }
         let name = self.family.name.as_str();
         self.is_float_histogram = source.sample_count_float > 0.0 || source.zero_count_float > 0.0;
         if self.is_float_histogram {
@@ -608,14 +623,169 @@ fn fill_histogram<C, B: Bucket>(
     )?;
     positive_buckets.clone_into(&mut target.positive_buckets);
     negative_buckets.clone_into(&mut target.negative_buckets);
+    target.custom_values.clear();
     target.counter_reset_hint = counter_reset_hint;
     target.schema = source.schema;
     target.zero_threshold = source.zero_threshold;
     target.sum = source.sample_sum;
     copy_spans(&mut target.positive_spans, &source.positive_span);
     copy_spans(&mut target.negative_spans, &source.negative_span);
-    compact_buckets(&mut target.positive_buckets, &mut target.positive_spans);
-    compact_buckets(&mut target.negative_buckets, &mut target.negative_spans);
+    compact_buckets(&mut target.positive_buckets, &mut target.positive_spans, 0);
+    compact_buckets(&mut target.negative_buckets, &mut target.negative_spans, 0);
+    Ok(())
+}
+
+/// Go's `convertToNHCB` with `convertnhcb.TempHistogram`: turns the classic buckets into one
+/// native histogram with custom buckets. Returns `true` for a float histogram.
+fn convert_to_nhcb(
+    source: &dto::Histogram,
+    buckets: &mut Vec<(f64, f64)>,
+    int_target: &mut Histogram<u64, i64>,
+    float_target: &mut Histogram<f64, f64>,
+    counter_reset_hint: CounterResetHint,
+) -> Result<bool, ParseError> {
+    let count = if source.sample_count_float == 0.0 {
+        source.sample_count as f64
+    } else {
+        source.sample_count_float
+    };
+    if count < 0.0 {
+        return Err(ParseError::InvalidProtobuf(format!(
+            "count must be non-negative: count={count}"
+        )));
+    }
+    buckets.clear();
+    for bucket in &source.bucket {
+        let cumulative_count = if bucket.cumulative_count_float == 0.0 {
+            bucket.cumulative_count as f64
+        } else {
+            bucket.cumulative_count_float
+        };
+        insert_nhcb_bucket(buckets, bucket.upper_bound, cumulative_count)?;
+    }
+    if buckets
+        .last()
+        .is_none_or(|&(upper_bound, _)| upper_bound != f64::INFINITY)
+    {
+        buckets.push((f64::INFINITY, count));
+    }
+    let last_count = buckets[buckets.len() - 1].1;
+    let is_integer = |value: f64| value == (value.round() as i64) as f64;
+    let is_float = !buckets
+        .iter()
+        .all(|&(_, cumulative_count)| is_integer(cumulative_count))
+        || count != (count.round() as u64) as f64;
+    if is_float {
+        reset_nhcb(float_target, source, buckets, counter_reset_hint);
+        float_target.count = count;
+        let mut previous = 0.0;
+        for &(_, cumulative_count) in buckets.iter() {
+            float_target
+                .positive_buckets
+                .push(cumulative_count - previous);
+            previous = cumulative_count;
+        }
+        check_nhcb_count(count != last_count, count, last_count)?;
+        compact_buckets(
+            &mut float_target.positive_buckets,
+            &mut float_target.positive_spans,
+            0,
+        );
+    } else {
+        reset_nhcb(int_target, source, buckets, counter_reset_hint);
+        int_target.count = count as u64;
+        let (mut previous_count, mut previous_delta) = (0i64, 0i64);
+        for &(_, cumulative_count) in buckets.iter() {
+            let current = cumulative_count as i64;
+            let delta = current.wrapping_sub(previous_count);
+            int_target
+                .positive_buckets
+                .push(delta.wrapping_sub(previous_delta));
+            previous_count = current;
+            previous_delta = delta;
+        }
+        check_nhcb_count(int_target.count != last_count as u64, count, last_count)?;
+        compact_buckets(
+            &mut int_target.positive_buckets,
+            &mut int_target.positive_spans,
+            2,
+        );
+    }
+    Ok(is_float)
+}
+
+/// Sets every field of an NHCB except the count and the bucket counts, which it clears.
+fn reset_nhcb<C: Default, B>(
+    target: &mut Histogram<C, B>,
+    source: &dto::Histogram,
+    buckets: &[(f64, f64)],
+    counter_reset_hint: CounterResetHint,
+) {
+    target.counter_reset_hint = counter_reset_hint;
+    target.schema = CUSTOM_BUCKETS_SCHEMA;
+    target.zero_threshold = 0.0;
+    target.zero_count = C::default();
+    target.sum = source.sample_sum;
+    target.positive_spans.clear();
+    target.positive_spans.push(Span {
+        offset: 0,
+        length: buckets.len() as u32,
+    });
+    target.positive_buckets.clear();
+    target.negative_spans.clear();
+    target.negative_buckets.clear();
+    // The last bucket is always +Inf, which Go does not store.
+    target.custom_values.clear();
+    target.custom_values.extend(
+        buckets[..buckets.len() - 1]
+            .iter()
+            .map(|&(upper_bound, _)| upper_bound),
+    );
+}
+
+/// Go's `TempHistogram.SetBucketCount`: keeps `buckets` sorted by upper bound and cumulative,
+/// and ignores a repeated upper bound.
+fn insert_nhcb_bucket(
+    buckets: &mut Vec<(f64, f64)>,
+    upper_bound: f64,
+    cumulative_count: f64,
+) -> Result<(), ParseError> {
+    if upper_bound.is_nan() {
+        return Err(ParseError::InvalidProtobuf(
+            "bucket boundary must not be NaN".to_owned(),
+        ));
+    }
+    if cumulative_count < 0.0 {
+        return Err(ParseError::InvalidProtobuf(format!(
+            "bucket count must be non-negative: le={upper_bound}, count={cumulative_count}"
+        )));
+    }
+    let index = buckets.partition_point(|&(bound, _)| bound < upper_bound);
+    let next = buckets.get(index).copied();
+    if next.is_some_and(|(bound, _)| bound == upper_bound) {
+        return Ok(());
+    }
+    let previous = index.checked_sub(1).map(|previous| buckets[previous].1);
+    if let Some(previous) = previous.filter(|&previous| cumulative_count < previous) {
+        return Err(ParseError::InvalidProtobuf(format!(
+            "count is not cumulative: {cumulative_count} < {previous}"
+        )));
+    }
+    if let Some((_, next)) = next.filter(|&(_, next)| cumulative_count > next) {
+        return Err(ParseError::InvalidProtobuf(format!(
+            "count is not cumulative: {cumulative_count} > {next}"
+        )));
+    }
+    buckets.insert(index, (upper_bound, cumulative_count));
+    Ok(())
+}
+
+fn check_nhcb_count(mismatch: bool, count: f64, last_count: f64) -> Result<(), ParseError> {
+    if mismatch {
+        return Err(ParseError::InvalidProtobuf(format!(
+            "count mismatch: count={count} != le=+Inf count={last_count}"
+        )));
+    }
     Ok(())
 }
 
@@ -657,9 +827,17 @@ impl Bucket for f64 {
     }
 }
 
-/// Go's `compactBuckets` with `maxEmptyBuckets` 0: removes empty buckets and merges spans.
-/// The caller has checked that the spans cover exactly `buckets.len()` buckets.
-fn compact_buckets<B: Bucket>(buckets: &mut Vec<B>, spans: &mut Vec<Span>) {
+/// Go's `compactBuckets`: removes empty buckets, except runs of at most `max_empty_buckets`
+/// inside a span, and merges spans. The caller has checked that the spans cover exactly
+/// `buckets.len()` buckets.
+///
+/// Go's last step, which merges spans less than `max_empty_buckets` apart, is left out: it
+/// only runs for NHCB, which starts with one span and only splits it at longer gaps.
+fn compact_buckets<B: Bucket>(
+    buckets: &mut Vec<B>,
+    spans: &mut Vec<Span>,
+    max_empty_buckets: usize,
+) {
     let absolute = |current: B, bucket: B| {
         if B::DELTA {
             current.add(bucket)
@@ -672,7 +850,11 @@ fn compact_buckets<B: Bucket>(buckets: &mut Vec<B>, spans: &mut Vec<Span>) {
         current = absolute(current, bucket);
         current == B::ZERO
     });
-    if !has_empty_bucket && spans.iter().all(|span| span.offset > 0 && span.length != 0) {
+    if !has_empty_bucket
+        && spans
+            .iter()
+            .all(|span| i64::from(span.offset) > max_empty_buckets as i64 && span.length != 0)
+    {
         return;
     }
 
@@ -726,6 +908,17 @@ fn compact_buckets<B: Bucket>(buckets: &mut Vec<B>, spans: &mut Vec<Span>) {
                 pos_in_span = 0;
                 span_index += 1;
             }
+            continue;
+        }
+        if pos_in_span > 0
+            && empty < (spans[span_index].length - pos_in_span) as usize
+            && empty <= max_empty_buckets
+        {
+            bucket_index += empty;
+            if B::DELTA {
+                current = B::ZERO;
+            }
+            pos_in_span += empty as u32;
             continue;
         }
         if B::DELTA && bucket_index + empty < buckets.len() {
