@@ -15,6 +15,8 @@
 
 #[cfg(feature = "arrow")]
 pub mod arrow;
+#[cfg(feature = "discovery")]
+pub mod discovery;
 #[cfg(feature = "dto")]
 pub mod dto;
 pub mod format;

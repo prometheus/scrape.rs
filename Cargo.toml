@@ -15,6 +15,7 @@ exclude = ["tests/otap-compat"]
 [features]
 default = ["arrow", "dto"]
 arrow = ["dep:arrow-array", "dep:arrow-buffer", "dep:arrow-schema"]
+discovery = ["dep:serde", "dep:serde_json"]
 dto = ["dep:prost", "dep:prost-types"]
 
 [dependencies]
@@ -23,6 +24,8 @@ arrow-buffer = { version = "59", default-features = false, optional = true }
 arrow-schema = { version = "59", default-features = false, optional = true }
 prost = { version = "0.14", optional = true }
 prost-types = { version = "0.14", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 thiserror = "2"
 
 [dev-dependencies]
