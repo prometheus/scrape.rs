@@ -11,15 +11,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Prometheus-compatible `HTTPClientConfig` schema, validation, and secret redaction.
+//! Prometheus-compatible `HTTPClientConfig` schema, validation, and `reqwest` client helpers.
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const REDACTED_SECRET: &str = "<secret>";
+
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 const GRANT_TYPE_JWT_BEARER: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 
@@ -83,6 +89,15 @@ impl TlsVersion {
             Self::Tls11 => "TLS11",
             Self::Tls12 => "TLS12",
             Self::Tls13 => "TLS13",
+        }
+    }
+
+    const fn to_reqwest(self) -> reqwest::tls::Version {
+        match self {
+            Self::Tls10 => reqwest::tls::Version::TLS_1_0,
+            Self::Tls11 => reqwest::tls::Version::TLS_1_1,
+            Self::Tls12 => reqwest::tls::Version::TLS_1_2,
+            Self::Tls13 => reqwest::tls::Version::TLS_1_3,
         }
     }
 }
@@ -155,6 +170,22 @@ impl BasicAuth {
         self.username_file = join_dir(dir, &self.username_file);
         self.password_file = join_dir(dir, &self.password_file);
     }
+
+    fn resolve_username(&self) -> Result<String, HttpConfigError> {
+        if !self.username_file.is_empty() {
+            Ok(fs::read_to_string(&self.username_file)?.trim().to_owned())
+        } else {
+            Ok(self.username.clone())
+        }
+    }
+
+    fn resolve_password(&self) -> Result<String, HttpConfigError> {
+        if !self.password_file.is_empty() {
+            Ok(fs::read_to_string(&self.password_file)?.trim().to_owned())
+        } else {
+            Ok(self.password.clone())
+        }
+    }
 }
 
 /// HTTP `Authorization` header configuration matching Prometheus `config.Authorization`.
@@ -194,6 +225,25 @@ impl Authorization {
     /// Joins relative file paths with `dir`.
     pub fn set_directory(&mut self, dir: &Path) {
         self.credentials_file = join_dir(dir, &self.credentials_file);
+    }
+
+    fn resolve_header_value(&self) -> Result<Option<String>, HttpConfigError> {
+        let creds = if !self.credentials_file.is_empty() {
+            fs::read_to_string(&self.credentials_file)?
+                .trim()
+                .to_owned()
+        } else {
+            self.credentials.trim().to_owned()
+        };
+        if creds.is_empty() {
+            return Ok(None);
+        }
+        let scheme = if self.auth_type.trim().is_empty() {
+            "Bearer"
+        } else {
+            self.auth_type.trim()
+        };
+        Ok(Some(format!("{scheme} {creds}")))
     }
 }
 
@@ -317,6 +367,67 @@ impl TlsConfig {
 
     fn using_client_key(&self) -> bool {
         !self.key.is_empty() || !self.key_file.is_empty() || !self.key_ref.is_empty()
+    }
+
+    fn apply_to_builder(
+        &self,
+        mut builder: reqwest::ClientBuilder,
+    ) -> Result<reqwest::ClientBuilder, HttpConfigError> {
+        self.validate()?;
+        if !self.ca_ref.is_empty() || !self.cert_ref.is_empty() || !self.key_ref.is_empty() {
+            return Err(HttpConfigError::InvalidConfig(
+                "cannot use secret ref without manager".to_owned(),
+            ));
+        }
+        if !self.server_name.is_empty() {
+            return Err(HttpConfigError::InvalidConfig(
+                "tls_config.server_name override is not yet supported".to_owned(),
+            ));
+        }
+        if self.insecure_skip_verify {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        if !self.ca.is_empty() || !self.ca_file.is_empty() {
+            let ca_pem = if !self.ca.is_empty() {
+                self.ca.as_bytes().to_vec()
+            } else {
+                fs::read(&self.ca_file)?
+            };
+            let certs = reqwest::Certificate::from_pem_bundle(&ca_pem)?;
+            if certs.is_empty() {
+                return Err(HttpConfigError::InvalidConfig(
+                    "unable to parse CA certificate PEM".to_owned(),
+                ));
+            }
+            builder = builder.tls_certs_only(certs);
+        }
+        if self.using_client_cert() {
+            let cert_pem = if !self.cert.is_empty() {
+                self.cert.as_bytes().to_vec()
+            } else {
+                fs::read(&self.cert_file)?
+            };
+            let key_pem = if !self.key.is_empty() {
+                self.key.as_bytes().to_vec()
+            } else {
+                fs::read(&self.key_file)?
+            };
+            let mut combined = Vec::with_capacity(cert_pem.len() + 1 + key_pem.len());
+            combined.extend_from_slice(&cert_pem);
+            if !combined.ends_with(b"\n") {
+                combined.push(b'\n');
+            }
+            combined.extend_from_slice(&key_pem);
+            let identity = reqwest::Identity::from_pem(&combined)?;
+            builder = builder.identity(identity);
+        }
+        if let Some(min) = self.min_version {
+            builder = builder.min_tls_version(min.to_reqwest());
+        }
+        if let Some(max) = self.max_version {
+            builder = builder.max_tls_version(max.to_reqwest());
+        }
+        Ok(builder)
     }
 }
 
@@ -894,6 +1005,180 @@ impl HttpClientConfig {
         }
         Ok(())
     }
+
+    /// Builds a [`reqwest::Client`] configured with the TLS, HTTP/2, redirect, timeout, and proxy
+    /// policies from this config.
+    pub fn build_client(&self) -> Result<reqwest::Client, HttpConfigError> {
+        self.check_unsupported_runtime_auth()?;
+        self.proxy_config.validate()?;
+        if let Some(headers) = &self.http_headers {
+            headers.validate()?;
+        }
+
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+            .timeout(DEFAULT_REQUEST_TIMEOUT);
+        if !self.follow_redirects {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        if !self.enable_http2 {
+            builder = builder.http1_only();
+        }
+        builder = self.tls_config.apply_to_builder(builder)?;
+
+        let proxy_headers = build_proxy_header_map(&self.proxy_config.proxy_connect_header)?;
+        if self.proxy_config.proxy_from_environment {
+            if !proxy_headers.is_empty() {
+                return Err(HttpConfigError::InvalidConfig(
+                    "proxy_connect_header with proxy_from_environment is not yet supported"
+                        .to_owned(),
+                ));
+            }
+        } else if let Some(proxy_url) = &self.proxy_config.proxy_url
+            && !proxy_url.is_empty()
+        {
+            let mut proxy = reqwest::Proxy::all(proxy_url)?;
+            if !self.proxy_config.no_proxy.is_empty() {
+                let np = reqwest::NoProxy::from_string(&self.proxy_config.no_proxy).ok_or_else(
+                    || {
+                        HttpConfigError::InvalidConfig(format!(
+                            "invalid no_proxy {:?}",
+                            self.proxy_config.no_proxy
+                        ))
+                    },
+                )?;
+                proxy = proxy.no_proxy(Some(np));
+            }
+            if !proxy_headers.is_empty() {
+                proxy = proxy.headers(proxy_headers);
+            }
+            builder = builder.proxy(proxy);
+        } else {
+            builder = builder.no_proxy();
+        }
+        Ok(builder.build()?)
+    }
+
+    /// Applies authentication (`basic_auth`, `authorization`, `bearer_token`, `bearer_token_file`)
+    /// and custom `http_headers` to an outgoing [`reqwest::RequestBuilder`].
+    pub fn apply_to_request(
+        &self,
+        mut req: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, HttpConfigError> {
+        self.check_unsupported_runtime_auth()?;
+        if let Some(basic_auth) = &self.basic_auth {
+            let username = basic_auth.resolve_username()?;
+            let password = basic_auth.resolve_password()?;
+            req = req.basic_auth(
+                username,
+                if password.is_empty() {
+                    None
+                } else {
+                    Some(password)
+                },
+            );
+        } else if let Some(auth) = &self.authorization {
+            if let Some(header_val) = auth.resolve_header_value()? {
+                req = req.header(AUTHORIZATION, sensitive_header_value(&header_val)?);
+            }
+        } else if !self.bearer_token.is_empty() {
+            let val = format!("Bearer {}", self.bearer_token.trim());
+            req = req.header(AUTHORIZATION, sensitive_header_value(&val)?);
+        } else if !self.bearer_token_file.is_empty() {
+            let token = fs::read_to_string(&self.bearer_token_file)?
+                .trim()
+                .to_owned();
+            if !token.is_empty() {
+                let val = format!("Bearer {token}");
+                req = req.header(AUTHORIZATION, sensitive_header_value(&val)?);
+            }
+        }
+
+        if let Some(headers) = &self.http_headers {
+            headers.validate()?;
+            for (name, header) in &headers.headers {
+                let hdr_name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                    HttpConfigError::InvalidConfig(format!(
+                        "invalid HTTP header name {name:?}: {e}"
+                    ))
+                })?;
+                for v in &header.values {
+                    let hdr_val = HeaderValue::from_str(v).map_err(|e| {
+                        HttpConfigError::InvalidConfig(format!(
+                            "invalid HTTP header value for {name:?}: {e}"
+                        ))
+                    })?;
+                    req = req.header(&hdr_name, hdr_val);
+                }
+                for v in &header.secrets {
+                    req = req.header(&hdr_name, sensitive_header_value(v)?);
+                }
+                for file in &header.files {
+                    let content = fs::read_to_string(file).map_err(|e| {
+                        HttpConfigError::InvalidConfig(format!(
+                            "unable to read headers file {file}: {e}"
+                        ))
+                    })?;
+                    req = req.header(&hdr_name, sensitive_header_value(content.trim())?);
+                }
+            }
+        }
+
+        Ok(req)
+    }
+
+    fn check_unsupported_runtime_auth(&self) -> Result<(), HttpConfigError> {
+        if self.oauth2.is_some() {
+            return Err(HttpConfigError::InvalidConfig(
+                "oauth2 authentication is not yet supported at runtime".to_owned(),
+            ));
+        }
+        if let Some(basic_auth) = &self.basic_auth
+            && (!basic_auth.username_ref.is_empty() || !basic_auth.password_ref.is_empty())
+        {
+            return Err(HttpConfigError::InvalidConfig(
+                "cannot use secret ref without manager".to_owned(),
+            ));
+        }
+        if let Some(auth) = &self.authorization
+            && !auth.credentials_ref.is_empty()
+        {
+            return Err(HttpConfigError::InvalidConfig(
+                "cannot use secret ref without manager".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn build_proxy_header_map(
+    headers: &BTreeMap<String, Vec<String>>,
+) -> Result<HeaderMap, HttpConfigError> {
+    let mut map = HeaderMap::new();
+    for (name, values) in headers {
+        let hdr_name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+            HttpConfigError::InvalidConfig(format!(
+                "invalid proxy_connect_header name {name:?}: {e}"
+            ))
+        })?;
+        for value in values {
+            let mut hdr_val = HeaderValue::from_str(value).map_err(|e| {
+                HttpConfigError::InvalidConfig(format!(
+                    "invalid proxy_connect_header value for {name:?}: {e}"
+                ))
+            })?;
+            hdr_val.set_sensitive(true);
+            map.append(&hdr_name, hdr_val);
+        }
+    }
+    Ok(map)
+}
+
+fn sensitive_header_value(value: &str) -> Result<HeaderValue, HttpConfigError> {
+    let mut hdr_val = HeaderValue::from_str(value)
+        .map_err(|e| HttpConfigError::InvalidConfig(format!("invalid HTTP header value: {e}")))?;
+    hdr_val.set_sensitive(true);
+    Ok(hdr_val)
 }
 
 fn redact_str(s: &str) -> &str {

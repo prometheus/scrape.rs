@@ -321,10 +321,13 @@ dependencies = [
  "prost-types",
  "protox",
  "reqwest",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
