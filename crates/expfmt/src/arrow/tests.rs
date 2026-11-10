@@ -444,7 +444,7 @@ fn decode_stream_splits_mid_family_preserves_metadata_and_handles_edges() {
         let mut stream = dec.decode_stream(labeled, &Format::TEXT, &zero_opts);
         assert!(stream.next().unwrap().is_ok());
     }
-    assert!(dec.prom_spans.capacity() >= 4);
+    assert!(dec.prom_state.labels.capacity() >= 4);
 
     // Consecutive assembled families (histograms/summaries) preceded by `# TYPE` flush at
     // `max_data_points_per_batch` when the next family begins, and a single assembled family
@@ -710,9 +710,11 @@ fn decode_stream_step_respects_entry_byte_and_duration_budgets() {
     assert_eq!(mid_err_stream.step(step1).unwrap(), DecodeStep::Done);
     drop(mid_err_stream);
 
-    // Non-zero `max_duration` checks elapsed time every 16 entries (`entries.is_multiple_of(16)`).
+    // Non-zero `max_duration` checks elapsed time every `DECODE_BUDGET_DURATION_CHECK_INTERVAL`
+    // entries.
+    let total_heavy_lines = DECODE_BUDGET_DURATION_CHECK_INTERVAL + 16;
     let mut heavy_lines = String::new();
-    for i in 0..20 {
+    for i in 0..total_heavy_lines {
         heavy_lines.push_str("m{");
         for k in 0..32 {
             if k > 0 {
@@ -726,7 +728,7 @@ fn decode_stream_step_respects_entry_byte_and_duration_budgets() {
     let mut dur_stream = dec.decode_stream(
         heavy_lines.as_bytes(),
         &Format::TEXT,
-        &DecodeOptions::new().with_max_data_points_per_batch(64),
+        &DecodeOptions::new().with_max_data_points_per_batch(total_heavy_lines * 2),
     );
     assert_eq!(dur_stream.step(dur_budget).unwrap(), DecodeStep::Pending);
     let consumed_lines = heavy_lines.as_bytes()[..dur_stream.pos()]
@@ -735,7 +737,7 @@ fn decode_stream_step_respects_entry_byte_and_duration_budgets() {
         .count();
     assert_eq!(consumed_lines, DECODE_BUDGET_DURATION_CHECK_INTERVAL);
     match dur_stream.step(dur_budget).unwrap() {
-        DecodeStep::Batch(batch) => assert_eq!(batch.num_data_points(), 20),
+        DecodeStep::Batch(batch) => assert_eq!(batch.num_data_points(), total_heavy_lines),
         other => panic!("expected DecodeStep::Batch, got {other:?}"),
     }
     assert_eq!(dur_stream.step(dur_budget).unwrap(), DecodeStep::Done);
@@ -850,12 +852,12 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
         DecodeStep::Pending
     );
     job.decoder.finish_decode(&mut aborted);
-    let retained_after_first = job.decoder.om_scratch.retained_memory_bytes();
+    let retained_after_first = job.decoder.om_state.retained_memory_bytes();
     assert!(aborted.is_done());
     assert!(retained_after_first > 0);
     job.decoder.finish_decode(&mut aborted);
     assert_eq!(
-        job.decoder.om_scratch.retained_memory_bytes(),
+        job.decoder.om_state.retained_memory_bytes(),
         retained_after_first
     );
 
@@ -1005,11 +1007,11 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
         DecodeStep::Batch(records) => assert_eq!(records.num_data_points(), 2),
         other => panic!("expected active cursor to finish cleanly, got {other:?}"),
     }
-    let grown_prom_cap = job.decoder.prom_spans.capacity();
+    let grown_prom_cap = job.decoder.prom_state.labels.capacity();
     assert!(grown_prom_cap >= 18);
     job.decoder.finish_decode(&mut stale_after_active);
     assert!(stale_after_active.is_done());
-    assert_eq!(job.decoder.prom_spans.capacity(), grown_prom_cap);
+    assert_eq!(job.decoder.prom_state.labels.capacity(), grown_prom_cap);
 
     let mut om_holder = job
         .decoder
@@ -1021,12 +1023,12 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
         .unwrap();
     job.decoder.finish_decode(&mut om_holder);
     assert_eq!(
-        job.decoder.om_scratch.retained_memory_bytes(),
+        job.decoder.om_state.retained_memory_bytes(),
         retained_after_first
     );
     job.decoder.finish_decode(&mut stale_om_cursor);
     assert_eq!(
-        job.decoder.om_scratch.retained_memory_bytes(),
+        job.decoder.om_state.retained_memory_bytes(),
         retained_after_first
     );
 
@@ -1153,7 +1155,7 @@ fn cooperative_async_helpers_respect_fast_path_and_yield_budgets() {
         let mut cx = Context::from_waker(Waker::noop());
         assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Pending));
     }
-    assert!(dec.prom_spans.capacity() > 0);
+    assert!(dec.prom_state.labels.capacity() > 0);
     assert!(dec.metrics.is_empty());
 
     let bad_coop = b"m{a=\"1\",b=\"2\",c=\"3\",d=\"4\"} 1\nbad_line\n";

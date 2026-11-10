@@ -37,7 +37,7 @@ pub const DEFAULT_DECODE_BUDGET_MAX_DURATION: Duration = Duration::from_millis(1
 
 /// Number of Layer 0 `Entry` items processed between wall-clock `Instant::elapsed` checks in
 /// budgeted decode steps.
-pub const DECODE_BUDGET_DURATION_CHECK_INTERVAL: usize = 16;
+pub const DECODE_BUDGET_DURATION_CHECK_INTERVAL: usize = 64;
 
 /// Cooperative step budget bounding how much entry ingestion work [`super::DecodeStream::step`],
 /// [`super::ArrowDecoder::step_decode`], [`super::ArrowDecoder::decode_cooperative`], and

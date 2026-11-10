@@ -109,12 +109,6 @@ impl PromParserState {
     pub(crate) fn retained_memory_bytes(&self) -> usize {
         self.labels.capacity() * size_of::<LabelSpan>()
     }
-
-    /// Takes the reusable label span buffer in place for `Drop` handlers.
-    pub(crate) fn take_scratch(&mut self) -> Vec<LabelSpan> {
-        self.labels.clear();
-        std::mem::take(&mut self.labels)
-    }
 }
 
 /// Zero-copy parser for the Prometheus text exposition format 0.0.4.

@@ -35,9 +35,8 @@ use std::time::Instant;
 
 use crate::format::{Format, FormatType};
 use crate::parse::{
-    Entry, LabelSpan, METRIC_NAME_LABEL, MetricType, OmScratch, OpenMetricsParser,
-    OpenMetricsParserState, ParseError, Parser, PromParser, PromParserState, parse_go_float,
-    unescape_bytes_into,
+    Entry, LabelSpan, METRIC_NAME_LABEL, MetricType, OpenMetricsParser, OpenMetricsParserState,
+    Parser, PromParser, PromParserState, parse_go_float, unescape_bytes_into,
 };
 
 use self::columns::{
@@ -86,41 +85,11 @@ pub enum DecodeStep {
     Done,
 }
 
-enum ActiveParserState {
-    Prom(PromParserState),
-    OpenMetrics(OpenMetricsParserState),
+#[derive(Clone, Copy)]
+enum ParserKind {
+    Prom,
+    OpenMetrics,
     Invalid,
-}
-
-impl ActiveParserState {
-    #[inline]
-    fn into_parser(self, input: &[u8]) -> ActiveParser<'_> {
-        match self {
-            Self::Prom(state) => ActiveParser::Prom(PromParser::from_state(input, state)),
-            Self::OpenMetrics(state) => {
-                ActiveParser::OpenMetrics(OpenMetricsParser::from_state(input, state))
-            }
-            Self::Invalid => ActiveParser::Invalid,
-        }
-    }
-
-    fn take_scratch_into(&mut self, decoder: &mut ArrowDecoder) {
-        match std::mem::replace(self, Self::Invalid) {
-            Self::Prom(mut state) => {
-                let scratch = state.take_scratch();
-                if scratch.capacity() > decoder.prom_spans.capacity() {
-                    decoder.prom_spans = scratch;
-                }
-            }
-            Self::OpenMetrics(mut state) => {
-                let scratch = state.take_scratch();
-                if scratch.retained_memory_bytes() > decoder.om_scratch.retained_memory_bytes() {
-                    decoder.om_scratch = scratch;
-                }
-            }
-            Self::Invalid => {}
-        }
-    }
 }
 
 /// Lifetime-free incremental decode cursor for driving [`ArrowDecoder::step_decode`] across
@@ -128,12 +97,12 @@ impl ActiveParserState {
 ///
 /// Created by [`ArrowDecoder::start_decode`] (single-batch mode) or
 /// [`ArrowDecoder::start_decode_stream`] (chunked streaming mode). Because `DecodeCursor` stores
-/// only byte-offset spans and parser state rather than references into the scrape payload, an
-/// owned task or `otel-arrow` `PdataDecodeJob` struct can hold an owned buffer (`Bytes`,
-/// `Vec<u8>`, or `Rc<[u8]>`), an [`ArrowDecoder`], and a `DecodeCursor` side by side under
-/// `#![forbid(unsafe_code)]`.
+/// only scalar byte offsets and options while [`ArrowDecoder`] retains the reusable parser scratch
+/// buffers in place, an owned task or `otel-arrow` `PdataDecodeJob` struct can hold an owned
+/// buffer (`Bytes`, `Vec<u8>`, or `Rc<[u8]>`), an [`ArrowDecoder`], and a compact `DecodeCursor`
+/// side by side under `#![forbid(unsafe_code)]`.
 pub struct DecodeCursor {
-    parser_state: ActiveParserState,
+    parser_kind: ParserKind,
     opts: DecodeOptions,
     default_ts_ns: Option<i64>,
     max_data_points: usize,
@@ -171,122 +140,73 @@ impl DecodeCursor {
     }
 }
 
-enum ActiveParser<'input> {
-    Prom(PromParser<'input>),
-    OpenMetrics(OpenMetricsParser<'input>),
-    Invalid,
+// Internal parser specialization trait so `ingest_entries` monomorphizes directly over
+// `PromParser` and `OpenMetricsParser` without per-entry enum dispatch or unused stack state.
+trait ScrapeParser<'input>: Parser<'input> {
+    const IS_OPENMETRICS: bool;
+
+    fn parser_pos(&self) -> usize;
+    fn name_offset(&self) -> usize;
+    fn raw_help(&self) -> (&'input [u8], &'input [u8]);
+    fn raw_series_parts(&self) -> (&'input [u8], &[LabelSpan], &'input [u8], Option<i64>, f64);
+    fn raw_exemplar_parts(&self) -> Option<(f64, Option<i64>, &[LabelSpan])>;
 }
 
-impl<'input> ActiveParser<'input> {
-    #[inline]
-    fn is_openmetrics(&self) -> bool {
-        matches!(self, Self::OpenMetrics(_))
-    }
+impl<'input> ScrapeParser<'input> for PromParser<'input> {
+    const IS_OPENMETRICS: bool = false;
 
     #[inline]
-    fn pos(&self) -> usize {
-        match self {
-            Self::Prom(p) => p.pos(),
-            Self::OpenMetrics(p) => p.pos(),
-            Self::Invalid => 0,
-        }
-    }
-
-    #[inline]
-    fn into_state(self) -> ActiveParserState {
-        match self {
-            Self::Prom(p) => ActiveParserState::Prom(p.into_state()),
-            Self::OpenMetrics(p) => ActiveParserState::OpenMetrics(p.into_state()),
-            Self::Invalid => ActiveParserState::Invalid,
-        }
-    }
-
-    #[inline]
-    fn next_entry(&mut self) -> Result<Option<Entry>, ParseError> {
-        match self {
-            Self::Prom(p) => p.next_entry(),
-            Self::OpenMetrics(p) => p.next_entry(),
-            Self::Invalid => Ok(None),
-        }
+    fn parser_pos(&self) -> usize {
+        self.pos()
     }
 
     #[inline]
     fn name_offset(&self) -> usize {
-        match self {
-            Self::Prom(p) => p.name_offset(),
-            Self::OpenMetrics(p) => p.name_offset(),
-            Self::Invalid => 0,
-        }
+        PromParser::name_offset(self)
     }
 
     #[inline]
     fn raw_help(&self) -> (&'input [u8], &'input [u8]) {
-        match self {
-            Self::Prom(p) => p.raw_help(),
-            Self::OpenMetrics(p) => p.raw_help(),
-            Self::Invalid => (b"", b""),
-        }
-    }
-
-    #[inline]
-    fn metric_type(&self) -> (&[u8], MetricType) {
-        match self {
-            Self::Prom(p) => p.metric_type(),
-            Self::OpenMetrics(p) => p.metric_type(),
-            Self::Invalid => (b"", MetricType::Unknown),
-        }
-    }
-
-    #[inline]
-    fn unit(&self) -> (&[u8], &[u8]) {
-        match self {
-            Self::Prom(p) => p.unit(),
-            Self::OpenMetrics(p) => p.unit(),
-            Self::Invalid => (b"", b""),
-        }
+        PromParser::raw_help(self)
     }
 
     #[inline]
     fn raw_series_parts(&self) -> (&'input [u8], &[LabelSpan], &'input [u8], Option<i64>, f64) {
-        match self {
-            Self::Prom(p) => p.raw_series_parts(),
-            Self::OpenMetrics(p) => p.raw_series_parts(),
-            Self::Invalid => (b"", &[], b"", None, 0.0),
-        }
+        PromParser::raw_series_parts(self)
     }
 
     #[inline]
     fn raw_exemplar_parts(&self) -> Option<(f64, Option<i64>, &[LabelSpan])> {
-        match self {
-            Self::Prom(_) | Self::Invalid => None,
-            Self::OpenMetrics(p) => p.raw_exemplar_parts(),
-        }
+        None
+    }
+}
+
+impl<'input> ScrapeParser<'input> for OpenMetricsParser<'input> {
+    const IS_OPENMETRICS: bool = true;
+
+    #[inline]
+    fn parser_pos(&self) -> usize {
+        self.pos()
     }
 
     #[inline]
-    fn start_timestamp(&mut self) -> Option<i64> {
-        match self {
-            Self::Prom(_) | Self::Invalid => None,
-            Self::OpenMetrics(p) => p.start_timestamp(),
-        }
+    fn name_offset(&self) -> usize {
+        OpenMetricsParser::name_offset(self)
     }
 
-    fn take_scratch_into(&mut self, decoder: &mut ArrowDecoder) {
-        match self {
-            Self::Prom(p) => {
-                let scratch = p.take_scratch();
-                if scratch.capacity() > decoder.prom_spans.capacity() {
-                    decoder.prom_spans = scratch;
-                }
-            }
-            Self::OpenMetrics(p) => {
-                let scratch = p.take_scratch();
-                if scratch.retained_memory_bytes() > decoder.om_scratch.retained_memory_bytes() {
-                    decoder.om_scratch = scratch;
-                }
-            }
-            Self::Invalid => {}
-        }
+    #[inline]
+    fn raw_help(&self) -> (&'input [u8], &'input [u8]) {
+        OpenMetricsParser::raw_help(self)
+    }
+
+    #[inline]
+    fn raw_series_parts(&self) -> (&'input [u8], &[LabelSpan], &'input [u8], Option<i64>, f64) {
+        OpenMetricsParser::raw_series_parts(self)
+    }
+
+    #[inline]
+    fn raw_exemplar_parts(&self) -> Option<(f64, Option<i64>, &[LabelSpan])> {
+        OpenMetricsParser::raw_exemplar_parts(self)
     }
 }
 
@@ -298,8 +218,8 @@ impl<'input> ActiveParser<'input> {
 /// Arrow `Buffer`s returned inside [`OtapMetricRecords`].
 pub struct ArrowDecoder {
     scrape_id: u64,
-    prom_spans: Vec<LabelSpan>,
-    om_scratch: OmScratch,
+    prom_state: PromParserState,
+    om_state: OpenMetricsParserState,
     unescape_buf: Vec<u8>,
     series_name_buf: Vec<u8>,
     current_family: CurrentFamily,
@@ -342,8 +262,8 @@ impl ArrowDecoder {
     pub fn with_capacity(metrics: usize, data_points: usize, attrs: usize) -> Self {
         Self {
             scrape_id: 0,
-            prom_spans: Vec::with_capacity(16),
-            om_scratch: OmScratch::default(),
+            prom_state: PromParserState::with_capacity(16),
+            om_state: OpenMetricsParserState::default(),
             unescape_buf: Vec::new(),
             series_name_buf: Vec::with_capacity(64),
             current_family: CurrentFamily::with_capacity(64, 128),
@@ -364,8 +284,8 @@ impl ArrowDecoder {
     /// reusable scratch structures.
     #[must_use]
     pub fn retained_memory_bytes(&self) -> usize {
-        self.prom_spans.capacity() * size_of::<LabelSpan>()
-            + self.om_scratch.retained_memory_bytes()
+        self.prom_state.retained_memory_bytes()
+            + self.om_state.retained_memory_bytes()
             + self.unescape_buf.capacity()
             + self.series_name_buf.capacity()
             + self.current_family.retained_memory_bytes()
@@ -410,20 +330,51 @@ impl ArrowDecoder {
         opts: &DecodeOptions,
     ) -> Result<OtapMetricRecords, DecodeError> {
         self.reset_scrape();
-        let (mut parser, default_ts_ns) = self.init_scrape_parser(input, format, opts)?;
-
+        let default_ts_ns = match opts.timestamp_ms {
+            Some(ms) => Some(ms_to_ns(ms)?),
+            None => None,
+        };
         let mut pending_series = false;
         let mut done = false;
-        let res = self.ingest_entries::<false, false>(
-            &mut parser,
-            opts,
-            default_ts_ns,
-            0,
-            None,
-            &mut pending_series,
-            &mut done,
-        );
-        parser.take_scratch_into(self);
+        let res = match format.format_type() {
+            FormatType::TextPlain => {
+                let spans = std::mem::take(&mut self.prom_state.labels);
+                let mut parser = PromParser::with_scratch(input, spans);
+                let res = self.ingest_entries::<_, false, false>(
+                    &mut parser,
+                    input.len(),
+                    opts,
+                    default_ts_ns,
+                    0,
+                    None,
+                    &mut pending_series,
+                    &mut done,
+                );
+                self.prom_state.labels = parser.take_scratch();
+                res
+            }
+            FormatType::OpenMetrics if !format.version().starts_with("2.") => {
+                // TODO(bwplotka): Dispatch OpenMetrics 2.0 in Phase 3.
+                let scratch = self.om_state.take_scratch();
+                let mut parser = OpenMetricsParser::with_scratch(input, scratch);
+                let res = self.ingest_entries::<_, false, false>(
+                    &mut parser,
+                    input.len(),
+                    opts,
+                    default_ts_ns,
+                    0,
+                    None,
+                    &mut pending_series,
+                    &mut done,
+                );
+                self.om_state.put_scratch(parser.take_scratch());
+                res
+            }
+            _ => {
+                // TODO(bwplotka): Dispatch Proto* in Phase 3.
+                return Err(DecodeError::UnsupportedFormat(format.as_str().to_owned()));
+            }
+        };
         match res? {
             DecodeStep::Batch(records) => Ok(records),
             DecodeStep::Done => Ok(OtapMetricRecords::default()),
@@ -525,14 +476,14 @@ impl ArrowDecoder {
     /// `step_decode` call for a given `cursor`, because the cursor and staged parser state store
     /// byte offsets into `input`.
     ///
-    /// Internal parser scratch buffers are automatically returned to `self` once `cursor` reaches
-    /// end-of-input or encounters an error. If `cursor` is abandoned early before completion,
-    /// call [`ArrowDecoder::finish_decode`] to reclaim its parser scratch buffers.
+    /// If `cursor` is abandoned early before completion, call [`ArrowDecoder::finish_decode`] to
+    /// reset partial scrape state in `self` while preserving internal scratch capacities.
     ///
     /// # Errors
     ///
     /// Returns [`DecodeError`] if the exposition payload fails validation or an OTAP table exceeds
     /// its integer ID width.
+    #[inline]
     pub fn step_decode(
         &mut self,
         cursor: &mut DecodeCursor,
@@ -553,7 +504,7 @@ impl ArrowDecoder {
         }
         if cursor.scrape_id != self.scrape_id {
             cursor.done = true;
-            cursor.parser_state.take_scratch_into(self);
+            cursor.parser_kind = ParserKind::Invalid;
             return Err(DecodeError::InvalidCursor(
                 "cursor does not belong to current decoder scrape",
             ));
@@ -565,11 +516,74 @@ impl ArrowDecoder {
                 "scrape input buffer length changed across decode steps",
             ));
         }
-        let state = std::mem::replace(&mut cursor.parser_state, ActiveParserState::Invalid);
-        let mut parser = state.into_parser(input);
-        let res = if cursor.chunked {
-            self.ingest_entries::<true, BUDGETED>(
-                &mut parser,
+        match cursor.parser_kind {
+            ParserKind::Prom => {
+                let state = std::mem::take(&mut self.prom_state);
+                let mut parser = PromParser::from_state(input, state);
+                let res =
+                    self.run_cursor_step::<_, BUDGETED>(&mut parser, input.len(), cursor, budget);
+                cursor.pos = parser.parser_pos();
+                self.prom_state = parser.into_state();
+                match res {
+                    Ok(step) => {
+                        if cursor.done {
+                            cursor.parser_kind = ParserKind::Invalid;
+                            self.prom_state.reset();
+                        }
+                        Ok(step)
+                    }
+                    Err(err) => {
+                        cursor.done = true;
+                        cursor.parser_kind = ParserKind::Invalid;
+                        self.prom_state.reset();
+                        self.reset_scrape();
+                        Err(err)
+                    }
+                }
+            }
+            ParserKind::OpenMetrics => {
+                let state = std::mem::take(&mut self.om_state);
+                let mut parser = OpenMetricsParser::from_state(input, state);
+                let res =
+                    self.run_cursor_step::<_, BUDGETED>(&mut parser, input.len(), cursor, budget);
+                cursor.pos = parser.parser_pos();
+                self.om_state = parser.into_state();
+                match res {
+                    Ok(step) => {
+                        if cursor.done {
+                            cursor.parser_kind = ParserKind::Invalid;
+                            self.om_state.reset();
+                        }
+                        Ok(step)
+                    }
+                    Err(err) => {
+                        cursor.done = true;
+                        cursor.parser_kind = ParserKind::Invalid;
+                        self.om_state.reset();
+                        self.reset_scrape();
+                        Err(err)
+                    }
+                }
+            }
+            ParserKind::Invalid => {
+                cursor.done = true;
+                Ok(DecodeStep::Done)
+            }
+        }
+    }
+
+    #[inline]
+    fn run_cursor_step<'input, P: ScrapeParser<'input>, const BUDGETED: bool>(
+        &mut self,
+        parser: &mut P,
+        input_len: usize,
+        cursor: &mut DecodeCursor,
+        budget: Option<DecodeBudget>,
+    ) -> Result<DecodeStep, DecodeError> {
+        if cursor.chunked {
+            self.ingest_entries::<P, true, BUDGETED>(
+                parser,
+                input_len,
                 &cursor.opts,
                 cursor.default_ts_ns,
                 cursor.max_data_points,
@@ -578,8 +592,9 @@ impl ArrowDecoder {
                 &mut cursor.done,
             )
         } else {
-            self.ingest_entries::<false, BUDGETED>(
-                &mut parser,
+            self.ingest_entries::<P, false, BUDGETED>(
+                parser,
+                input_len,
                 &cursor.opts,
                 cursor.default_ts_ns,
                 0,
@@ -587,33 +602,18 @@ impl ArrowDecoder {
                 &mut cursor.pending_series,
                 &mut cursor.done,
             )
-        };
-        cursor.pos = parser.pos();
-        match res {
-            Ok(step) => {
-                if cursor.done {
-                    parser.take_scratch_into(self);
-                } else {
-                    cursor.parser_state = parser.into_state();
-                }
-                Ok(step)
-            }
-            Err(err) => {
-                cursor.done = true;
-                parser.take_scratch_into(self);
-                self.reset_scrape();
-                Err(err)
-            }
         }
     }
 
-    /// Ends an active [`DecodeCursor`] and reclaims its internal parser scratch buffers into
-    /// `self`.
+    /// Ends an active [`DecodeCursor`] and resets partial scrape state in `self` while preserving
+    /// internal parser scratch capacities.
     pub fn finish_decode(&mut self, cursor: &mut DecodeCursor) {
-        cursor.parser_state.take_scratch_into(self);
+        cursor.parser_kind = ParserKind::Invalid;
         if !cursor.done {
             cursor.done = true;
             if cursor.scrape_id == self.scrape_id {
+                self.prom_state.reset();
+                self.om_state.reset();
                 self.reset_scrape();
             }
         }
@@ -626,8 +626,8 @@ impl ArrowDecoder {
     /// Empty or metadata-only scrapes yield zero items. When a contiguous metric family spans a
     /// chunk boundary, [`ArrowDecoder`] retains its `# HELP`, `# TYPE`, and `# UNIT` metadata
     /// across the flush and re-emits the family row in the next chunk only if further samples
-    /// follow. Dropping [`DecodeStream`] early returns the internal parser scratch buffer to
-    /// `self`.
+    /// follow. Dropping [`DecodeStream`] early resets partial scrape state in `self` while
+    /// preserving internal scratch capacities.
     pub fn decode_stream<'dec, 'input>(
         &'dec mut self,
         input: &'input [u8],
@@ -653,7 +653,7 @@ impl ArrowDecoder {
                     decoder: self,
                     input,
                     cursor: DecodeCursor {
-                        parser_state: ActiveParserState::Invalid,
+                        parser_kind: ParserKind::Invalid,
                         opts: *opts,
                         default_ts_ns: None,
                         max_data_points,
@@ -683,9 +683,27 @@ impl ArrowDecoder {
         } else {
             0
         };
-        let (parser, default_ts_ns) = self.init_scrape_parser(b"", format, opts)?;
+        let default_ts_ns = match opts.timestamp_ms {
+            Some(ms) => Some(ms_to_ns(ms)?),
+            None => None,
+        };
+        let parser_kind = match format.format_type() {
+            FormatType::TextPlain => {
+                self.prom_state.reset();
+                ParserKind::Prom
+            }
+            FormatType::OpenMetrics if !format.version().starts_with("2.") => {
+                // TODO(bwplotka): Dispatch OpenMetrics 2.0 in Phase 3.
+                self.om_state.reset();
+                ParserKind::OpenMetrics
+            }
+            _ => {
+                // TODO(bwplotka): Dispatch Proto* in Phase 3.
+                return Err(DecodeError::UnsupportedFormat(format.as_str().to_owned()));
+            }
+        };
         Ok(DecodeCursor {
-            parser_state: parser.into_state(),
+            parser_kind,
             opts: *opts,
             default_ts_ns,
             max_data_points,
@@ -696,34 +714,6 @@ impl ArrowDecoder {
             pending_series: false,
             done: false,
         })
-    }
-
-    fn init_scrape_parser<'input>(
-        &mut self,
-        input: &'input [u8],
-        format: &Format,
-        opts: &DecodeOptions,
-    ) -> Result<(ActiveParser<'input>, Option<i64>), DecodeError> {
-        let default_ts_ns = match opts.timestamp_ms {
-            Some(ms) => Some(ms_to_ns(ms)?),
-            None => None,
-        };
-        let parser = match format.format_type() {
-            FormatType::TextPlain => {
-                let spans = std::mem::take(&mut self.prom_spans);
-                ActiveParser::Prom(PromParser::with_scratch(input, spans))
-            }
-            FormatType::OpenMetrics if !format.version().starts_with("2.") => {
-                // TODO(bwplotka): Dispatch OpenMetrics 2.0 in Phase 3.
-                let scratch = std::mem::take(&mut self.om_scratch);
-                ActiveParser::OpenMetrics(OpenMetricsParser::with_scratch(input, scratch))
-            }
-            _ => {
-                // TODO(bwplotka): Dispatch Proto* in Phase 3.
-                return Err(DecodeError::UnsupportedFormat(format.as_str().to_owned()));
-            }
-        };
-        Ok((parser, default_ts_ns))
     }
 
     fn reset_scrape(&mut self) {
@@ -801,15 +791,21 @@ impl ArrowDecoder {
         Ok(())
     }
 
-    // Monomorphizing on `CHUNKED` and `BUDGETED` shares one entry dispatch loop across
+    // Monomorphizing on `P`, `CHUNKED`, and `BUDGETED` shares one entry dispatch loop across
     // synchronous single-batch `decode` (`false, false`), synchronous `decode_stream`
     // (`true, false`), cooperative single-batch `decode_cooperative` (`false, true`), and
-    // cooperative streaming `DecodeStream::step` (`true, true`), compiling out unused checks on
-    // each path.
+    // cooperative streaming `DecodeStream::step` (`true, true`), compiling out per-entry parser
+    // enum dispatch and unused budget/chunk checks on each path.
     #[allow(clippy::too_many_arguments)]
-    fn ingest_entries<const CHUNKED: bool, const BUDGETED: bool>(
+    fn ingest_entries<
+        'input,
+        P: ScrapeParser<'input>,
+        const CHUNKED: bool,
+        const BUDGETED: bool,
+    >(
         &mut self,
-        parser: &mut ActiveParser<'_>,
+        parser: &mut P,
+        input_len: usize,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
         max_data_points: usize,
@@ -817,18 +813,35 @@ impl ArrowDecoder {
         pending_series: &mut bool,
         done: &mut bool,
     ) -> Result<DecodeStep, DecodeError> {
-        let start_pos = if BUDGETED { parser.pos() } else { 0 };
-        let max_entries = if let Some(b) = budget.filter(|_| BUDGETED) {
-            b.max_entries.max(1)
+        let start_pos = if BUDGETED { parser.parser_pos() } else { 0 };
+        let (max_entries, byte_limit, max_duration, check_every_entry, started) = if let Some(b) =
+            budget.filter(|_| BUDGETED)
+        {
+            let max_entries = b.max_entries.max(1);
+            let byte_limit = start_pos.saturating_add(b.max_bytes.max(1));
+            let check_every = b.max_duration.is_zero();
+            // Skip `Instant::now()` when the step is guaranteed to finish or hit `max_entries`
+            // before the first periodic duration check at `DECODE_BUDGET_DURATION_CHECK_INTERVAL`.
+            let need_clock = check_every
+                || (max_entries > DECODE_BUDGET_DURATION_CHECK_INTERVAL
+                    && b.max_bytes.max(1) > DECODE_BUDGET_DURATION_CHECK_INTERVAL
+                    && input_len.saturating_sub(start_pos) > DECODE_BUDGET_DURATION_CHECK_INTERVAL);
+            (
+                max_entries,
+                byte_limit,
+                b.max_duration,
+                check_every,
+                need_clock.then(Instant::now),
+            )
         } else {
-            usize::MAX
+            (
+                usize::MAX,
+                usize::MAX,
+                std::time::Duration::ZERO,
+                false,
+                None,
+            )
         };
-        let max_bytes = if let Some(b) = budget.filter(|_| BUDGETED) {
-            b.max_bytes.max(1)
-        } else {
-            usize::MAX
-        };
-        let started = if BUDGETED { Some(Instant::now()) } else { None };
         let mut entries = 0usize;
 
         loop {
@@ -903,17 +916,20 @@ impl ArrowDecoder {
                     };
 
                     if CHUNKED {
-                        let split_assembled = !self.assembly.is_empty()
-                            && self.batch_data_points() >= max_data_points
-                            && !self.series_matches_staged_group(parser, role);
-                        let split_scalar = self.assembly.is_empty()
-                            && (self.total_data_points() >= max_data_points
+                        if self.assembly.is_empty() {
+                            if self.total_data_points() >= max_data_points
                                 || (self.current_family.batch_id.is_none()
-                                    && self.metrics.len() >= MAX_METRICS_PER_BATCH));
-                        if split_assembled || split_scalar {
-                            if split_assembled {
-                                self.flush_pending_family(opts, default_ts_ns)?;
+                                    && self.metrics.len() >= MAX_METRICS_PER_BATCH)
+                            {
+                                *pending_series = true;
+                                let batch = self.finish_batches(default_ts_ns.is_some())?;
+                                self.reset_batch();
+                                return Ok(DecodeStep::Batch(batch));
                             }
+                        } else if self.batch_data_points() >= max_data_points
+                            && !self.series_matches_staged_group(parser, role)
+                        {
+                            self.flush_pending_family(opts, default_ts_ns)?;
                             *pending_series = true;
                             let batch = self.finish_batches(default_ts_ns.is_some())?;
                             self.reset_batch();
@@ -934,13 +950,15 @@ impl ArrowDecoder {
                 }
             }
 
-            if let Some(budget) = budget.filter(|_| BUDGETED) {
+            if BUDGETED {
                 entries += 1;
-                let bytes_consumed = parser.pos().saturating_sub(start_pos);
-                let duration_exceeded = (budget.max_duration.is_zero()
+                if entries >= max_entries || parser.parser_pos() >= byte_limit {
+                    return Ok(DecodeStep::Pending);
+                }
+                if (check_every_entry
                     || entries.is_multiple_of(DECODE_BUDGET_DURATION_CHECK_INTERVAL))
-                    && started.is_some_and(|t| t.elapsed() >= budget.max_duration);
-                if entries >= max_entries || bytes_consumed >= max_bytes || duration_exceeded {
+                    && started.is_some_and(|t| t.elapsed() >= max_duration)
+                {
                     return Ok(DecodeStep::Pending);
                 }
             }
@@ -948,9 +966,9 @@ impl ArrowDecoder {
     }
 
     #[inline]
-    fn ingest_help_entry(
+    fn ingest_help_entry<'input, P: ScrapeParser<'input>>(
         &mut self,
-        parser: &ActiveParser<'_>,
+        parser: &P,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
@@ -975,8 +993,7 @@ impl ArrowDecoder {
                 metric: self.current_family.name_string(),
             });
         }
-        let unescaped =
-            unescape_bytes_into(raw_help, parser.is_openmetrics(), &mut self.unescape_buf);
+        let unescaped = unescape_bytes_into(raw_help, P::IS_OPENMETRICS, &mut self.unescape_buf);
         self.current_family.help.clear();
         self.current_family.help.extend_from_slice(unescaped);
         self.current_family.has_help = true;
@@ -984,9 +1001,9 @@ impl ArrowDecoder {
     }
 
     #[inline]
-    fn ingest_type_entry(
+    fn ingest_type_entry<'input, P: ScrapeParser<'input>>(
         &mut self,
-        parser: &ActiveParser<'_>,
+        parser: &P,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
@@ -1007,9 +1024,9 @@ impl ArrowDecoder {
     }
 
     #[inline]
-    fn ingest_unit_entry(
+    fn ingest_unit_entry<'input, P: ScrapeParser<'input>>(
         &mut self,
-        parser: &ActiveParser<'_>,
+        parser: &P,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
@@ -1035,9 +1052,9 @@ impl ArrowDecoder {
     }
 
     #[inline]
-    fn ingest_series_entry(
+    fn ingest_series_entry<'input, P: ScrapeParser<'input>>(
         &mut self,
-        parser: &mut ActiveParser<'_>,
+        parser: &mut P,
         role: SeriesRole,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
@@ -1054,19 +1071,24 @@ impl ArrowDecoder {
     }
 
     #[inline]
-    fn append_scalar_series(
+    fn append_scalar_series<'input, P: ScrapeParser<'input>>(
         &mut self,
-        parser: &mut ActiveParser<'_>,
+        parser: &mut P,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
-        let start_ts_ms = if self.current_family.metric_type == MetricType::Counter {
-            parser.start_timestamp()
+        let start_ts_ms =
+            if P::IS_OPENMETRICS && self.current_family.metric_type == MetricType::Counter {
+                parser.start_timestamp()
+            } else {
+                None
+            };
+        let (_, label_spans, full_input, sample_ts_ms, value) = parser.raw_series_parts();
+        let exemplar_parts = if P::IS_OPENMETRICS {
+            parser.raw_exemplar_parts()
         } else {
             None
         };
-        let (_, label_spans, full_input, sample_ts_ms, value) = parser.raw_series_parts();
-        let exemplar_parts = parser.raw_exemplar_parts();
 
         // Always validate series labels first so duplicate/reserved labels are caught even when a
         // translation policy drops the metric family.
@@ -1089,7 +1111,9 @@ impl ArrowDecoder {
         self.extract_series_labels_into_temp(label_spans, full_input, None)?;
         self.num_dp.attrs.extend_for_parent(dp_id, &self.temp_attrs);
 
-        if let Some((ex_val, ex_ts_ms, ex_spans)) = exemplar_parts {
+        if P::IS_OPENMETRICS
+            && let Some((ex_val, ex_ts_ms, ex_spans)) = exemplar_parts
+        {
             self.append_number_exemplar(
                 dp_id,
                 ex_val,
@@ -1115,9 +1139,9 @@ impl ArrowDecoder {
         Ok(())
     }
 
-    fn append_assembled_series(
+    fn append_assembled_series<'input, P: ScrapeParser<'input>>(
         &mut self,
-        parser: &mut ActiveParser<'_>,
+        parser: &mut P,
         role: SeriesRole,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
@@ -1140,7 +1164,7 @@ impl ArrowDecoder {
         };
         let om_start_ts_ns = if !self.assembly.groups[group_idx].start_ts_checked {
             self.assembly.groups[group_idx].start_ts_checked = true;
-            if parser.is_openmetrics() {
+            if P::IS_OPENMETRICS {
                 parser
                     .start_timestamp()
                     .and_then(|ms| ms.checked_mul(1_000_000))
@@ -1177,10 +1201,12 @@ impl ArrowDecoder {
             SeriesRole::Scalar => {}
         }
 
-        if matches!(
-            self.current_family.metric_type,
-            MetricType::Histogram | MetricType::GaugeHistogram
-        ) && let Some((ex_val, ex_ts_ms, ex_spans)) = parser.raw_exemplar_parts()
+        if P::IS_OPENMETRICS
+            && matches!(
+                self.current_family.metric_type,
+                MetricType::Histogram | MetricType::GaugeHistogram
+            )
+            && let Some((ex_val, ex_ts_ms, ex_spans)) = parser.raw_exemplar_parts()
         {
             let full_input = parser.raw_series_parts().2;
             self.stage_pending_histogram_exemplar(
@@ -1198,7 +1224,11 @@ impl ArrowDecoder {
 
     /// Checks whether the current assembled series line belongs to a data-point group already
     /// staged in `self.assembly` without interning new keys or values into the active batch.
-    fn series_matches_staged_group(&mut self, parser: &ActiveParser<'_>, role: SeriesRole) -> bool {
+    fn series_matches_staged_group<'input, P: ScrapeParser<'input>>(
+        &mut self,
+        parser: &P,
+        role: SeriesRole,
+    ) -> bool {
         let special_label = match role {
             SeriesRole::HistogramBucket => Some(b"le" as &[u8]),
             SeriesRole::SummaryQuantile => Some(b"quantile" as &[u8]),
@@ -1648,6 +1678,7 @@ impl DecodeStream<'_, '_> {
     /// UTF-8 validation, duplicate or late metadata lines are encountered within a contiguous
     /// family, duplicate label names appear on a sample, or an OTAP table exceeds its integer ID
     /// width.
+    #[inline]
     pub fn step(&mut self, budget: DecodeBudget) -> Result<DecodeStep, DecodeError> {
         if self.cursor.done {
             return Ok(DecodeStep::Done);
@@ -1681,6 +1712,7 @@ impl DecodeStream<'_, '_> {
 impl Iterator for DecodeStream<'_, '_> {
     type Item = Result<OtapMetricRecords, DecodeError>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.cursor.done {
             return None;
