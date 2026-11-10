@@ -71,6 +71,7 @@ pub(crate) struct LabelSpan {
 
 /// Lifetime-free state of [`PromParser`] that can be stored across suspension points alongside an
 /// owned input buffer without self-referential lifetimes.
+#[derive(Default)]
 pub(crate) struct PromParserState {
     lexer: LexerState,
     series: ByteSpan,
@@ -80,10 +81,35 @@ pub(crate) struct PromParserState {
     timestamp: Option<i64>,
     line_start: usize,
     name: Option<ByteSpan>,
-    labels: Vec<LabelSpan>,
+    pub(crate) labels: Vec<LabelSpan>,
 }
 
 impl PromParserState {
+    pub(crate) fn with_capacity(label_cap: usize) -> Self {
+        Self {
+            labels: Vec::with_capacity(label_cap),
+            ..Self::default()
+        }
+    }
+
+    /// Resets cursor state for a new scrape while preserving `labels` capacity in place.
+    #[inline]
+    pub(crate) fn reset(&mut self) {
+        self.lexer = LexerState::default();
+        self.series = ByteSpan::default();
+        self.text = ByteSpan::default();
+        self.last_type = MetricType::Unknown;
+        self.value = 0.0;
+        self.timestamp = None;
+        self.line_start = 0;
+        self.name = None;
+        self.labels.clear();
+    }
+
+    pub(crate) fn retained_memory_bytes(&self) -> usize {
+        self.labels.capacity() * size_of::<LabelSpan>()
+    }
+
     /// Takes the reusable label span buffer in place for `Drop` handlers.
     pub(crate) fn take_scratch(&mut self) -> Vec<LabelSpan> {
         self.labels.clear();
@@ -115,6 +141,7 @@ impl<'a> PromParser<'a> {
     }
 
     /// Creates a parser over `input` reusing a caller-owned `labels` span buffer.
+    #[inline]
     pub(crate) fn with_scratch(input: &'a [u8], mut labels: Vec<LabelSpan>) -> Self {
         labels.clear();
         Self {
@@ -169,6 +196,7 @@ impl<'a> PromParser<'a> {
     }
 
     /// Takes the reusable label span buffer in place for `Drop` handlers.
+    #[inline]
     pub(crate) fn take_scratch(&mut self) -> Vec<LabelSpan> {
         self.labels.clear();
         std::mem::take(&mut self.labels)
@@ -188,12 +216,14 @@ impl<'a> PromParser<'a> {
 
     /// Returns the raw metric name and raw (escaped) help text for `Entry::Help` without
     /// allocating a `Cow::Owned` buffer.
+    #[inline]
     pub(crate) fn raw_help(&self) -> (&'a [u8], &'a [u8]) {
         (self.metric_name(), &self.lexer.input[self.text])
     }
 
     /// Returns the raw metric name, validated UTF-8 label spans, full input slice, optional
     /// timestamp in milliseconds, and sample value for `Entry::Series`.
+    #[inline]
     pub(crate) fn raw_series_parts(&self) -> (&'a [u8], &[LabelSpan], &'a [u8], Option<i64>, f64) {
         (
             self.metric_name(),
@@ -395,6 +425,7 @@ impl<'a> PromParser<'a> {
 }
 
 impl<'a> Parser<'a> for PromParser<'a> {
+    #[inline]
     fn next_entry(&mut self) -> Result<Option<Entry>, ParseError> {
         loop {
             self.line_start = self.lexer.pos;
@@ -424,6 +455,7 @@ impl<'a> Parser<'a> for PromParser<'a> {
         )
     }
 
+    #[inline]
     fn metric_type(&self) -> (&'a [u8], MetricType) {
         (self.metric_name(), self.last_type)
     }

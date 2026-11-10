@@ -64,6 +64,7 @@ impl OmScratch {
 
 /// Lifetime-free state of [`OpenMetricsParser`] that can be stored across suspension points
 /// alongside an owned input buffer without self-referential lifetimes.
+#[derive(Default)]
 pub(crate) struct OpenMetricsParserState {
     lexer: LexerState,
     done: bool,
@@ -85,7 +86,28 @@ pub(crate) struct OpenMetricsParserState {
 }
 
 impl OpenMetricsParserState {
-    /// Takes the reusable scratch buffers in place for `Drop` handlers.
+    /// Resets cursor state for a new scrape while preserving internal scratch capacities in place.
+    #[inline]
+    pub(crate) fn reset(&mut self) {
+        self.lexer = LexerState::default();
+        self.done = false;
+        self.peeking = false;
+        self.line_start = 0;
+        self.series = ByteSpan::default();
+        self.text = ByteSpan::default();
+        self.name = None;
+        self.family_name_len = 0;
+        self.metric_type = MetricType::Unknown;
+        self.value = 0.0;
+        self.timestamp = None;
+        self.labels.clear();
+        self.exemplar = None;
+        self.exemplar_labels.clear();
+        self.peek_labels.clear();
+        self.start_timestamp_key.clear();
+        self.start_timestamp = None;
+    }
+
     pub(crate) fn take_scratch(&mut self) -> OmScratch {
         self.labels.clear();
         self.exemplar_labels.clear();
@@ -97,6 +119,20 @@ impl OpenMetricsParserState {
             peek_labels: std::mem::take(&mut self.peek_labels),
             start_timestamp_key: std::mem::take(&mut self.start_timestamp_key),
         }
+    }
+
+    pub(crate) fn put_scratch(&mut self, mut scratch: OmScratch) {
+        scratch.clear();
+        self.labels = scratch.labels;
+        self.exemplar_labels = scratch.exemplar_labels;
+        self.peek_labels = scratch.peek_labels;
+        self.start_timestamp_key = scratch.start_timestamp_key;
+    }
+
+    pub(crate) fn retained_memory_bytes(&self) -> usize {
+        (self.labels.capacity() + self.exemplar_labels.capacity() + self.peek_labels.capacity())
+            * size_of::<LabelSpan>()
+            + self.start_timestamp_key.capacity()
     }
 }
 
@@ -140,6 +176,7 @@ impl<'a> OpenMetricsParser<'a> {
     }
 
     /// Creates a parser over `input` reusing pre-allocated scratch buffers.
+    #[inline]
     pub(crate) fn with_scratch(input: &'a [u8], mut scratch: OmScratch) -> Self {
         scratch.clear();
         Self {
@@ -217,6 +254,7 @@ impl<'a> OpenMetricsParser<'a> {
     }
 
     /// Takes the reusable scratch buffers in place for `Drop` handlers.
+    #[inline]
     pub(crate) fn take_scratch(&mut self) -> OmScratch {
         self.labels.clear();
         self.exemplar_labels.clear();
@@ -243,12 +281,14 @@ impl<'a> OpenMetricsParser<'a> {
     }
 
     /// Returns the raw metric name and raw (escaped) help text for `Entry::Help`.
+    #[inline]
     pub(crate) fn raw_help(&self) -> (&'a [u8], &'a [u8]) {
         (self.metric_name(), &self.lexer.input[self.text])
     }
 
     /// Returns the raw metric name, validated UTF-8 label spans, full input slice, optional
     /// timestamp in milliseconds, and sample value for `Entry::Series`.
+    #[inline]
     pub(crate) fn raw_series_parts(&self) -> (&'a [u8], &[LabelSpan], &'a [u8], Option<i64>, f64) {
         (
             self.metric_name(),
@@ -261,6 +301,7 @@ impl<'a> OpenMetricsParser<'a> {
 
     /// Returns the exemplar value, optional timestamp in milliseconds, and label spans for the
     /// current `Entry::Series`, if present.
+    #[inline]
     pub(crate) fn raw_exemplar_parts(&self) -> Option<(f64, Option<i64>, &[LabelSpan])> {
         self.exemplar
             .map(|(val, ts)| (val, ts, self.exemplar_labels.as_slice()))
@@ -557,6 +598,7 @@ impl<'a> OpenMetricsParser<'a> {
 }
 
 impl<'a> Parser<'a> for OpenMetricsParser<'a> {
+    #[inline]
     fn next_entry(&mut self) -> Result<Option<Entry>, ParseError> {
         if self.done {
             return Ok(None);
@@ -599,10 +641,12 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
         (self.metric_name(), unescape(&self.lexer.input[self.text]))
     }
 
+    #[inline]
     fn metric_type(&self) -> (&'a [u8], MetricType) {
         (self.metric_name(), self.metric_type)
     }
 
+    #[inline]
     fn unit(&self) -> (&'a [u8], &'a [u8]) {
         (self.metric_name(), &self.lexer.input[self.text])
     }

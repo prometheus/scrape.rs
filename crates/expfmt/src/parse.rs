@@ -321,6 +321,7 @@ pub trait Parser<'a> {
     fn comment(&self) -> &'a [u8];
 
     /// Returns the metric name and unit of the current [`Entry::Unit`].
+    #[inline]
     fn unit(&self) -> (&[u8], &[u8]) {
         (b"", b"")
     }

@@ -17,8 +17,9 @@
 use super::ByteSpan;
 
 /// Lexer states, named after the start conditions in `openmetricslex.l`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum State {
+    #[default]
     Init,
     Comment,
     /// After `# HELP`, `# TYPE` or `# UNIT`, before the metric name.
@@ -35,7 +36,7 @@ enum State {
 }
 
 /// Lifetime-free cursor state of [`Lexer`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LexerState {
     pub(super) pos: usize,
     pub(super) token_start: usize,
