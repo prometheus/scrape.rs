@@ -34,12 +34,16 @@ jobs:
         run: cargo clippy --all-targets --no-default-features -- -D warnings
       - name: Run clippy (discovery only)
         run: cargo clippy --all-targets --no-default-features --features discovery -- -D warnings
+      - name: Run clippy (http-config only)
+        run: cargo clippy --all-targets --no-default-features --features http-config -- -D warnings
       - name: Run tests (all features)
         run: cargo test --all-features
       - name: Run tests (no default features)
         run: cargo test --no-default-features
       - name: Run tests (discovery only)
         run: cargo test --no-default-features --features discovery
+      - name: Run tests (http-config only)
+        run: cargo test --no-default-features --features http-config
       - name: Run clippy (OTAP compatibility suite)
         env:
           CARGO_TARGET_DIR: target
@@ -62,6 +66,8 @@ jobs:
         run: cargo check --all-targets --no-default-features
       - name: Check MSRV (discovery only)
         run: cargo check --all-targets --no-default-features --features discovery
+      - name: Check MSRV (http-config only)
+        run: cargo check --all-targets --no-default-features --features http-config
 
   go-fixtures:
     name: Go testdata sync check
