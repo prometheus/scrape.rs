@@ -1102,6 +1102,8 @@ dependencies = [
  "prometheus-expfmt",
  "prometheus-relabel",
  "reqwest",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
