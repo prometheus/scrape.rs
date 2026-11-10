@@ -16,13 +16,15 @@
 #![cfg(feature = "discovery")]
 
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use expfmt::discovery::{
-    DiscoveryConfigs, DiscoveryError, DnsDiscovery, DnsRecord, DnsRecordType, DnsSdConfig,
-    LabelSet, ResolvConf, TargetGroup,
+    ADDRESS_LABEL, DiscoveryConfigs, DiscoveryError, DnsDiscovery, DnsRecord, DnsRecordType,
+    DnsSdConfig, LabelSet, ResolvConf, TargetGroup,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
 
 fn label_set(pairs: &[(&str, &str)]) -> LabelSet {
     pairs
@@ -305,4 +307,277 @@ fn dns_discovery_records_match_prometheus_dns_test() {
     assert!(groups[1].targets.is_empty());
 
     assert!(ResolvConf::from_file(std::path::Path::new("/nonexistent/resolv.conf")).is_err());
+}
+
+fn decode_qname_from_query(qbuf: &[u8]) -> (String, usize) {
+    let mut offset = 12;
+    let mut labels = Vec::new();
+    while qbuf[offset] != 0 {
+        let len = qbuf[offset] as usize;
+        let label = std::str::from_utf8(&qbuf[offset + 1..offset + 1 + len]).unwrap();
+        labels.push(label.to_owned());
+        offset += 1 + len;
+    }
+    let qend = offset + 1 + 4;
+    let fqdn = if labels.is_empty() {
+        ".".to_owned()
+    } else {
+        format!("{}.", labels.join("."))
+    };
+    (fqdn, qend)
+}
+
+#[tokio::test]
+async fn dns_discovery_live_udp_and_tcp_fallback_with_search_path() {
+    let parsed_resolv = ResolvConf::parse(
+        r#"
+        # Comment line
+        ; Semicolon comment
+        nameserver 10.96.0.10
+        nameserver [::1]:5353
+        domain old.example.com.
+        search svc.cluster.local. cluster.local.
+        options ndots:3 timeout:4
+        "#,
+    );
+    assert_eq!(
+        parsed_resolv.servers,
+        vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 96, 0, 10)), 53),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5353),
+        ]
+    );
+    assert_eq!(
+        parsed_resolv.search,
+        vec!["svc.cluster.local".to_owned(), "cluster.local".to_owned()]
+    );
+    assert_eq!(parsed_resolv.ndots, 3);
+    assert_eq!(parsed_resolv.timeout, Duration::from_secs(4));
+
+    let udp_listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = udp_listener.local_addr().unwrap();
+    let tcp_listener = TcpListener::bind(server_addr).await.unwrap();
+
+    // Spawn a local DNS server that returns TC=1 (truncated) over UDP so the client falls back
+    // to TCP, and returns an SRV record over TCP for `_metrics._tcp.svc.cluster.local.`.
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        if let Ok((len, peer)) = udp_listener.recv_from(&mut buf).await {
+            assert!(len >= 12);
+            let mut resp = Vec::with_capacity(12);
+            resp.extend_from_slice(&buf[0..2]);
+            resp.extend_from_slice(&0x8200u16.to_be_bytes());
+            resp.extend_from_slice(&0u16.to_be_bytes());
+            resp.extend_from_slice(&0u16.to_be_bytes());
+            resp.extend_from_slice(&0u16.to_be_bytes());
+            resp.extend_from_slice(&0u16.to_be_bytes());
+            let _ = udp_listener.send_to(&resp, peer).await;
+        }
+    });
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = tcp_listener.accept().await {
+            let mut len_buf = [0u8; 2];
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let qlen = u16::from_be_bytes(len_buf) as usize;
+            let mut qbuf = vec![0u8; qlen];
+            stream.read_exact(&mut qbuf).await.unwrap();
+
+            let (_, qname_end) = decode_qname_from_query(&qbuf);
+            let mut resp = Vec::new();
+            resp.extend_from_slice(&qbuf[0..2]);
+            resp.extend_from_slice(&0x8180u16.to_be_bytes());
+            resp.extend_from_slice(&1u16.to_be_bytes());
+            resp.extend_from_slice(&1u16.to_be_bytes());
+            resp.extend_from_slice(&0u16.to_be_bytes());
+            resp.extend_from_slice(&0u16.to_be_bytes());
+            resp.extend_from_slice(&qbuf[12..qname_end]);
+
+            resp.push(0);
+            resp.extend_from_slice(&33u16.to_be_bytes()); // SRV
+            resp.extend_from_slice(&1u16.to_be_bytes()); // IN
+            resp.extend_from_slice(&60u32.to_be_bytes());
+
+            let mut rdata = Vec::new();
+            rdata.extend_from_slice(&10u16.to_be_bytes());
+            rdata.extend_from_slice(&5u16.to_be_bytes());
+            rdata.extend_from_slice(&9100u16.to_be_bytes());
+            for label in ["pod1", "cluster", "local"] {
+                rdata.push(label.len() as u8);
+                rdata.extend_from_slice(label.as_bytes());
+            }
+            rdata.push(0);
+
+            resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            resp.extend_from_slice(&rdata);
+
+            stream
+                .write_all(&(resp.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&resp).await.unwrap();
+        }
+    });
+
+    let resolv = ResolvConf {
+        servers: vec![server_addr],
+        search: vec!["svc.cluster.local".to_owned()],
+        ndots: 5,
+        timeout: Duration::from_secs(2),
+    };
+    let sd = DnsDiscovery::with_resolv_conf(
+        DnsSdConfig {
+            names: vec!["_metrics._tcp".to_owned()],
+            refresh_interval: Duration::from_secs(15),
+            record_type: "SRV".to_owned(),
+            port: 0,
+        },
+        resolv,
+    )
+    .unwrap();
+
+    assert!(sd.resolv_conf().is_some());
+    let groups = sd.refresh().await.unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].source, "_metrics._tcp");
+    assert_eq!(
+        groups[0].targets,
+        vec![label_set(&[
+            ("__address__", "pod1.cluster.local:9100"),
+            ("__meta_dns_name", "_metrics._tcp"),
+            ("__meta_dns_srv_record_target", "pod1.cluster.local."),
+            ("__meta_dns_srv_record_port", "9100"),
+            ("__meta_dns_mx_record_target", ""),
+            ("__meta_dns_ns_record_target", ""),
+        ])]
+    );
+}
+
+#[test]
+fn dns_multi_server_fallback_search_path_and_localset() {
+    let clamped = ResolvConf::parse(
+        "domain first.example.com. ignored.example.com.\noptions ndots:99 timeout:999\n",
+    );
+    assert_eq!(clamped.search, vec!["first.example.com".to_owned()]);
+    assert_eq!(clamped.ndots, 15);
+    assert_eq!(clamped.timeout, Duration::from_secs(30));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+
+    local.block_on(&rt, async {
+        let udp1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srv1_addr = udp1.local_addr().unwrap();
+        let tcp1 = TcpListener::bind(srv1_addr).await.unwrap();
+
+        let udp2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srv2_addr = udp2.local_addr().unwrap();
+
+        tokio::task::spawn_local(async move {
+            if tcp1.accept().await.is_ok() {
+                panic!("non-truncated UDP response must not trigger TCP fallback");
+            }
+        });
+
+        let srv2_queries = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let srv2_queries_clone = std::rc::Rc::clone(&srv2_queries);
+
+        tokio::task::spawn_local(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((len, peer)) = udp1.recv_from(&mut buf).await {
+                let (qname, qend) = decode_qname_from_query(&buf[..len]);
+                let rcode: u16 = match qname.as_str() {
+                    "hit.two.local." | "flaky.one.local." => 2, // SERVFAIL
+                    "nodata.one.local." => 0,                   // NODATA (ANCOUNT=0)
+                    _ => 3,                                     // NXDOMAIN
+                };
+                let mut resp = Vec::new();
+                resp.extend_from_slice(&buf[0..2]);
+                resp.extend_from_slice(&(0x8180u16 | rcode).to_be_bytes());
+                resp.extend_from_slice(&1u16.to_be_bytes());
+                resp.extend_from_slice(&0u16.to_be_bytes());
+                resp.extend_from_slice(&0u16.to_be_bytes());
+                resp.extend_from_slice(&0u16.to_be_bytes());
+                resp.extend_from_slice(&buf[12..qend]);
+                let _ = udp1.send_to(&resp, peer).await;
+            }
+        });
+
+        tokio::task::spawn_local(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((len, peer)) = udp2.recv_from(&mut buf).await {
+                let (qname, qend) = decode_qname_from_query(&buf[..len]);
+                srv2_queries_clone.borrow_mut().push(qname.clone());
+                let mut resp = Vec::new();
+                resp.extend_from_slice(&buf[0..2]);
+                if qname == "hit.two.local." {
+                    resp.extend_from_slice(&0x8180u16.to_be_bytes());
+                    resp.extend_from_slice(&1u16.to_be_bytes());
+                    resp.extend_from_slice(&1u16.to_be_bytes());
+                    resp.extend_from_slice(&0u16.to_be_bytes());
+                    resp.extend_from_slice(&0u16.to_be_bytes());
+                    resp.extend_from_slice(&buf[12..qend]);
+                    resp.push(0);
+                    resp.extend_from_slice(&1u16.to_be_bytes()); // A
+                    resp.extend_from_slice(&1u16.to_be_bytes()); // IN
+                    resp.extend_from_slice(&60u32.to_be_bytes());
+                    resp.extend_from_slice(&4u16.to_be_bytes());
+                    resp.extend_from_slice(&[10, 1, 2, 3]);
+                } else {
+                    resp.extend_from_slice(&0x8182u16.to_be_bytes()); // SERVFAIL
+                    resp.extend_from_slice(&1u16.to_be_bytes());
+                    resp.extend_from_slice(&0u16.to_be_bytes());
+                    resp.extend_from_slice(&0u16.to_be_bytes());
+                    resp.extend_from_slice(&0u16.to_be_bytes());
+                    resp.extend_from_slice(&buf[12..qend]);
+                }
+                let _ = udp2.send_to(&resp, peer).await;
+            }
+        });
+
+        let resolv = ResolvConf {
+            servers: vec![srv1_addr, srv2_addr],
+            search: vec!["one.local".to_owned(), "two.local".to_owned()],
+            ndots: 2,
+            timeout: Duration::from_secs(2),
+        };
+        let sd = DnsDiscovery::with_resolv_conf(
+            DnsSdConfig {
+                names: vec![
+                    "hit".to_owned(),
+                    "gone".to_owned(),
+                    "flaky".to_owned(),
+                    "nodata".to_owned(),
+                ],
+                refresh_interval: Duration::from_secs(15),
+                record_type: "A".to_owned(),
+                port: 9100,
+            },
+            resolv,
+        )
+        .unwrap();
+
+        let groups = tokio::task::spawn_local(async move { sd.refresh().await })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].source, "hit");
+        assert_eq!(
+            groups[0].targets[0].get(ADDRESS_LABEL),
+            Some(&"10.1.2.3:9100".to_owned())
+        );
+        assert_eq!(groups[1].source, "gone");
+        assert!(groups[1].targets.is_empty());
+        assert_eq!(groups[2].source, "nodata");
+        assert!(groups[2].targets.is_empty());
+
+        assert_eq!(
+            *srv2_queries.borrow(),
+            vec!["hit.two.local.".to_owned(), "flaky.one.local.".to_owned()]
+        );
+    });
 }

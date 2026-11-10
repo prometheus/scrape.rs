@@ -14,12 +14,17 @@
 //! Prometheus-compatible DNS service discovery (`dns_sd_configs`).
 
 use std::collections::BTreeMap;
+use std::collections::hash_map::RandomState;
 use std::fs;
+use std::hash::BuildHasher;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 
 use super::{ADDRESS_LABEL, DiscoveryError, LabelSet, TargetGroup, join_host_port, serde_duration};
 
@@ -33,6 +38,18 @@ pub const DNS_SRV_RECORD_PORT_LABEL: &str = "__meta_dns_srv_record_port";
 pub const DNS_MX_RECORD_TARGET_LABEL: &str = "__meta_dns_mx_record_target";
 /// Meta label storing the target field of an NS record.
 pub const DNS_NS_RECORD_TARGET_LABEL: &str = "__meta_dns_ns_record_target";
+
+const QTYPE_A: u16 = 1;
+const QTYPE_NS: u16 = 2;
+const QTYPE_CNAME: u16 = 5;
+const QTYPE_MX: u16 = 15;
+const QTYPE_AAAA: u16 = 28;
+const QTYPE_SRV: u16 = 33;
+const QTYPE_OPT: u16 = 41;
+const QCLASS_IN: u16 = 1;
+
+const RCODE_SUCCESS: u8 = 0;
+const RCODE_NXDOMAIN: u8 = 3;
 
 const fn default_refresh_interval() -> Duration {
     Duration::from_secs(30)
@@ -70,6 +87,17 @@ impl DnsRecordType {
             _ => Err(DiscoveryError::InvalidConfig(format!(
                 "invalid DNS-SD records type {s}"
             ))),
+        }
+    }
+
+    /// Returns the DNS wire protocol QTYPE code for this record type.
+    pub(crate) const fn qtype(self) -> u16 {
+        match self {
+            Self::A => QTYPE_A,
+            Self::Ns => QTYPE_NS,
+            Self::Mx => QTYPE_MX,
+            Self::Aaaa => QTYPE_AAAA,
+            Self::Srv => QTYPE_SRV,
         }
     }
 }
@@ -316,6 +344,35 @@ impl DnsDiscovery {
         self.resolv_conf.as_ref()
     }
 
+    /// Performs a single discovery refresh across all configured DNS names using the configured
+    /// nameservers and search paths.
+    ///
+    /// Lookup failures for individual names are skipped so previously discovered targets for
+    /// those sources are preserved while healthy names still emit [`TargetGroup`]s, matching
+    /// Prometheus `dns.Discovery.refresh`.
+    pub async fn refresh(&self) -> Result<Vec<TargetGroup>, DiscoveryError> {
+        let owned_conf;
+        let conf = match &self.resolv_conf {
+            Some(c) => c,
+            None => {
+                owned_conf = ResolvConf::from_file(Path::new("/etc/resolv.conf"))?;
+                &owned_conf
+            }
+        };
+        let mut groups = Vec::with_capacity(self.config.names.len());
+        for name in &self.config.names {
+            if let Ok(records) = self.lookup_with_search_path(name, conf).await {
+                groups.push(records_to_target_group(
+                    name,
+                    self.record_type,
+                    self.config.port,
+                    &records,
+                ));
+            }
+        }
+        Ok(groups)
+    }
+
     /// Performs a single discovery refresh using a caller-supplied synchronous lookup function.
     ///
     /// If the lookup function returns an empty record list (for example on `NXDOMAIN`), an empty
@@ -338,6 +395,54 @@ impl DnsDiscovery {
             }
         }
         Ok(groups)
+    }
+
+    async fn lookup_with_search_path(
+        &self,
+        name: &str,
+        resolv_conf: &ResolvConf,
+    ) -> Result<Vec<DnsRecord>, DiscoveryError> {
+        let candidates = candidate_query_names(name, resolv_conf);
+        let mut last_err: Option<DiscoveryError> = None;
+
+        for candidate in &candidates {
+            match self.lookup_all_servers(candidate, resolv_conf).await {
+                Ok(Some(records)) => return Ok(records),
+                Ok(None) => {
+                    // NXDOMAIN: continue trying remaining search path candidates, and if none
+                    // match, return an empty target group (matching Prometheus).
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        if let Some(err) = last_err {
+            Err(err)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn lookup_all_servers(
+        &self,
+        fqdn: &str,
+        resolv_conf: &ResolvConf,
+    ) -> Result<Option<Vec<DnsRecord>>, DiscoveryError> {
+        let qtype = self.record_type.qtype();
+        let mut last_err = None;
+
+        for &server in &resolv_conf.servers {
+            match query_dns_server(server, fqdn, qtype, resolv_conf.timeout).await {
+                Ok(DnsLookupOutcome::Records(records)) => return Ok(Some(records)),
+                Ok(DnsLookupOutcome::NxDomain) => return Ok(None),
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        Err(last_err
+            .unwrap_or_else(|| DiscoveryError::Dns("no DNS nameservers configured".to_owned())))
     }
 }
 
@@ -417,6 +522,45 @@ pub(crate) fn records_to_target_group(
     }
 }
 
+fn candidate_query_names(name: &str, conf: &ResolvConf) -> Vec<String> {
+    if name.ends_with('.') {
+        return vec![name.to_owned()];
+    }
+    let dots = name.bytes().filter(|&b| b == b'.').count();
+    let mut search_names: Vec<String> = conf
+        .search
+        .iter()
+        .map(|domain| format!("{name}.{domain}."))
+        .filter(|cand| wire_qname_len(cand).is_some_and(|n| n <= 255))
+        .collect();
+    let rooted = format!("{name}.");
+
+    if dots >= conf.ndots {
+        let mut out = Vec::with_capacity(1 + search_names.len());
+        out.push(rooted);
+        out.extend(search_names);
+        out
+    } else {
+        search_names.push(rooted);
+        search_names
+    }
+}
+
+fn wire_qname_len(fqdn: &str) -> Option<usize> {
+    let trimmed = fqdn.trim_end_matches('.');
+    if trimmed.is_empty() {
+        return Some(1);
+    }
+    let mut len = 1usize;
+    for label in trimmed.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        len += 1 + label.len();
+    }
+    Some(len)
+}
+
 fn is_safe_dns_label(label: &str) -> bool {
     !label.bytes().any(|b| {
         b.is_ascii_control()
@@ -428,4 +572,569 @@ fn is_safe_dns_label(label: &str) -> bool {
 fn is_safe_domain_target(target: &str) -> bool {
     let trimmed = target.trim_end_matches('.');
     trimmed.is_empty() || trimmed.split('.').all(is_safe_dns_label)
+}
+
+enum DnsLookupOutcome {
+    Records(Vec<DnsRecord>),
+    NxDomain,
+}
+
+fn next_dns_txid() -> u16 {
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    let n = NONCE.fetch_add(1, Ordering::Relaxed);
+    RandomState::new().hash_one(n) as u16
+}
+
+async fn query_dns_server(
+    server: SocketAddr,
+    fqdn: &str,
+    qtype: u16,
+    timeout: Duration,
+) -> Result<DnsLookupOutcome, DiscoveryError> {
+    let udp_id = next_dns_txid();
+    let query_pkt = encode_dns_query(udp_id, fqdn, qtype, true)?;
+    let bind_addr = if server.is_ipv4() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    };
+    let udp = UdpSocket::bind(bind_addr).await?;
+    udp.connect(server).await?;
+    udp.send(&query_pkt).await?;
+
+    let mut buf = vec![0u8; 4096];
+    let len = tokio::time::timeout(timeout, udp.recv(&mut buf))
+        .await
+        .map_err(|_| DiscoveryError::Dns(format!("DNS UDP read timeout from {server}")))??;
+    match decode_dns_response(udp_id, fqdn, qtype, &buf[..len])? {
+        DecodedDnsMessage::Truncated => {}
+        DecodedDnsMessage::NxDomain => return Ok(DnsLookupOutcome::NxDomain),
+        DecodedDnsMessage::Records(records) => return Ok(DnsLookupOutcome::Records(records)),
+    }
+
+    // Fallback to TCP on TC=1 truncation bit without EDNS0 OPT, matching Prometheus askServerForName.
+    let tcp_id = next_dns_txid();
+    let tcp_query_pkt = encode_dns_query(tcp_id, fqdn, qtype, false)?;
+    let tcp_query_len = u16::try_from(tcp_query_pkt.len())
+        .map_err(|_| DiscoveryError::Dns("DNS TCP query packet exceeds u16 length".to_owned()))?;
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(server))
+        .await
+        .map_err(|_| DiscoveryError::Dns(format!("DNS TCP connect timeout to {server}")))??;
+    stream.write_all(&tcp_query_len.to_be_bytes()).await?;
+    stream.write_all(&tcp_query_pkt).await?;
+
+    let mut resp_len_buf = [0u8; 2];
+    tokio::time::timeout(timeout, stream.read_exact(&mut resp_len_buf))
+        .await
+        .map_err(|_| DiscoveryError::Dns(format!("DNS TCP read timeout from {server}")))??;
+    let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
+    let mut resp_buf = vec![0u8; resp_len];
+    tokio::time::timeout(timeout, stream.read_exact(&mut resp_buf))
+        .await
+        .map_err(|_| DiscoveryError::Dns(format!("DNS TCP body timeout from {server}")))??;
+
+    match decode_dns_response(tcp_id, fqdn, qtype, &resp_buf)? {
+        DecodedDnsMessage::Truncated => Err(DiscoveryError::Dns(
+            "truncated DNS response over TCP".to_owned(),
+        )),
+        DecodedDnsMessage::NxDomain => Ok(DnsLookupOutcome::NxDomain),
+        DecodedDnsMessage::Records(records) => Ok(DnsLookupOutcome::Records(records)),
+    }
+}
+
+/// Encodes an RFC 1035 DNS wire query message, optionally including an EDNS0 OPT pseudo-record
+/// (4096-byte UDP payload).
+pub(crate) fn encode_dns_query(
+    id: u16,
+    fqdn: &str,
+    qtype: u16,
+    edns: bool,
+) -> Result<Vec<u8>, DiscoveryError> {
+    let mut pkt = Vec::with_capacity(64);
+    pkt.extend_from_slice(&id.to_be_bytes());
+    // Flags: RD=1 (recursion desired, 0x0100).
+    pkt.extend_from_slice(&0x0100u16.to_be_bytes());
+    // QDCOUNT = 1, ANCOUNT = 0, NSCOUNT = 0, ARCOUNT = 1 when EDNS0 is enabled.
+    let arcount: u16 = u16::from(edns);
+    pkt.extend_from_slice(&1u16.to_be_bytes());
+    pkt.extend_from_slice(&0u16.to_be_bytes());
+    pkt.extend_from_slice(&0u16.to_be_bytes());
+    pkt.extend_from_slice(&arcount.to_be_bytes());
+
+    let trimmed = fqdn.trim_end_matches('.');
+    let mut wire_qname_len = 1usize;
+    if !trimmed.is_empty() {
+        for label in trimmed.split('.') {
+            if label.is_empty() || label.len() > 63 || !is_safe_dns_label(label) {
+                return Err(DiscoveryError::Dns(format!(
+                    "invalid DNS label in query name {fqdn:?}"
+                )));
+            }
+            wire_qname_len += 1 + label.len();
+            if wire_qname_len > 255 {
+                return Err(DiscoveryError::Dns(format!(
+                    "DNS query name {fqdn:?} exceeds 255 octets"
+                )));
+            }
+            pkt.push(label.len() as u8);
+            pkt.extend_from_slice(label.as_bytes());
+        }
+    }
+    pkt.push(0);
+    pkt.extend_from_slice(&qtype.to_be_bytes());
+    pkt.extend_from_slice(&QCLASS_IN.to_be_bytes());
+
+    if edns {
+        // EDNS0 OPT record: root name (0), TYPE = 41 (OPT), CLASS = 4096 (UDP payload size),
+        // TTL = 0, RDLENGTH = 0.
+        pkt.push(0);
+        pkt.extend_from_slice(&QTYPE_OPT.to_be_bytes());
+        pkt.extend_from_slice(&4096u16.to_be_bytes());
+        pkt.extend_from_slice(&0u32.to_be_bytes());
+        pkt.extend_from_slice(&0u16.to_be_bytes());
+    }
+
+    Ok(pkt)
+}
+
+enum DecodedDnsMessage {
+    Records(Vec<DnsRecord>),
+    NxDomain,
+    Truncated,
+}
+
+fn canonical_fqdn(fqdn: &str) -> String {
+    let trimmed = fqdn.trim_end_matches('.');
+    if trimmed.is_empty() {
+        ".".to_owned()
+    } else {
+        format!("{trimmed}.")
+    }
+}
+
+fn decode_dns_response(
+    expected_id: u16,
+    expected_qname: &str,
+    expected_qtype: u16,
+    msg: &[u8],
+) -> Result<DecodedDnsMessage, DiscoveryError> {
+    if msg.len() < 12 {
+        return Err(DiscoveryError::Dns("DNS response too short".to_owned()));
+    }
+    let resp_id = u16::from_be_bytes([msg[0], msg[1]]);
+    if resp_id != expected_id {
+        return Err(DiscoveryError::Dns(format!(
+            "DNS response transaction ID mismatch: expected {expected_id:#06x}, got {resp_id:#06x}"
+        )));
+    }
+    let flags = u16::from_be_bytes([msg[2], msg[3]]);
+    if (flags & 0x8000) == 0 {
+        return Err(DiscoveryError::Dns(
+            "DNS packet is a query (QR=0), expected response (QR=1)".to_owned(),
+        ));
+    }
+    let tc = (flags & 0x0200) != 0;
+    if tc {
+        return Ok(DecodedDnsMessage::Truncated);
+    }
+
+    let qdcount = u16::from_be_bytes([msg[4], msg[5]]) as usize;
+    let ancount = u16::from_be_bytes([msg[6], msg[7]]) as usize;
+    if qdcount != 1 {
+        return Err(DiscoveryError::Dns(format!(
+            "unexpected DNS question count {qdcount}, expected 1"
+        )));
+    }
+
+    let (qname, next) = decode_dns_name(msg, 12)?;
+    if next + 4 > msg.len() {
+        return Err(DiscoveryError::Dns("truncated DNS question".to_owned()));
+    }
+    let qtype = u16::from_be_bytes([msg[next], msg[next + 1]]);
+    let qclass = u16::from_be_bytes([msg[next + 2], msg[next + 3]]);
+    let want_qname = canonical_fqdn(expected_qname);
+    if !qname.eq_ignore_ascii_case(&want_qname) || qtype != expected_qtype || qclass != QCLASS_IN {
+        return Err(DiscoveryError::Dns(format!(
+            "DNS response question mismatch: expected ({want_qname}, {expected_qtype}, {QCLASS_IN}), got ({qname}, {qtype}, {qclass})"
+        )));
+    }
+    let mut offset = next + 4;
+
+    let rcode = (flags & 0x000F) as u8;
+    if rcode == RCODE_NXDOMAIN {
+        return Ok(DecodedDnsMessage::NxDomain);
+    }
+    if rcode != RCODE_SUCCESS {
+        return Err(DiscoveryError::Dns(format!(
+            "DNS response returned non-zero RCODE {rcode}"
+        )));
+    }
+
+    // Each resource record requires at least 1 byte for a root/pointer name plus 10 header bytes.
+    let max_possible_rrs = msg.len().saturating_sub(offset) / 11;
+    let mut records = Vec::with_capacity(ancount.min(max_possible_rrs));
+    for _ in 0..ancount {
+        let (_, next) = decode_dns_name(msg, offset)?;
+        if next + 10 > msg.len() {
+            return Err(DiscoveryError::Dns(
+                "truncated DNS resource record header".to_owned(),
+            ));
+        }
+        let rtype = u16::from_be_bytes([msg[next], msg[next + 1]]);
+        let rclass = u16::from_be_bytes([msg[next + 2], msg[next + 3]]);
+        let rdlength = u16::from_be_bytes([msg[next + 8], msg[next + 9]]) as usize;
+        let rdata_start = next + 10;
+        let rdata_end = rdata_start + rdlength;
+        if rdata_end > msg.len() {
+            return Err(DiscoveryError::Dns(
+                "truncated DNS resource record rdata".to_owned(),
+            ));
+        }
+        if rclass != QCLASS_IN {
+            offset = rdata_end;
+            continue;
+        }
+        let rdata = &msg[rdata_start..rdata_end];
+
+        match rtype {
+            QTYPE_A => {
+                if rdata.len() != 4 {
+                    return Err(DiscoveryError::Dns("invalid A record length".to_owned()));
+                }
+                records.push(DnsRecord::A(Ipv4Addr::new(
+                    rdata[0], rdata[1], rdata[2], rdata[3],
+                )));
+            }
+            QTYPE_AAAA => {
+                if rdata.len() != 16 {
+                    return Err(DiscoveryError::Dns("invalid AAAA record length".to_owned()));
+                }
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(rdata);
+                records.push(DnsRecord::Aaaa(Ipv6Addr::from(octets)));
+            }
+            QTYPE_SRV => {
+                if rdata.len() < 7 {
+                    return Err(DiscoveryError::Dns("invalid SRV record length".to_owned()));
+                }
+                let priority = u16::from_be_bytes([rdata[0], rdata[1]]);
+                let weight = u16::from_be_bytes([rdata[2], rdata[3]]);
+                let port = u16::from_be_bytes([rdata[4], rdata[5]]);
+                let (target, next_rdata) =
+                    decode_dns_name_bounded(msg, rdata_start + 6, rdata_end)?;
+                if next_rdata != rdata_end {
+                    return Err(DiscoveryError::Dns("invalid SRV record length".to_owned()));
+                }
+                records.push(DnsRecord::Srv {
+                    priority,
+                    weight,
+                    port,
+                    target,
+                });
+            }
+            QTYPE_MX => {
+                if rdata.len() < 3 {
+                    return Err(DiscoveryError::Dns("invalid MX record length".to_owned()));
+                }
+                let preference = u16::from_be_bytes([rdata[0], rdata[1]]);
+                let (target, next_rdata) =
+                    decode_dns_name_bounded(msg, rdata_start + 2, rdata_end)?;
+                if next_rdata != rdata_end {
+                    return Err(DiscoveryError::Dns("invalid MX record length".to_owned()));
+                }
+                records.push(DnsRecord::Mx { preference, target });
+            }
+            QTYPE_NS => {
+                let (target, next_rdata) = decode_dns_name_bounded(msg, rdata_start, rdata_end)?;
+                if next_rdata != rdata_end {
+                    return Err(DiscoveryError::Dns("invalid NS record length".to_owned()));
+                }
+                records.push(DnsRecord::Ns { target });
+            }
+            QTYPE_CNAME => {
+                let (target, next_rdata) = decode_dns_name_bounded(msg, rdata_start, rdata_end)?;
+                if next_rdata != rdata_end {
+                    return Err(DiscoveryError::Dns(
+                        "invalid CNAME record length".to_owned(),
+                    ));
+                }
+                records.push(DnsRecord::Cname(target));
+            }
+            _ => {}
+        }
+
+        offset = rdata_end;
+    }
+
+    Ok(DecodedDnsMessage::Records(records))
+}
+
+fn decode_dns_name(msg: &[u8], offset: usize) -> Result<(String, usize), DiscoveryError> {
+    decode_dns_name_bounded(msg, offset, msg.len())
+}
+
+fn decode_dns_name_bounded(
+    msg: &[u8],
+    mut offset: usize,
+    inline_bound: usize,
+) -> Result<(String, usize), DiscoveryError> {
+    let mut labels = Vec::new();
+    let mut end_offset = None;
+    let mut jumps = 0usize;
+    let mut total_len = 0usize;
+
+    loop {
+        let active_bound = if end_offset.is_none() {
+            inline_bound
+        } else {
+            msg.len()
+        };
+        if offset >= active_bound {
+            return Err(DiscoveryError::Dns(
+                "unexpected EOF while decoding DNS domain name".to_owned(),
+            ));
+        }
+        let len = msg[offset];
+        if len == 0 {
+            let final_offset = end_offset.unwrap_or(offset + 1);
+            let fqdn = if labels.is_empty() {
+                ".".to_owned()
+            } else {
+                let mut s = labels.join(".");
+                s.push('.');
+                s
+            };
+            return Ok((fqdn, final_offset));
+        }
+        if (len & 0xC0) == 0xC0 {
+            if offset + 1 >= active_bound {
+                return Err(DiscoveryError::Dns(
+                    "truncated DNS name compression pointer".to_owned(),
+                ));
+            }
+            if end_offset.is_none() {
+                end_offset = Some(offset + 2);
+            }
+            let ptr = (((len & 0x3F) as usize) << 8) | (msg[offset + 1] as usize);
+            if ptr >= msg.len() {
+                return Err(DiscoveryError::Dns(
+                    "DNS name compression pointer out of bounds".to_owned(),
+                ));
+            }
+            offset = ptr;
+            jumps += 1;
+            if jumps > 64 {
+                return Err(DiscoveryError::Dns(
+                    "DNS name compression pointer loop detected".to_owned(),
+                ));
+            }
+            continue;
+        }
+        if (len & 0xC0) != 0 {
+            return Err(DiscoveryError::Dns(
+                "invalid DNS label length byte".to_owned(),
+            ));
+        }
+        let label_len = len as usize;
+        let start = offset + 1;
+        let end = start + label_len;
+        if end > active_bound {
+            return Err(DiscoveryError::Dns("truncated DNS label".to_owned()));
+        }
+        total_len += label_len + 1;
+        if total_len > 255 {
+            return Err(DiscoveryError::Dns(
+                "DNS domain name exceeds 255 bytes".to_owned(),
+            ));
+        }
+        let label = std::str::from_utf8(&msg[start..end])
+            .map_err(|e| DiscoveryError::Dns(format!("non-UTF-8 DNS label: {e}")))?;
+        if !is_safe_dns_label(label) {
+            return Err(DiscoveryError::Dns(format!(
+                "unsafe character in DNS label {label:?}"
+            )));
+        }
+        labels.push(label.to_owned());
+        offset = end;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_dns_response_compression_pointers_and_rdata_bounds() {
+        // Build a response with QDCOUNT=1 (`_http._tcp.example.com.`) at offset 12,
+        // where `example.com.` starts at offset 23 (12 + 6 ("_http") + 5 ("_tcp") = 23).
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&0x5052u16.to_be_bytes()); // ID
+        pkt.extend_from_slice(&0x8180u16.to_be_bytes()); // QR=1, RD=1, RA=1
+        pkt.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+        pkt.extend_from_slice(&2u16.to_be_bytes()); // ANCOUNT=2 (CNAME + SRV)
+        pkt.extend_from_slice(&0u16.to_be_bytes());
+        pkt.extend_from_slice(&0u16.to_be_bytes());
+
+        // Question: _http._tcp.example.com.
+        for label in ["_http", "_tcp", "example", "com"] {
+            pkt.push(label.len() as u8);
+            pkt.extend_from_slice(label.as_bytes());
+        }
+        pkt.push(0);
+        pkt.extend_from_slice(&QTYPE_SRV.to_be_bytes());
+        pkt.extend_from_slice(&QCLASS_IN.to_be_bytes());
+
+        // Answer 1: CNAME with owner pointer 0xC00C -> `alias` + pointer 0xC017 (`example.com.`)
+        pkt.extend_from_slice(&[0xC0, 0x0C]); // Name pointer to offset 12
+        pkt.extend_from_slice(&QTYPE_CNAME.to_be_bytes());
+        pkt.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        pkt.extend_from_slice(&60u32.to_be_bytes());
+        let cname_rdata = [5, b'a', b'l', b'i', b'a', b's', 0xC0, 0x17];
+        pkt.extend_from_slice(&(cname_rdata.len() as u16).to_be_bytes());
+        pkt.extend_from_slice(&cname_rdata);
+
+        // Answer 2: SRV with owner pointer 0xC00C -> target `node1` + pointer 0xC017 (`example.com.`)
+        pkt.extend_from_slice(&[0xC0, 0x0C]);
+        pkt.extend_from_slice(&QTYPE_SRV.to_be_bytes());
+        pkt.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        pkt.extend_from_slice(&60u32.to_be_bytes());
+        let mut srv_rdata = Vec::new();
+        srv_rdata.extend_from_slice(&10u16.to_be_bytes());
+        srv_rdata.extend_from_slice(&20u16.to_be_bytes());
+        srv_rdata.extend_from_slice(&8080u16.to_be_bytes());
+        srv_rdata.extend_from_slice(&[5, b'n', b'o', b'd', b'e', b'1', 0xC0, 0x17]);
+        pkt.extend_from_slice(&(srv_rdata.len() as u16).to_be_bytes());
+        pkt.extend_from_slice(&srv_rdata);
+
+        let DecodedDnsMessage::Records(records) =
+            decode_dns_response(0x5052, "_http._tcp.example.com.", QTYPE_SRV, &pkt).unwrap()
+        else {
+            panic!("expected decoded DNS records");
+        };
+        assert_eq!(
+            records,
+            vec![
+                DnsRecord::Cname("alias.example.com.".to_owned()),
+                DnsRecord::Srv {
+                    priority: 10,
+                    weight: 20,
+                    port: 8080,
+                    target: "node1.example.com.".to_owned(),
+                },
+            ]
+        );
+
+        // Wrong transaction ID or mismatched question is rejected.
+        assert!(decode_dns_response(0x1234, "_http._tcp.example.com.", QTYPE_SRV, &pkt).is_err());
+        assert!(decode_dns_response(0x5052, "_other._tcp.example.com.", QTYPE_SRV, &pkt).is_err());
+        assert!(decode_dns_response(0x5052, "_http._tcp.example.com.", QTYPE_A, &pkt).is_err());
+
+        // Malformed NS record with RDLENGTH=0 followed by trailing root byte must fail instead of reading past RDATA.
+        let mut bad_ns = Vec::new();
+        bad_ns.extend_from_slice(&0x5052u16.to_be_bytes());
+        bad_ns.extend_from_slice(&0x8180u16.to_be_bytes());
+        bad_ns.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
+        bad_ns.extend_from_slice(&1u16.to_be_bytes());
+        bad_ns.extend_from_slice(&0u16.to_be_bytes());
+        bad_ns.extend_from_slice(&1u16.to_be_bytes());
+        bad_ns.push(0); // question: root
+        bad_ns.extend_from_slice(&QTYPE_NS.to_be_bytes());
+        bad_ns.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        bad_ns.push(0); // owner: root
+        bad_ns.extend_from_slice(&QTYPE_NS.to_be_bytes());
+        bad_ns.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        bad_ns.extend_from_slice(&60u32.to_be_bytes());
+        bad_ns.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH = 0 (invalid for NS)
+        bad_ns.push(0); // trailing OPT root name byte
+        assert!(decode_dns_response(0x5052, ".", QTYPE_NS, &bad_ns).is_err());
+
+        // QR=0 query packet is rejected.
+        let query_pkt = encode_dns_query(0x5052, "example.com.", QTYPE_A, true).unwrap();
+        assert!(decode_dns_response(0x5052, "example.com.", QTYPE_A, &query_pkt).is_err());
+
+        // EDNS0 controls ARCOUNT (1 vs 0), and >255-octet or unsafe QNAMEs are rejected.
+        let no_edns_pkt = encode_dns_query(0x5052, "example.com.", QTYPE_A, false).unwrap();
+        assert_eq!(u16::from_be_bytes([query_pkt[10], query_pkt[11]]), 1);
+        assert_eq!(u16::from_be_bytes([no_edns_pkt[10], no_edns_pkt[11]]), 0);
+        let overlong_qname = format!("{}.", vec!["a".repeat(60); 5].join("."));
+        assert!(encode_dns_query(1, &overlong_qname, QTYPE_A, true).is_err());
+        assert!(encode_dns_query(1, &"a".repeat(64), QTYPE_A, true).is_err());
+        assert!(encode_dns_query(1, "bad@host.example.com.", QTYPE_A, true).is_err());
+
+        // Compression pointer loop (self-pointer at offset 12) is rejected.
+        let mut loop_pkt = Vec::new();
+        loop_pkt.extend_from_slice(&0x5052u16.to_be_bytes());
+        loop_pkt.extend_from_slice(&0x8180u16.to_be_bytes());
+        loop_pkt.extend_from_slice(&1u16.to_be_bytes());
+        loop_pkt.extend_from_slice(&0u16.to_be_bytes());
+        loop_pkt.extend_from_slice(&0u16.to_be_bytes());
+        loop_pkt.extend_from_slice(&0u16.to_be_bytes());
+        loop_pkt.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1]);
+        assert!(decode_dns_response(0x5052, "example.com.", QTYPE_A, &loop_pkt).is_err());
+
+        // Out-of-bounds compression pointer is rejected.
+        let mut oob_pkt = loop_pkt.clone();
+        oob_pkt[12] = 0xC0;
+        oob_pkt[13] = 0xFF;
+        assert!(decode_dns_response(0x5052, "example.com.", QTYPE_A, &oob_pkt).is_err());
+
+        // Unsafe characters in decoded SRV/NS target hostnames are rejected.
+        let mut unsafe_ns = Vec::new();
+        unsafe_ns.extend_from_slice(&0x5052u16.to_be_bytes());
+        unsafe_ns.extend_from_slice(&0x8180u16.to_be_bytes());
+        unsafe_ns.extend_from_slice(&1u16.to_be_bytes());
+        unsafe_ns.extend_from_slice(&1u16.to_be_bytes());
+        unsafe_ns.extend_from_slice(&0u16.to_be_bytes());
+        unsafe_ns.extend_from_slice(&0u16.to_be_bytes());
+        unsafe_ns.push(0);
+        unsafe_ns.extend_from_slice(&QTYPE_NS.to_be_bytes());
+        unsafe_ns.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        unsafe_ns.push(0);
+        unsafe_ns.extend_from_slice(&QTYPE_NS.to_be_bytes());
+        unsafe_ns.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        unsafe_ns.extend_from_slice(&60u32.to_be_bytes());
+        let bad_target = b"\x0bad@evil.com\x00";
+        unsafe_ns.extend_from_slice(&(bad_target.len() as u16).to_be_bytes());
+        unsafe_ns.extend_from_slice(bad_target);
+        assert!(decode_dns_response(0x5052, ".", QTYPE_NS, &unsafe_ns).is_err());
+
+        // Trailing extra byte inside NS RDATA is rejected.
+        let mut trailing_ns = Vec::new();
+        trailing_ns.extend_from_slice(&0x5052u16.to_be_bytes());
+        trailing_ns.extend_from_slice(&0x8180u16.to_be_bytes());
+        trailing_ns.extend_from_slice(&1u16.to_be_bytes());
+        trailing_ns.extend_from_slice(&1u16.to_be_bytes());
+        trailing_ns.extend_from_slice(&0u16.to_be_bytes());
+        trailing_ns.extend_from_slice(&0u16.to_be_bytes());
+        trailing_ns.push(0);
+        trailing_ns.extend_from_slice(&QTYPE_NS.to_be_bytes());
+        trailing_ns.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        trailing_ns.push(0);
+        trailing_ns.extend_from_slice(&QTYPE_NS.to_be_bytes());
+        trailing_ns.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        trailing_ns.extend_from_slice(&60u32.to_be_bytes());
+        trailing_ns.extend_from_slice(&5u16.to_be_bytes());
+        trailing_ns.extend_from_slice(b"\x02ns\x00\x00");
+        assert!(decode_dns_response(0x5052, ".", QTYPE_NS, &trailing_ns).is_err());
+
+        // candidate_query_names honors ndots ordering, trailing dot, and 255-octet search filtering.
+        let conf = ResolvConf {
+            servers: ResolvConf::default().servers,
+            search: vec![
+                "svc.cluster.local".to_owned(),
+                vec!["x".repeat(60); 5].join("."),
+            ],
+            ndots: 2,
+            timeout: Duration::from_secs(5),
+        };
+        assert_eq!(
+            candidate_query_names("api.ns", &conf),
+            vec!["api.ns.svc.cluster.local.", "api.ns."]
+        );
+        assert_eq!(
+            candidate_query_names("a.b.c", &conf),
+            vec!["a.b.c.", "a.b.c.svc.cluster.local."]
+        );
+        assert_eq!(candidate_query_names("rooted.", &conf), vec!["rooted."]);
+    }
 }

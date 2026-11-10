@@ -15,7 +15,7 @@ exclude = ["tests/otap-compat"]
 [features]
 default = ["arrow", "dto"]
 arrow = ["dep:arrow-array", "dep:arrow-buffer", "dep:arrow-schema"]
-discovery = ["dep:serde", "dep:serde_json"]
+discovery = ["dep:serde", "dep:serde_json", "dep:tokio"]
 dto = ["dep:prost", "dep:prost-types"]
 
 [dependencies]
@@ -27,11 +27,13 @@ prost-types = { version = "0.14", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["io-util", "net", "time"], optional = true }
 
 [dev-dependencies]
 benchfmt = { git = "https://github.com/bwplotka/benchfmt.rs" }
 prost-build = "=0.14.4"
 protox = "0.10"
+tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
 
 [[bench]]
 name = "decode"
