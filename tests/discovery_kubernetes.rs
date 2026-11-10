@@ -16,16 +16,19 @@
 #![cfg(feature = "discovery-kubernetes")]
 
 use std::collections::BTreeMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use expfmt::discovery::kubernetes::{
     Job, KubernetesAttachMetadataConfig, KubernetesMetadataContext, KubernetesNamespaceDiscovery,
-    KubernetesRole, KubernetesSdConfig, KubernetesSelectorConfig, Namespace, Node, OwnerReference,
-    ReplicaSet, build_pod_target_group,
+    KubernetesPodDiscovery, KubernetesRole, KubernetesSdConfig, KubernetesSelectorConfig,
+    Namespace, Node, OwnerReference, ReplicaSet, build_pod_target_group,
 };
 use expfmt::discovery::{
     ADDRESS_LABEL, Authorization, BasicAuth, DiscoveryConfigs, HttpClientConfig, HttpHeader,
     HttpHeaders, LabelSet, OAuth2, Pod, TlsConfig, TlsVersion,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 fn label_set(pairs: &[(&str, &str)]) -> LabelSet {
     pairs
@@ -578,4 +581,418 @@ fn kubernetes_model_and_validation_edge_cases() {
         tg_cron_only.targets[1].get(ADDRESS_LABEL),
         Some(&"2001:db8::9".to_owned())
     );
+}
+
+const TEST_CA_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBSzCB8qADAgECAgEBMAoGCCqGSM49BAMCMBwxGjAYBgNVBAMMEVRlc3QgRGlz\n\
+Y292ZXJ5IENBMCAXDTIwMDEwMTAwMDAwMFoYDzIxMjAwMTAxMDAwMDAwWjAcMRow\n\
+GAYDVQQDDBFUZXN0IERpc2NvdmVyeSBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEH\n\
+A0IABIh8inO1e0XFBqDBtcxv3BmM0MHgV2PZeF+BswiHPsQ63K6Xt/xGZS9ziRh8\n\
+bErqSNtv7W9shFuHxVmIuf+ROo+jIzAhMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0P\n\
+AQH/BAQDAgGGMAoGCCqGSM49BAMCA0gAMEUCIQCXh/u32CC/j81T+3oEJnRR0P8A\n\
+ZCXcq24++2iU8RQHuAIgTvD813EN4j4Wd++SFXpG+evSLLk+fyJse98OIktvI/E=\n\
+-----END CERTIFICATE-----\n";
+
+const TEST_SERVER_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBVzCB/aADAgECAgECMAoGCCqGSM49BAMCMBwxGjAYBgNVBAMMEVRlc3QgRGlz\n\
+Y292ZXJ5IENBMCAXDTIwMDEwMTAwMDAwMFoYDzIxMjAwMTAxMDAwMDAwWjAUMRIw\n\
+EAYDVQQDDAkxMjcuMC4wLjEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASgpvT7\n\
+pxvHJ9b0hfVl1OSzVw4wXXNbMgOcQuzTJyWIdPLOgN4uV3uYNUCGBoOmzZiSHQNV\n\
+kxosSi48IIZKN66CozYwNDAMBgNVHRMBAf8EAjAAMA8GA1UdEQQIMAaHBH8AAAEw\n\
+EwYDVR0lBAwwCgYIKwYBBQUHAwEwCgYIKoZIzj0EAwIDSQAwRgIhAL8MTVC7DzUW\n\
+S6c9vBHZmQpTHRttDCHL5pJuJjYfD6UIAiEA4Svgdadp5oYsNbiccD3xiOxd2f0C\n\
+gcCEe0UeZFy+qgs=\n\
+-----END CERTIFICATE-----\n";
+
+const TEST_SERVER_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQglO/xnuT6hNqAa1Au\n\
+8mCUOEYEuik/fdi8Fp1fJTvPI/mhRANCAASgpvT7pxvHJ9b0hfVl1OSzVw4wXXNb\n\
+MgOcQuzTJyWIdPLOgN4uV3uYNUCGBoOmzZiSHQNVkxosSi48IIZKN66C\n\
+-----END PRIVATE KEY-----\n";
+
+const TEST_CLIENT_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBRzCB7qADAgECAgEDMAoGCCqGSM49BAMCMBwxGjAYBgNVBAMMEVRlc3QgRGlz\n\
+Y292ZXJ5IENBMCAXDTIwMDEwMTAwMDAwMFoYDzIxMjAwMTAxMDAwMDAwWjAWMRQw\n\
+EgYDVQQDDAtwcm9tLWNsaWVudDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPaV\n\
+o6u67B6wO8kr/rbYTvsvDXIxURJaLinfvVeqsPW3SDYaUTM9f8tSa7xbvmBwLbmr\n\
+y1s7cN7v0Pfo5lYFU5CjJTAjMAwGA1UdEwEB/wQCMAAwEwYDVR0lBAwwCgYIKwYB\n\
+BQUHAwIwCgYIKoZIzj0EAwIDSAAwRQIgNdIcz83GyYDyCadBNBtP+jxPeCBBpQY4\n\
+c/Mzu1lyEr8CIQDZMeAQYUPozmcVavNzujS3wddD9dNSIpZBGsOd9p4Kdg==\n\
+-----END CERTIFICATE-----\n";
+
+const TEST_CLIENT_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgOcr6T6T9duo1QH4u\n\
+nR6BDYL+R0s2UDkIdWN9ry1Z60ihRANCAAT2laOruuwesDvJK/622E77Lw1yMVES\n\
+Wi4p371XqrD1t0g2GlEzPX/LUmu8W75gcC25q8tbO3De79D36OZWBVOQ\n\
+-----END PRIVATE KEY-----\n";
+
+#[tokio::test]
+async fn kubernetes_pod_discovery_reqwest_end_to_end() {
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut req_buf = vec![0u8; 4096];
+                let n = stream.read(&mut req_buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                let first_line = req_str.lines().next().unwrap_or("");
+                assert!(
+                    req_str
+                        .lines()
+                        .any(|l| l.eq_ignore_ascii_case("authorization: Bearer test-k8s-token")),
+                    "missing bearer token header in:\n{req_str}"
+                );
+
+                let body = if first_line.starts_with(
+                    "GET /api/v1/namespaces/monitoring/pods?labelSelector=app%3Dmetrics&fieldSelector=status.phase%3DRunning ",
+                ) {
+                    r#"{
+                        "items": [{
+                            "metadata": {
+                                "name": "metrics-pod-0",
+                                "namespace": "monitoring",
+                                "uid": "uid-123",
+                                "labels": {"app": "metrics"},
+                                "ownerReferences": [{
+                                    "kind": "ReplicaSet",
+                                    "name": "metrics-rs",
+                                    "controller": true
+                                }]
+                            },
+                            "spec": {
+                                "nodeName": "node-1",
+                                "containers": [{
+                                    "name": "exporter",
+                                    "image": "prom/exporter:v1",
+                                    "ports": [{
+                                        "name": "http-metrics",
+                                        "containerPort": 9100,
+                                        "protocol": "TCP"
+                                    }]
+                                }]
+                            },
+                            "status": {
+                                "phase": "Running",
+                                "podIP": "10.244.0.9",
+                                "hostIP": "192.168.10.5",
+                                "conditions": [{"type": "Ready", "status": "True"}],
+                                "containerStatuses": [{
+                                    "name": "exporter",
+                                    "containerID": "containerd://abc123"
+                                }]
+                            }
+                        }]
+                    }"#
+                } else if first_line.starts_with("GET /api/v1/nodes?labelSelector=role%3Dworker ") {
+                    r#"{
+                        "items": [{
+                            "metadata": {
+                                "name": "node-1",
+                                "labels": {"role": "worker"}
+                            }
+                        }]
+                    }"#
+                } else if first_line
+                    .starts_with("GET /apis/apps/v1/namespaces/monitoring/replicasets ")
+                {
+                    r#"{
+                        "items": [{
+                            "metadata": {
+                                "name": "metrics-rs",
+                                "namespace": "monitoring",
+                                "ownerReferences": [{
+                                    "kind": "Deployment",
+                                    "name": "metrics-deploy",
+                                    "controller": true
+                                }]
+                            }
+                        }]
+                    }"#
+                } else {
+                    panic!("unexpected request line: {first_line}");
+                };
+
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let cfg: KubernetesSdConfig = serde_json::from_str(&format!(
+        r#"{{
+            "api_server": "http://{addr}",
+            "role": "pod",
+            "bearer_token": "test-k8s-token",
+            "namespaces": {{
+                "names": ["monitoring"]
+            }},
+            "selectors": [
+                {{
+                    "role": "pod",
+                    "label": "app=metrics",
+                    "field": "status.phase=Running"
+                }},
+                {{
+                    "role": "node",
+                    "label": "role=worker"
+                }}
+            ],
+            "attach_metadata": {{
+                "node": true,
+                "deployment": true
+            }}
+        }}"#
+    ))
+    .unwrap();
+
+    let discovery = KubernetesPodDiscovery::new(cfg).unwrap();
+    let groups = discovery.discover().await.unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].source, "pod/monitoring/metrics-pod-0");
+    assert_eq!(
+        groups[0]
+            .labels
+            .get("__meta_kubernetes_pod_deployment_name"),
+        Some(&"metrics-deploy".to_owned())
+    );
+    assert_eq!(
+        groups[0].labels.get("__meta_kubernetes_node_label_role"),
+        Some(&"worker".to_owned())
+    );
+    assert_eq!(
+        groups[0].targets,
+        vec![label_set(&[
+            ("__address__", "10.244.0.9:9100"),
+            ("__meta_kubernetes_pod_container_id", "containerd://abc123"),
+            ("__meta_kubernetes_pod_container_image", "prom/exporter:v1"),
+            ("__meta_kubernetes_pod_container_init", "false"),
+            ("__meta_kubernetes_pod_container_name", "exporter"),
+            ("__meta_kubernetes_pod_container_port_name", "http-metrics"),
+            ("__meta_kubernetes_pod_container_port_number", "9100"),
+            ("__meta_kubernetes_pod_container_port_protocol", "TCP"),
+        ])]
+    );
+}
+
+#[test]
+fn https_mtls_all_namespaces_404_tolerance_and_localset_execution() {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+
+    local.block_on(&rt, async {
+        let dir =
+            std::env::temp_dir().join(format!("scrape-rs-https-k8s-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user_file = dir.join("user.txt");
+        let pass_file = dir.join("pass.txt");
+        let hdr_file = dir.join("hdr.txt");
+        std::fs::write(&user_file, "prom-user\n").unwrap();
+        std::fs::write(&pass_file, "prom-pass\n").unwrap();
+        std::fs::write(&hdr_file, "from-file\n").unwrap();
+
+        let mut client_roots = rustls::RootCertStore::empty();
+        client_roots
+            .add(CertificateDer::from_pem_slice(TEST_CA_CERT_PEM.as_bytes()).unwrap())
+            .unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(
+            client_roots,
+        ))
+        .build()
+        .unwrap();
+        let server_cert = CertificateDer::from_pem_slice(TEST_SERVER_CERT_PEM.as_bytes()).unwrap();
+        let server_key = PrivateKeyDer::from_pem_slice(TEST_SERVER_KEY_PEM.as_bytes()).unwrap();
+        let tls_cfg = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![server_cert], server_key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls_cfg));
+
+        let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::task::spawn_local(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::task::spawn_local(async move {
+                    let Ok(mut tls_stream) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let mut req_buf = vec![0u8; 4096];
+                    let n = tls_stream.read(&mut req_buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                    let first_line = req_str.lines().next().unwrap_or("");
+                    assert!(
+                        req_str.lines().any(|l| l.eq_ignore_ascii_case(
+                            "authorization: Basic cHJvbS11c2VyOnByb20tcGFzcw=="
+                        )),
+                        "missing basic auth in:\n{req_str}"
+                    );
+                    assert!(
+                        req_str
+                            .lines()
+                            .any(|l| l.eq_ignore_ascii_case("x-trace-file: from-file")),
+                        "missing file header in:\n{req_str}"
+                    );
+
+                    let (status, body) = if first_line.starts_with("GET /api/v1/pods ") {
+                        (
+                            "200 OK",
+                            r#"{"items":[{"metadata":{"name":"job-pod","namespace":"batch-ns","ownerReferences":[{"kind":"Job","name":"job-1","controller":true}]},"spec":{"containers":[{"name":"worker","image":"worker:1","ports":[{"containerPort":9091,"protocol":"TCP"}]}]},"status":{"phase":"Running","podIP":"10.9.0.2"}}]}"#,
+                        )
+                    } else if first_line.starts_with("GET /api/v1/namespaces ") {
+                        (
+                            "200 OK",
+                            r#"{"items":[{"metadata":{"name":"batch-ns","labels":{"tier":"batch"}}}]}"#,
+                        )
+                    } else if first_line.starts_with("GET /apis/batch/v1/jobs ") {
+                        (
+                            "200 OK",
+                            r#"{"items":[{"metadata":{"name":"job-1","namespace":"batch-ns","ownerReferences":[{"kind":"CronJob","name":"nightly","controller":true}]}}]}"#,
+                        )
+                    } else if first_line.starts_with("GET /api/v1/namespaces/missing-ns ") {
+                        ("404 Not Found", r#"{"status":"Failure","code":404}"#)
+                    } else if first_line.starts_with("GET /api/v1/namespaces/missing-ns/pods ") {
+                        ("200 OK", r#"{"items":null}"#)
+                    } else if first_line.starts_with("GET /api/v1/namespaces/batch-ns ") {
+                        (
+                            "200 OK",
+                            r#"{"metadata":{"name":"batch-ns","labels":{"tier":"batch"}}}"#,
+                        )
+                    } else if first_line.starts_with("GET /api/v1/namespaces/batch-ns/pods ") {
+                        (
+                            "200 OK",
+                            r#"{"items":[{"metadata":{"name":"job-pod","namespace":"batch-ns"},"spec":{"containers":[{"name":"worker","image":"worker:1","ports":null}]},"status":{"phase":"Running","podIP":"10.9.0.2"}}]}"#,
+                        )
+                    } else {
+                        panic!("unexpected HTTPS request: {first_line}");
+                    };
+
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tls_stream.write_all(resp.as_bytes()).await;
+                    let _ = tls_stream.shutdown().await;
+                });
+            }
+        });
+
+        let base_http = HttpClientConfig {
+            basic_auth: Some(BasicAuth {
+                username_file: user_file.to_string_lossy().into_owned(),
+                password_file: pass_file.to_string_lossy().into_owned(),
+                ..BasicAuth::default()
+            }),
+            enable_http2: false,
+            follow_redirects: false,
+            tls_config: TlsConfig {
+                ca: TEST_CA_CERT_PEM.to_owned(),
+                cert: TEST_CLIENT_CERT_PEM.to_owned(),
+                key: TEST_CLIENT_KEY_PEM.to_owned(),
+                min_version: Some(TlsVersion::Tls12),
+                max_version: Some(TlsVersion::Tls13),
+                ..TlsConfig::default()
+            },
+            http_headers: Some(HttpHeaders {
+                headers: BTreeMap::from([(
+                    "X-Trace-File".to_owned(),
+                    HttpHeader {
+                        files: vec![hdr_file.to_string_lossy().into_owned()],
+                        ..HttpHeader::default()
+                    },
+                )]),
+            }),
+            ..HttpClientConfig::default()
+        };
+
+        // 1. All-namespaces HTTPS mTLS discovery with attach_metadata.{namespace, job, cronjob}.
+        let all_ns_disc = KubernetesPodDiscovery::new(KubernetesSdConfig {
+            api_server: Some(format!("https://{addr}")),
+            role: Some(KubernetesRole::Pod),
+            http_client_config: base_http.clone(),
+            attach_metadata: KubernetesAttachMetadataConfig {
+                namespace: true,
+                job: true,
+                cronjob: true,
+                ..KubernetesAttachMetadataConfig::default()
+            },
+            ..KubernetesSdConfig::default()
+        })
+        .unwrap();
+
+        let groups = tokio::task::spawn_local(async move { all_ns_disc.discover().await })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0]
+                .labels
+                .get("__meta_kubernetes_namespace_label_tier"),
+            Some(&"batch".to_owned())
+        );
+        assert_eq!(
+            groups[0].labels.get("__meta_kubernetes_pod_cronjob_name"),
+            Some(&"nightly".to_owned())
+        );
+
+        // 2. Multi-namespace HTTPS mTLS discovery where `missing-ns` returns `items: null` for pods
+        // and `404 Not Found` for `GET /api/v1/namespaces/missing-ns` without aborting `batch-ns`.
+        let multi_ns_disc = KubernetesPodDiscovery::new(KubernetesSdConfig {
+            api_server: Some(format!("https://{addr}")),
+            role: Some(KubernetesRole::Pod),
+            http_client_config: base_http,
+            namespaces: KubernetesNamespaceDiscovery {
+                own_namespace: false,
+                names: vec!["missing-ns".to_owned(), "batch-ns".to_owned()],
+            },
+            attach_metadata: KubernetesAttachMetadataConfig {
+                namespace: true,
+                ..KubernetesAttachMetadataConfig::default()
+            },
+            ..KubernetesSdConfig::default()
+        })
+        .unwrap();
+
+        let multi_groups = tokio::task::spawn_local(async move { multi_ns_disc.discover().await })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(multi_groups.len(), 1);
+        assert_eq!(multi_groups[0].source, "pod/batch-ns/job-pod");
+        assert_eq!(
+            multi_groups[0]
+                .labels
+                .get("__meta_kubernetes_namespace_label_tier"),
+            Some(&"batch".to_owned())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }

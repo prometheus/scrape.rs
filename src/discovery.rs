@@ -32,8 +32,8 @@ pub use dns::{DnsDiscovery, DnsRecord, DnsRecordType, DnsSdConfig, ResolvConf};
 #[cfg(feature = "discovery-kubernetes")]
 pub use kubernetes::{
     KubernetesAttachMetadataConfig, KubernetesMetadataContext, KubernetesNamespaceDiscovery,
-    KubernetesRole, KubernetesSdConfig, KubernetesSelectorConfig, Pod, build_pod_target_group,
-    build_pod_target_groups,
+    KubernetesPodDiscovery, KubernetesRole, KubernetesSdConfig, KubernetesSelectorConfig, Pod,
+    build_pod_target_group, build_pod_target_groups,
 };
 
 /// Reserved Prometheus label holding the `<host>:<port>` scrape target address.

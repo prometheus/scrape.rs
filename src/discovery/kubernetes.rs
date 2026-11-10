@@ -11,10 +11,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Prometheus-compatible Kubernetes service discovery (`kubernetes_sd_configs`) schema and
-//! pod target group builder (`role: pod`).
+//! Prometheus-compatible Kubernetes service discovery (`kubernetes_sd_configs`),
+//! with `reqwest`-based discovery for `role: pod`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -24,6 +26,10 @@ use crate::http_config::HttpClientConfig;
 use super::{
     ADDRESS_LABEL, DiscoveryError, LabelSet, TargetGroup, join_host_port, sanitize_label_name,
 };
+
+const IN_CLUSTER_TOKEN_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+const IN_CLUSTER_CA_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+const IN_CLUSTER_NAMESPACE_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
 
 /// Meta label prefix for all Kubernetes discovery labels (`"__meta_kubernetes_"`).
 pub const META_LABEL_PREFIX: &str = "__meta_kubernetes_";
@@ -338,6 +344,10 @@ impl KubernetesSdConfig {
 
         Ok(())
     }
+
+    fn selector_for(&self, role: KubernetesRole) -> Option<&KubernetesSelectorConfig> {
+        self.selectors.iter().find(|s| s.role == Some(role))
+    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -525,6 +535,14 @@ pub struct Pod {
     pub status: PodStatus,
 }
 
+/// Kubernetes `corev1.PodList` response payload.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct PodList {
+    /// List of pods.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub items: Vec<Pod>,
+}
+
 /// Kubernetes `corev1.Node` resource.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -532,6 +550,14 @@ pub struct Node {
     /// Standard object metadata.
     #[serde(default)]
     pub metadata: ObjectMeta,
+}
+
+/// Kubernetes `corev1.NodeList` response payload.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct NodeList {
+    /// List of nodes.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub items: Vec<Node>,
 }
 
 /// Kubernetes `corev1.Namespace` resource.
@@ -543,6 +569,14 @@ pub struct Namespace {
     pub metadata: ObjectMeta,
 }
 
+/// Kubernetes `corev1.NamespaceList` response payload.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct NamespaceList {
+    /// List of namespaces.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub items: Vec<Namespace>,
+}
+
 /// Kubernetes `appsv1.ReplicaSet` resource.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -552,6 +586,14 @@ pub struct ReplicaSet {
     pub metadata: ObjectMeta,
 }
 
+/// Kubernetes `appsv1.ReplicaSetList` response payload.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct ReplicaSetList {
+    /// List of ReplicaSets.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub items: Vec<ReplicaSet>,
+}
+
 /// Kubernetes `batchv1.Job` resource.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -559,6 +601,14 @@ pub struct Job {
     /// Standard object metadata.
     #[serde(default)]
     pub metadata: ObjectMeta,
+}
+
+/// Kubernetes `batchv1.JobList` response payload.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct JobList {
+    /// List of Jobs.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub items: Vec<Job>,
 }
 
 /// Auxiliary cluster metadata indexed for `attach_metadata` enrichment during pod discovery.
@@ -852,6 +902,330 @@ fn pod_source(namespace: &str, name: &str) -> String {
     format!("pod/{}", namespaced_name(namespace, name))
 }
 
+/// `reqwest`-based Kubernetes Pod service discovery runner (`role: pod`).
+#[derive(Clone, Debug)]
+pub struct KubernetesPodDiscovery {
+    config: KubernetesSdConfig,
+    client: Option<reqwest::Client>,
+    own_namespace_file: String,
+    in_cluster_token_file: String,
+    in_cluster_ca_file: String,
+}
+
+impl KubernetesPodDiscovery {
+    /// Creates a new [`KubernetesPodDiscovery`] after validating `config` (`role` must be `Pod`)
+    /// and building a [`reqwest::Client`] when `api_server` is configured.
+    ///
+    /// In-cluster mode (`api_server: None`) builds its TLS client using the service account CA
+    /// bundle and token when [`KubernetesPodDiscovery::discover`] runs.
+    pub fn new(mut config: KubernetesSdConfig) -> Result<Self, DiscoveryError> {
+        validate_pod_runner_config(&mut config)?;
+        let client = if config.api_server.is_some() {
+            Some(config.http_client_config.build_client()?)
+        } else {
+            None
+        };
+        Ok(Self {
+            config,
+            client,
+            own_namespace_file: IN_CLUSTER_NAMESPACE_FILE.to_owned(),
+            in_cluster_token_file: IN_CLUSTER_TOKEN_FILE.to_owned(),
+            in_cluster_ca_file: IN_CLUSTER_CA_FILE.to_owned(),
+        })
+    }
+
+    /// Creates a new [`KubernetesPodDiscovery`] using a caller-supplied [`reqwest::Client`].
+    pub fn with_client(
+        mut config: KubernetesSdConfig,
+        client: reqwest::Client,
+    ) -> Result<Self, DiscoveryError> {
+        validate_pod_runner_config(&mut config)?;
+        Ok(Self {
+            config,
+            client: Some(client),
+            own_namespace_file: IN_CLUSTER_NAMESPACE_FILE.to_owned(),
+            in_cluster_token_file: IN_CLUSTER_TOKEN_FILE.to_owned(),
+            in_cluster_ca_file: IN_CLUSTER_CA_FILE.to_owned(),
+        })
+    }
+
+    /// Overrides the path used to read the in-cluster service account namespace when
+    /// `namespaces.own_namespace` is `true` (defaults to
+    /// `"/var/run/secrets/kubernetes.io/serviceaccount/namespace"`).
+    pub fn with_own_namespace_file(mut self, path: impl Into<String>) -> Self {
+        self.own_namespace_file = path.into();
+        self
+    }
+
+    /// Returns the validated [`KubernetesSdConfig`].
+    pub fn config(&self) -> &KubernetesSdConfig {
+        &self.config
+    }
+
+    /// Queries the Kubernetes API server over HTTP(S) using `reqwest` and returns the discovered
+    /// pod [`TargetGroup`]s.
+    pub async fn discover(&self) -> Result<Vec<TargetGroup>, DiscoveryError> {
+        let (base_url, client, effective_http) = self.resolve_endpoint_and_auth()?;
+        let namespaces = self.resolve_namespaces()?;
+
+        let pod_selector = self.config.selector_for(KubernetesRole::Pod);
+        let node_selector = self.config.selector_for(KubernetesRole::Node);
+
+        let mut all_pods = Vec::new();
+        if namespaces.is_empty() {
+            let url = build_resource_url(&base_url, &["api", "v1", "pods"], pod_selector)?;
+            let list: PodList = self.get_json(&client, url, &effective_http).await?;
+            all_pods.extend(list.items);
+        } else {
+            for ns in &namespaces {
+                let url = build_resource_url(
+                    &base_url,
+                    &["api", "v1", "namespaces", ns, "pods"],
+                    pod_selector,
+                )?;
+                let list: PodList = self.get_json(&client, url, &effective_http).await?;
+                all_pods.extend(list.items);
+            }
+        }
+
+        let mut metadata = KubernetesMetadataContext::default();
+        let attach = &self.config.attach_metadata;
+
+        if attach.node {
+            let url = build_resource_url(&base_url, &["api", "v1", "nodes"], node_selector)?;
+            let list: NodeList = self.get_json(&client, url, &effective_http).await?;
+            for node in list.items {
+                metadata.nodes.insert(node.metadata.name.clone(), node);
+            }
+        }
+
+        if attach.namespace {
+            if namespaces.is_empty() {
+                let url = build_resource_url(&base_url, &["api", "v1", "namespaces"], None)?;
+                let list: NamespaceList = self.get_json(&client, url, &effective_http).await?;
+                for ns in list.items {
+                    metadata.namespaces.insert(ns.metadata.name.clone(), ns);
+                }
+            } else {
+                for ns_name in &namespaces {
+                    let url =
+                        build_resource_url(&base_url, &["api", "v1", "namespaces", ns_name], None)?;
+                    if let Some(ns) = self
+                        .get_optional_json::<Namespace>(&client, url, &effective_http)
+                        .await?
+                    {
+                        metadata.namespaces.insert(ns.metadata.name.clone(), ns);
+                    }
+                }
+            }
+        }
+
+        if attach.deployment {
+            if namespaces.is_empty() {
+                let url =
+                    build_resource_url(&base_url, &["apis", "apps", "v1", "replicasets"], None)?;
+                let list: ReplicaSetList = self.get_json(&client, url, &effective_http).await?;
+                for rs in list.items {
+                    metadata.replicasets.insert(
+                        namespaced_name(&rs.metadata.namespace, &rs.metadata.name),
+                        rs,
+                    );
+                }
+            } else {
+                for ns in &namespaces {
+                    let url = build_resource_url(
+                        &base_url,
+                        &["apis", "apps", "v1", "namespaces", ns, "replicasets"],
+                        None,
+                    )?;
+                    let list: ReplicaSetList = self.get_json(&client, url, &effective_http).await?;
+                    for rs in list.items {
+                        metadata.replicasets.insert(
+                            namespaced_name(&rs.metadata.namespace, &rs.metadata.name),
+                            rs,
+                        );
+                    }
+                }
+            }
+        }
+
+        if attach.cronjob {
+            if namespaces.is_empty() {
+                let url = build_resource_url(&base_url, &["apis", "batch", "v1", "jobs"], None)?;
+                let list: JobList = self.get_json(&client, url, &effective_http).await?;
+                for job in list.items {
+                    metadata.jobs.insert(
+                        namespaced_name(&job.metadata.namespace, &job.metadata.name),
+                        job,
+                    );
+                }
+            } else {
+                for ns in &namespaces {
+                    let url = build_resource_url(
+                        &base_url,
+                        &["apis", "batch", "v1", "namespaces", ns, "jobs"],
+                        None,
+                    )?;
+                    let list: JobList = self.get_json(&client, url, &effective_http).await?;
+                    for job in list.items {
+                        metadata.jobs.insert(
+                            namespaced_name(&job.metadata.namespace, &job.metadata.name),
+                            job,
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(build_pod_target_groups(&all_pods, &metadata, attach))
+    }
+
+    async fn get_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        client: &reqwest::Client,
+        url: reqwest::Url,
+        http_cfg: &HttpClientConfig,
+    ) -> Result<T, DiscoveryError> {
+        let req = client
+            .get(url)
+            .header("Accept", "application/json")
+            .header("User-Agent", "expfmt-rs/0.1");
+        let req = http_cfg.apply_to_request(req)?;
+        let resp = req.send().await?.error_for_status()?;
+        let body = resp.bytes().await?;
+        Ok(serde_json::from_slice(&body)?)
+    }
+
+    async fn get_optional_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        client: &reqwest::Client,
+        url: reqwest::Url,
+        http_cfg: &HttpClientConfig,
+    ) -> Result<Option<T>, DiscoveryError> {
+        let req = client
+            .get(url)
+            .header("Accept", "application/json")
+            .header("User-Agent", "expfmt-rs/0.1");
+        let req = http_cfg.apply_to_request(req)?;
+        let resp = req.send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = resp.error_for_status()?;
+        let body = resp.bytes().await?;
+        Ok(Some(serde_json::from_slice(&body)?))
+    }
+
+    fn resolve_endpoint_and_auth(
+        &self,
+    ) -> Result<(String, reqwest::Client, HttpClientConfig), DiscoveryError> {
+        if let Some(api_server) = &self.config.api_server {
+            let client = match &self.client {
+                Some(c) => c.clone(),
+                None => self.config.http_client_config.build_client()?,
+            };
+            return Ok((
+                api_server.trim_end_matches('/').to_owned(),
+                client,
+                self.config.http_client_config.clone(),
+            ));
+        }
+
+        let host = env::var("KUBERNETES_SERVICE_HOST").unwrap_or_default();
+        let port = env::var("KUBERNETES_SERVICE_PORT").unwrap_or_default();
+        self.resolve_in_cluster_endpoint_and_auth(&host, &port)
+    }
+
+    fn resolve_in_cluster_endpoint_and_auth(
+        &self,
+        host: &str,
+        port: &str,
+    ) -> Result<(String, reqwest::Client, HttpClientConfig), DiscoveryError> {
+        // In-cluster configuration matching client-go rest.InClusterConfig().
+        if host.is_empty() || port.is_empty() {
+            return Err(DiscoveryError::InvalidConfig(
+                "unable to load in-cluster configuration, KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT must be defined".to_owned(),
+            ));
+        }
+        let base_url = format!("https://{}", join_host_port(host, port));
+        let mut http_cfg = self.config.http_client_config.clone();
+        if http_cfg.basic_auth.is_none()
+            && http_cfg.authorization.is_none()
+            && http_cfg.bearer_token.is_empty()
+            && http_cfg.bearer_token_file.is_empty()
+        {
+            let token = fs::read_to_string(&self.in_cluster_token_file).map_err(|e| {
+                DiscoveryError::InvalidConfig(format!(
+                    "unable to read in-cluster token file {}: {e}",
+                    self.in_cluster_token_file
+                ))
+            })?;
+            if token.trim().is_empty() {
+                return Err(DiscoveryError::InvalidConfig(format!(
+                    "in-cluster token file {} is empty",
+                    self.in_cluster_token_file
+                )));
+            }
+            http_cfg
+                .bearer_token_file
+                .clone_from(&self.in_cluster_token_file);
+        }
+        let client = match &self.client {
+            Some(c) => c.clone(),
+            None => {
+                if http_cfg.tls_config.ca.is_empty()
+                    && http_cfg.tls_config.ca_file.is_empty()
+                    && !http_cfg.tls_config.insecure_skip_verify
+                {
+                    if !Path::new(&self.in_cluster_ca_file).exists() {
+                        return Err(DiscoveryError::InvalidConfig(format!(
+                            "unable to read in-cluster CA certificate file {}",
+                            self.in_cluster_ca_file
+                        )));
+                    }
+                    http_cfg
+                        .tls_config
+                        .ca_file
+                        .clone_from(&self.in_cluster_ca_file);
+                }
+                http_cfg.build_client()?
+            }
+        };
+        Ok((base_url, client, http_cfg))
+    }
+
+    fn resolve_namespaces(&self) -> Result<Vec<String>, DiscoveryError> {
+        let mut names = Vec::with_capacity(self.config.namespaces.names.len() + 1);
+        for ns in &self.config.namespaces.names {
+            validate_k8s_namespace_name(ns)?;
+            if !names.contains(ns) {
+                names.push(ns.clone());
+            }
+        }
+        if self.config.namespaces.own_namespace {
+            let own_ns = fs::read_to_string(&self.own_namespace_file)
+                .map_err(|e| {
+                    DiscoveryError::InvalidConfig(format!(
+                        "unable to read in-cluster namespace file {}: {e}",
+                        self.own_namespace_file
+                    ))
+                })?
+                .trim()
+                .to_owned();
+            if own_ns.is_empty() {
+                return Err(DiscoveryError::InvalidConfig(
+                    "could not read own namespace name (empty file)".to_owned(),
+                ));
+            }
+            validate_k8s_namespace_name(&own_ns)?;
+            if !names.contains(&own_ns) {
+                names.push(own_ns);
+            }
+        }
+        Ok(names)
+    }
+}
+
 fn validate_k8s_namespace_name(ns: &str) -> Result<(), DiscoveryError> {
     let bytes = ns.as_bytes();
     let is_valid = !bytes.is_empty()
@@ -867,4 +1241,159 @@ fn validate_k8s_namespace_name(ns: &str) -> Result<(), DiscoveryError> {
         )));
     }
     Ok(())
+}
+
+fn validate_pod_runner_config(config: &mut KubernetesSdConfig) -> Result<(), DiscoveryError> {
+    config.validate()?;
+    if config.role != Some(KubernetesRole::Pod) {
+        return Err(DiscoveryError::InvalidConfig(format!(
+            "KubernetesPodDiscovery requires role \"pod\", got {:?}",
+            config.role.map(KubernetesRole::as_str)
+        )));
+    }
+    if !config.kubeconfig_file.is_empty() {
+        return Err(DiscoveryError::InvalidConfig(
+            "kubeconfig_file is not supported by KubernetesPodDiscovery; configure api_server and HTTP credentials instead".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn build_resource_url(
+    base_url: &str,
+    segments: &[&str],
+    selector: Option<&KubernetesSelectorConfig>,
+) -> Result<reqwest::Url, DiscoveryError> {
+    let mut url = reqwest::Url::parse(base_url).map_err(|e| {
+        DiscoveryError::InvalidConfig(format!("invalid Kubernetes base URL {base_url:?}: {e}"))
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(DiscoveryError::InvalidConfig(format!(
+            "invalid Kubernetes base URL scheme {:?}, expected \"http\" or \"https\"",
+            url.scheme()
+        )));
+    }
+    {
+        let mut path_segs = url.path_segments_mut().map_err(|()| {
+            DiscoveryError::InvalidConfig(format!(
+                "Kubernetes base URL {base_url:?} cannot be a base"
+            ))
+        })?;
+        path_segs.pop_if_empty();
+        path_segs.extend(segments);
+    }
+    if let Some(sel) = selector {
+        let mut pairs = url.query_pairs_mut();
+        if !sel.label.is_empty() {
+            pairs.append_pair("labelSelector", &sel.label);
+        }
+        if !sel.field.is_empty() {
+            pairs.append_pair("fieldSelector", &sel.field);
+        }
+    }
+    Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_namespaces_rejects_empty_own_namespace_file() {
+        let cfg = KubernetesSdConfig {
+            role: Some(KubernetesRole::Pod),
+            namespaces: KubernetesNamespaceDiscovery {
+                own_namespace: true,
+                names: Vec::new(),
+            },
+            ..KubernetesSdConfig::default()
+        };
+        let disc = KubernetesPodDiscovery::new(cfg)
+            .unwrap()
+            .with_own_namespace_file("/dev/null");
+        let err = disc.resolve_namespaces().unwrap_err().to_string();
+        assert_eq!(err, "could not read own namespace name (empty file)");
+    }
+
+    #[test]
+    fn in_cluster_auth_ca_and_namespace_validation() {
+        let kubeconfig_cfg = KubernetesSdConfig {
+            role: Some(KubernetesRole::Pod),
+            kubeconfig_file: "/etc/kubeconfig".to_owned(),
+            ..KubernetesSdConfig::default()
+        };
+        assert!(KubernetesPodDiscovery::new(kubeconfig_cfg).is_err());
+
+        let node_cfg = KubernetesSdConfig {
+            role: Some(KubernetesRole::Node),
+            ..KubernetesSdConfig::default()
+        };
+        assert!(KubernetesPodDiscovery::new(node_cfg).is_err());
+
+        let dir = std::env::temp_dir().join(format!("scrape-rs-k8s-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let ns_file = dir.join("namespace");
+        let tok_file = dir.join("token");
+        let ca_file = dir.join("ca.crt");
+        fs::write(&ns_file, "  monitoring \n").unwrap();
+        fs::write(&tok_file, "  in-cluster-jwt \n").unwrap();
+        fs::write(
+            &ca_file,
+            "-----BEGIN CERTIFICATE-----\n\
+MIIBSzCB8qADAgECAgEBMAoGCCqGSM49BAMCMBwxGjAYBgNVBAMMEVRlc3QgRGlz\n\
+Y292ZXJ5IENBMCAXDTIwMDEwMTAwMDAwMFoYDzIxMjAwMTAxMDAwMDAwWjAcMRow\n\
+GAYDVQQDDBFUZXN0IERpc2NvdmVyeSBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEH\n\
+A0IABIh8inO1e0XFBqDBtcxv3BmM0MHgV2PZeF+BswiHPsQ63K6Xt/xGZS9ziRh8\n\
+bErqSNtv7W9shFuHxVmIuf+ROo+jIzAhMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0P\n\
+AQH/BAQDAgGGMAoGCCqGSM49BAMCA0gAMEUCIQCXh/u32CC/j81T+3oEJnRR0P8A\n\
+ZCXcq24++2iU8RQHuAIgTvD813EN4j4Wd++SFXpG+evSLLk+fyJse98OIktvI/E=\n\
+-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+
+        let mut disc = KubernetesPodDiscovery::new(KubernetesSdConfig {
+            role: Some(KubernetesRole::Pod),
+            namespaces: KubernetesNamespaceDiscovery {
+                own_namespace: true,
+                names: vec![
+                    "default".to_owned(),
+                    "monitoring".to_owned(),
+                    "default".to_owned(),
+                ],
+            },
+            ..KubernetesSdConfig::default()
+        })
+        .unwrap()
+        .with_own_namespace_file(ns_file.to_string_lossy());
+
+        assert_eq!(
+            disc.resolve_namespaces().unwrap(),
+            vec!["default".to_owned(), "monitoring".to_owned()]
+        );
+
+        assert!(
+            disc.resolve_in_cluster_endpoint_and_auth("", "443")
+                .is_err()
+        );
+        disc.in_cluster_token_file = dir.join("missing-token").to_string_lossy().into_owned();
+        assert!(
+            disc.resolve_in_cluster_endpoint_and_auth("10.96.0.1", "443")
+                .is_err()
+        );
+        disc.in_cluster_token_file = tok_file.to_string_lossy().into_owned();
+        disc.in_cluster_ca_file = dir.join("missing-ca").to_string_lossy().into_owned();
+        assert!(
+            disc.resolve_in_cluster_endpoint_and_auth("10.96.0.1", "443")
+                .is_err()
+        );
+        disc.in_cluster_ca_file = ca_file.to_string_lossy().into_owned();
+        let (base_url, _client, eff_http) = disc
+            .resolve_in_cluster_endpoint_and_auth("fd00::1", "6443")
+            .unwrap();
+        assert_eq!(base_url, "https://[fd00::1]:6443");
+        assert_eq!(eff_http.bearer_token_file, disc.in_cluster_token_file);
+        assert_eq!(eff_http.tls_config.ca_file, disc.in_cluster_ca_file);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
