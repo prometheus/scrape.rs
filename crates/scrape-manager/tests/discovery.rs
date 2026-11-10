@@ -15,7 +15,78 @@
 
 use std::time::Duration;
 
-use prometheus_scrape_manager::discovery::{format_duration, parse_duration};
+use prometheus_scrape_manager::discovery::{
+    ADDRESS_LABEL, DiscoveryConfigs, LabelSet, StaticConfig, TargetGroup, format_duration,
+    parse_duration,
+};
+
+fn label_set(pairs: &[(&str, &str)]) -> LabelSet {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect()
+}
+
+#[test]
+fn static_configs_and_target_group_serde_match_prometheus() {
+    let json = r#"{
+        "static_configs": [
+            {
+                "targets": ["127.0.0.1:9090", "[::1]:9100"],
+                "labels": {
+                    "env": "prod",
+                    "job": "prometheus"
+                }
+            },
+            {
+                "targets": ["10.0.0.1:8080"]
+            }
+        ]
+    }"#;
+
+    let mut cfg: DiscoveryConfigs = serde_json::from_str(json).expect("deserialize static_configs");
+    cfg.validate().expect("validate static_configs");
+
+    let groups = cfg.resolve_static();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].source, "0");
+    assert_eq!(
+        groups[0].targets,
+        vec![
+            label_set(&[(ADDRESS_LABEL, "127.0.0.1:9090")]),
+            label_set(&[(ADDRESS_LABEL, "[::1]:9100")]),
+        ]
+    );
+    assert_eq!(
+        groups[0].labels,
+        label_set(&[("env", "prod"), ("job", "prometheus")])
+    );
+    assert_eq!(groups[1].source, "1");
+    assert_eq!(
+        groups[1].targets,
+        vec![label_set(&[(ADDRESS_LABEL, "10.0.0.1:8080")])]
+    );
+    assert!(groups[1].labels.is_empty());
+
+    // TargetGroup direct serde round-trip matches Prometheus targetgroup.Group.
+    let tg_json = serde_json::to_string(&groups[0]).expect("serialize TargetGroup");
+    let roundtrip: TargetGroup = serde_json::from_str(&tg_json).expect("deserialize TargetGroup");
+    assert_eq!(roundtrip.targets, groups[0].targets);
+    assert_eq!(roundtrip.labels, groups[0].labels);
+
+    // Empty TargetGroup always serializes `"targets": []` matching Prometheus targetgroup.Group.MarshalJSON.
+    let empty_tg = TargetGroup::default();
+    let empty_json = serde_json::to_string(&empty_tg).expect("serialize empty TargetGroup");
+    assert_eq!(empty_json, r#"{"targets":[]}"#);
+    let empty_roundtrip: TargetGroup =
+        serde_json::from_str(&empty_json).expect("deserialize empty TargetGroup");
+    assert!(empty_roundtrip.targets.is_empty());
+    assert!(empty_roundtrip.labels.is_empty());
+
+    // Unknown fields are rejected on StaticConfig and DiscoveryConfigs.
+    assert!(serde_json::from_str::<StaticConfig>(r#"{"target": ["127.0.0.1:80"]}"#).is_err());
+    assert!(serde_json::from_str::<DiscoveryConfigs>(r#"{"static_config": []}"#).is_err());
+}
 
 #[test]
 fn prometheus_duration_parsing_and_formatting() {
