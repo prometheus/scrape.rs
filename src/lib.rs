@@ -20,6 +20,8 @@ pub mod discovery;
 #[cfg(feature = "dto")]
 pub mod dto;
 pub mod format;
+#[cfg(feature = "http-config")]
+pub mod http_config;
 // Layer 0 parsers remain crate-internal; `arrow` and `dto` expose the public decoding APIs.
 #[allow(dead_code, unused_imports)]
 pub(crate) mod parse;
