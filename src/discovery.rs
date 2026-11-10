@@ -11,16 +11,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Prometheus-compatible target discovery (`static_configs` and `dns_sd_configs`).
+//! Prometheus-compatible target discovery (`static_configs`, `dns_sd_configs`,
+//! and `reqwest`-based `kubernetes_sd_configs` for `role: pod`).
 
 pub mod dns;
+#[cfg(feature = "discovery-kubernetes")]
+pub mod kubernetes;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+#[cfg(feature = "http-config")]
+pub use crate::http_config::{
+    Authorization, BasicAuth, HttpClientConfig, HttpConfigError, HttpHeader, HttpHeaders, OAuth2,
+    ProxyConfig, TlsConfig, TlsVersion,
+};
 pub use dns::{DnsDiscovery, DnsRecord, DnsRecordType, DnsSdConfig, ResolvConf};
+#[cfg(feature = "discovery-kubernetes")]
+pub use kubernetes::{
+    KubernetesAttachMetadataConfig, KubernetesMetadataContext, KubernetesNamespaceDiscovery,
+    KubernetesRole, KubernetesSdConfig, KubernetesSelectorConfig, Pod, build_pod_target_group,
+    build_pod_target_groups,
+};
 
 /// Reserved Prometheus label holding the `<host>:<port>` scrape target address.
 pub const ADDRESS_LABEL: &str = "__address__";
@@ -37,12 +51,27 @@ pub enum DiscoveryError {
     /// I/O or filesystem error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// HTTP client or transport error during discovery.
+    #[cfg(feature = "http-config")]
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
     /// DNS protocol or lookup error.
     #[error("DNS error: {0}")]
     Dns(String),
     /// JSON payload decoding error.
     #[error("JSON decode error: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+#[cfg(feature = "http-config")]
+impl From<crate::http_config::HttpConfigError> for DiscoveryError {
+    fn from(err: crate::http_config::HttpConfigError) -> Self {
+        match err {
+            crate::http_config::HttpConfigError::InvalidConfig(msg) => Self::InvalidConfig(msg),
+            crate::http_config::HttpConfigError::Io(e) => Self::Io(e),
+            crate::http_config::HttpConfigError::Http(e) => Self::Http(e),
+        }
+    }
 }
 
 /// Static target group configuration matching Prometheus `static_configs` entries.
@@ -139,6 +168,10 @@ pub struct DiscoveryConfigs {
     /// DNS service discovery configurations (`dns_sd_configs`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_sd_configs: Vec<DnsSdConfig>,
+    /// Kubernetes service discovery configurations (`kubernetes_sd_configs`).
+    #[cfg(feature = "discovery-kubernetes")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kubernetes_sd_configs: Vec<KubernetesSdConfig>,
 }
 
 impl DiscoveryConfigs {
@@ -146,6 +179,10 @@ impl DiscoveryConfigs {
     pub fn validate(&mut self) -> Result<(), DiscoveryError> {
         for dns_cfg in &mut self.dns_sd_configs {
             dns_cfg.validate()?;
+        }
+        #[cfg(feature = "discovery-kubernetes")]
+        for k8s_cfg in &mut self.kubernetes_sd_configs {
+            k8s_cfg.validate()?;
         }
         Ok(())
     }
@@ -163,6 +200,22 @@ pub(crate) fn join_host_port(host: &str, port: &str) -> String {
     } else {
         format!("{host}:{port}")
     }
+}
+
+/// Sanitizes an arbitrary string into a valid Prometheus ASCII label name suffix by replacing
+/// any character outside `[a-zA-Z0-9_]` with `'_'`, matching Prometheus `strutil.SanitizeLabelName`.
+#[cfg(feature = "discovery-kubernetes")]
+pub(crate) fn sanitize_label_name(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Parses a Prometheus duration string (such as `"30s"`, `"1m"`, `"500ms"`, `"1h30m"`, `"7d"`,

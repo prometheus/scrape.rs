@@ -16,6 +16,7 @@ exclude = ["tests/otap-compat"]
 default = ["arrow", "dto"]
 arrow = ["dep:arrow-array", "dep:arrow-buffer", "dep:arrow-schema"]
 discovery = ["dep:serde", "dep:serde_json", "dep:tokio"]
+discovery-kubernetes = ["discovery", "http-config"]
 dto = ["dep:prost", "dep:prost-types"]
 http-config = ["dep:reqwest", "dep:serde", "dep:serde_json"]
 
