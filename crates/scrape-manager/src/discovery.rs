@@ -24,8 +24,8 @@ use std::time::Duration as StdDuration;
 pub use dns::{DnsDiscovery, DnsRecord, DnsRecordType, DnsSdConfig, ResolvConf};
 pub use kubernetes::{
     KubernetesAttachMetadataConfig, KubernetesMetadataContext, KubernetesNamespaceDiscovery,
-    KubernetesRole, KubernetesSdConfig, KubernetesSelectorConfig, Pod, build_pod_target_group,
-    build_pod_target_groups,
+    KubernetesPodDiscovery, KubernetesRole, KubernetesSdConfig, KubernetesSelectorConfig, Pod,
+    build_pod_target_group, build_pod_target_groups,
 };
 pub use prometheus_relabel::{ADDRESS_LABEL, LabelSet, ValidationScheme};
 use regex::Regex;
