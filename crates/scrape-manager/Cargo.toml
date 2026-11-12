@@ -21,7 +21,6 @@ default = ["arrow"]
 arrow = ["prometheus-expfmt/arrow"]
 
 [dependencies]
-bytes = { workspace = true }
 flate2 = { workspace = true }
 futures-util = { workspace = true }
 prometheus-expfmt = { workspace = true }
@@ -32,7 +31,7 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 benchfmt = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util"] }
 
 [[bench]]
 name = "scrape"
