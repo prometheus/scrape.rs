@@ -23,12 +23,16 @@
 //! consecutive scrapes in arena-backed tables so steady-state scrapes whose series set does not
 //! change perform zero heap allocations.
 
+use std::time::{Duration, Instant};
+
 use crate::parse::MetricType;
 
 use super::columns::{HistogramDpTable, MetricTable, NumberDpTable, SummaryDpTable};
 use super::family::{CurrentFamily, emit_family_row, hash_attrs};
 use super::intern::StringInterner;
-use super::options::{DecodeError, DecodeOptions, UntypedPolicy};
+use super::options::{
+    DECODE_BUDGET_DURATION_CHECK_INTERVAL, DecodeError, DecodeOptions, UntypedPolicy,
+};
 
 /// Raw IEEE 754 `u64` bit pattern of Prometheus's staleness marker (`0x7ff0_0000_0000_0002`),
 /// matching `prometheus/prometheus/model/value.StaleNaN`.
@@ -124,6 +128,19 @@ fn hash_series(family_idx: u32, kind: DpKind, attrs: &[(u32, u32)]) -> u64 {
     hash ^= hash >> 32;
     hash = hash.wrapping_mul(FX_SEED);
     hash ^ (hash >> 32)
+}
+
+/// Outcome of a bounded EOF stale-series drain step in [`StalenessTracker::finish_scrape_step`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StaleDrainStep {
+    /// The cooperative step budget expired while scanning/emitting disappeared series; yield
+    /// [`super::DecodeStep::Pending`] and resume from `stale_cursor` on the next step.
+    YieldPending,
+    /// The active streaming chunk reached `max_data_points` or `max_metrics`; finalize this chunk
+    /// and continue draining remaining stale series in the next chunk.
+    ChunkFull,
+    /// All disappeared series have been staged into the current batch.
+    Complete,
 }
 
 /// OTAP data-point table kind associated with a tracked time series.
@@ -976,11 +993,9 @@ impl StalenessTracker {
     }
 
     /// Emits stale data points for all previously active series that were not observed during the
-    /// current scrape, bounded by `max_data_points` when chunked streaming is active.
-    ///
-    /// Returns `Ok(true)` if additional stale series remain to be emitted in a subsequent chunk,
-    /// or `Ok(false)` once all disappeared series have been staged into the final batch (ready for
-    /// [`Self::commit_scrape`] once `finish_batches` succeeds).
+    /// current scrape, bounded by `max_data_points` when chunked streaming is active and by
+    /// `step_budget` (`(remaining_entries, started, max_duration)`) when cooperative budgeting is
+    /// active.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn finish_scrape_step(
         &mut self,
@@ -994,45 +1009,67 @@ impl StalenessTracker {
         default_ts_ns: Option<i64>,
         max_data_points: Option<usize>,
         max_metrics: usize,
-    ) -> Result<bool, DecodeError> {
+        step_budget: Option<(usize, Instant, Duration)>,
+    ) -> Result<StaleDrainStep, DecodeError> {
+        let mut steps = 0usize;
         while self.stale_cursor < self.series.len() {
+            if let Some((rem_entries, _, _)) = step_budget
+                && rem_entries == 0
+            {
+                return Ok(StaleDrainStep::YieldPending);
+            }
+
             let idx = self.stale_cursor;
             let s = self.series[idx];
             if !s.active || s.seen != SeenState::Unseen {
                 self.stale_cursor += 1;
-                continue;
-            }
+            } else {
+                let fam = self.families[s.family_idx as usize];
+                if fam.metric_type == MetricType::Unknown
+                    && opts.untyped_policy == UntypedPolicy::Drop
+                {
+                    self.stale_cursor += 1;
+                } else {
+                    if let Some(max_dps) = max_data_points {
+                        let current_dps =
+                            num_dp.base.len() + sum_dp.base.len() + hist_dp.base.len();
+                        let need_new_metric = fam.current_batch_id.is_none();
+                        if current_dps >= max_dps
+                            || (need_new_metric && metrics.len() >= max_metrics)
+                        {
+                            return Ok(StaleDrainStep::ChunkFull);
+                        }
+                    }
 
-            let fam = self.families[s.family_idx as usize];
-            if fam.metric_type == MetricType::Unknown && opts.untyped_policy == UntypedPolicy::Drop
-            {
-                self.stale_cursor += 1;
-                continue;
-            }
-
-            if let Some(max_dps) = max_data_points {
-                let current_dps = num_dp.base.len() + sum_dp.base.len() + hist_dp.base.len();
-                let need_new_metric = fam.current_batch_id.is_none();
-                if current_dps >= max_dps || (need_new_metric && metrics.len() >= max_metrics) {
-                    return Ok(true);
+                    self.emit_single_stale_series(
+                        s,
+                        metrics,
+                        num_dp,
+                        sum_dp,
+                        hist_dp,
+                        batch_keys,
+                        batch_vals,
+                        opts,
+                        default_ts_ns,
+                    )?;
+                    self.stale_cursor += 1;
                 }
             }
 
-            self.emit_single_stale_series(
-                s,
-                metrics,
-                num_dp,
-                sum_dp,
-                hist_dp,
-                batch_keys,
-                batch_vals,
-                opts,
-                default_ts_ns,
-            )?;
-            self.stale_cursor += 1;
+            if let Some((rem_entries, started, max_duration)) = step_budget {
+                steps += 1;
+                if self.stale_cursor < self.series.len() {
+                    let duration_exceeded = (max_duration.is_zero()
+                        || steps.is_multiple_of(DECODE_BUDGET_DURATION_CHECK_INTERVAL))
+                        && started.elapsed() >= max_duration;
+                    if steps >= rem_entries || duration_exceeded {
+                        return Ok(StaleDrainStep::YieldPending);
+                    }
+                }
+            }
         }
 
-        Ok(false)
+        Ok(StaleDrainStep::Complete)
     }
 
     #[allow(clippy::too_many_arguments)]
