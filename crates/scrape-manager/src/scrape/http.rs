@@ -19,7 +19,9 @@ use flate2::write::GzDecoder;
 #[cfg(feature = "arrow")]
 use prometheus_expfmt::arrow::DecodeError;
 use prometheus_expfmt::format::{EscapingScheme, FMT_TEXT, Format, FormatType, response_format};
-use reqwest::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, USER_AGENT};
+use reqwest::header::{
+    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, HeaderValue, USER_AGENT,
+};
 
 use crate::scrape::{BodyBufferPool, PooledBodyBuffer, ScrapeConfig, ScrapeTarget};
 
@@ -32,9 +34,9 @@ pub enum ScrapeError {
     /// Invalid scrape pool or target configuration.
     #[error("invalid scrape configuration: {0}")]
     InvalidConfig(String),
-    /// Transport or request construction failure from `reqwest`.
+    /// Transport or request construction failure from `reqwest` (with any URL password stripped).
     #[error("HTTP scrape request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[source] reqwest::Error),
     /// Target returned a non-200 HTTP status code.
     #[error("target returned non-200 HTTP status {status}")]
     UnexpectedStatus {
@@ -66,6 +68,19 @@ pub enum ScrapeError {
     #[cfg(feature = "arrow")]
     #[error("failed to decode exposition payload: {0}")]
     Decode(#[from] DecodeError),
+}
+
+impl From<reqwest::Error> for ScrapeError {
+    fn from(mut err: reqwest::Error) -> Self {
+        // Strip basic-auth passwords from `reqwest::Error`'s embedded URL so error strings and
+        // `ScrapeReport::error` never leak credentials.
+        if let Some(url) = err.url_mut()
+            && url.password().is_some()
+        {
+            let _ = url.set_password(None);
+        }
+        Self::Http(err)
+    }
 }
 
 /// Completed HTTP target fetch holding a pooled, uncompressed exposition buffer and timing metadata.
@@ -177,9 +192,9 @@ pub fn resolve_scrape_format(content_type: Option<&str>) -> Format {
 #[derive(Clone, Debug)]
 pub struct ReqwestFetcher {
     client: reqwest::Client,
-    accept_header: String,
-    timeout_header: String,
-    user_agent: String,
+    accept_header: HeaderValue,
+    timeout_header: HeaderValue,
+    user_agent: HeaderValue,
     scrape_timeout: Duration,
     enable_compression: bool,
     max_body_bytes: usize,
@@ -199,7 +214,7 @@ impl ReqwestFetcher {
         Self::with_client(client, config)
     }
 
-    /// Wraps an caller-supplied [`reqwest::Client`] (for example, one built from custom TLS or
+    /// Wraps a caller-supplied [`reqwest::Client`] (for example, one built from custom TLS or
     /// proxy settings) with scrape request headers and limits from `config`.
     ///
     /// # Errors
@@ -210,11 +225,20 @@ impl ReqwestFetcher {
         config: &ScrapeConfig,
     ) -> Result<Self, ScrapeError> {
         config.validate()?;
+        let accept_raw = build_accept_header(config.enable_open_metrics, config.escaping_scheme);
+        let accept_header = HeaderValue::from_str(&accept_raw)
+            .map_err(|err| ScrapeError::InvalidConfig(format!("invalid Accept header: {err}")))?;
+        let timeout_raw = format_scrape_timeout_seconds(config.scrape_timeout);
+        let timeout_header = HeaderValue::from_str(&timeout_raw)
+            .map_err(|err| ScrapeError::InvalidConfig(format!("invalid timeout header: {err}")))?;
+        let user_agent = HeaderValue::from_str(&config.user_agent).map_err(|err| {
+            ScrapeError::InvalidConfig(format!("invalid user_agent header: {err}"))
+        })?;
         Ok(Self {
             client,
-            accept_header: build_accept_header(config.enable_open_metrics, config.escaping_scheme),
-            timeout_header: format_scrape_timeout_seconds(config.scrape_timeout),
-            user_agent: config.user_agent.clone(),
+            accept_header,
+            timeout_header,
+            user_agent,
             scrape_timeout: config.scrape_timeout,
             enable_compression: config.enable_compression,
             max_body_bytes: config.effective_max_body_bytes(),
@@ -234,9 +258,9 @@ impl TargetFetcher for ReqwestFetcher {
         let mut req = self
             .client
             .get(target.url().clone())
-            .header(ACCEPT, &self.accept_header)
-            .header(SCRAPE_TIMEOUT_HEADER, &self.timeout_header)
-            .header(USER_AGENT, &self.user_agent);
+            .header(ACCEPT, self.accept_header.clone())
+            .header(SCRAPE_TIMEOUT_HEADER, self.timeout_header.clone())
+            .header(USER_AGENT, self.user_agent.clone());
         if self.enable_compression {
             req = req.header(ACCEPT_ENCODING, "gzip");
         }

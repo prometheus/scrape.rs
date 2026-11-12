@@ -450,6 +450,12 @@ impl ScrapeConfig {
                 self.scrape_timeout, self.scrape_interval
             )));
         }
+        if reqwest::header::HeaderValue::from_str(&self.user_agent).is_err() {
+            return Err(ScrapeError::InvalidConfig(format!(
+                "user_agent contains invalid HTTP header bytes: {:?}",
+                self.user_agent
+            )));
+        }
         if let SchedulingMode::Concurrent {
             max_in_flight,
             max_buffered_bodies,
