@@ -68,9 +68,40 @@ const NONE_IDX: u32 = u32::MAX;
 const FX_SEED: u64 = 0x517c_c1b7_2722_0a95;
 
 #[inline]
-fn fx_hash_bytes(bytes: &[u8]) -> u64 {
+const fn metric_type_tag(mt: MetricType) -> u8 {
+    match mt {
+        MetricType::Unknown => 0,
+        MetricType::Counter => 1,
+        MetricType::Gauge => 2,
+        MetricType::Histogram => 3,
+        MetricType::GaugeHistogram => 4,
+        MetricType::Summary => 5,
+        MetricType::Info => 6,
+        MetricType::Stateset => 7,
+    }
+}
+
+#[inline]
+fn canonical_family_key(current_family: &CurrentFamily) -> (&[u8], MetricType, bool) {
+    let raw = current_family.unescaped_name.as_slice();
+    if current_family.metric_type == MetricType::Counter
+        && raw.len() > 6
+        && raw.ends_with(b"_total")
+    {
+        (&raw[..raw.len() - 6], MetricType::Counter, true)
+    } else {
+        (
+            raw,
+            current_family.metric_type,
+            current_family.saw_total_suffix,
+        )
+    }
+}
+
+#[inline]
+fn hash_family_key(name: &[u8], metric_type: MetricType, saw_total_suffix: bool) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    let (chunks, remainder) = bytes.as_chunks::<8>();
+    let (chunks, remainder) = name.as_chunks::<8>();
     for chunk in chunks {
         let word = u64::from_le_bytes(*chunk);
         hash = (hash.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
@@ -78,6 +109,8 @@ fn fx_hash_bytes(bytes: &[u8]) -> u64 {
     for &b in remainder {
         hash = (hash.rotate_left(5) ^ u64::from(b)).wrapping_mul(FX_SEED);
     }
+    let tag = (u64::from(metric_type_tag(metric_type)) << 1) | u64::from(saw_total_suffix);
+    hash = (hash.rotate_left(5) ^ tag).wrapping_mul(FX_SEED);
     hash ^= hash >> 32;
     hash = hash.wrapping_mul(FX_SEED);
     hash ^ (hash >> 32)
@@ -484,15 +517,16 @@ impl StalenessTracker {
         &mut self,
         current_family: &mut CurrentFamily,
     ) -> Result<u32, DecodeError> {
+        let (name, metric_type, saw_total_suffix) = canonical_family_key(current_family);
         if let Some(idx) = current_family.tracker_family_idx {
             let fam = &mut self.families[idx as usize];
-            fam.current_batch_id = current_family.batch_id;
-            fam.saw_total_suffix |= current_family.saw_total_suffix;
-            return Ok(idx);
+            if fam.metric_type == metric_type && fam.saw_total_suffix == saw_total_suffix {
+                fam.current_batch_id = current_family.batch_id;
+                return Ok(idx);
+            }
         }
 
-        let name = current_family.unescaped_name.as_slice();
-        let hash = fx_hash_bytes(name);
+        let hash = hash_family_key(name, metric_type, saw_total_suffix);
         let mask = self.family_buckets.len() - 1;
         let mut slot = (hash as usize) & mask;
 
@@ -504,7 +538,10 @@ impl StalenessTracker {
             if bucket.hash == hash {
                 let idx = bucket.family_idx as usize;
                 let fam = self.families[idx];
-                if &self.family_bytes[fam.name_start as usize..fam.name_end as usize] == name {
+                if fam.metric_type == metric_type
+                    && fam.saw_total_suffix == saw_total_suffix
+                    && &self.family_bytes[fam.name_start as usize..fam.name_end as usize] == name
+                {
                     self.update_existing_family(idx, current_family)?;
                     current_family.tracker_family_idx = Some(bucket.family_idx);
                     return Ok(bucket.family_idx);
@@ -544,8 +581,8 @@ impl StalenessTracker {
             help_end,
             unit_start,
             unit_end,
-            metric_type: current_family.metric_type,
-            saw_total_suffix: current_family.saw_total_suffix,
+            metric_type,
+            saw_total_suffix,
             has_help: current_family.has_help,
             has_unit: current_family.has_unit,
             current_batch_id: current_family.batch_id,
@@ -567,29 +604,27 @@ impl StalenessTracker {
     ) -> Result<(), DecodeError> {
         let fam = self.families[idx];
         let (help_start, help_end) = if current_family.has_help {
-            if fam.has_help
-                && &self.family_bytes[fam.help_start as usize..fam.help_end as usize]
-                    == current_family.help.as_slice()
+            if &self.family_bytes[fam.help_start as usize..fam.help_end as usize]
+                == current_family.help.as_slice()
             {
                 (fam.help_start, fam.help_end)
             } else {
                 self.append_family_bytes(&current_family.help)?
             }
         } else {
-            (fam.help_start, fam.help_start)
+            (fam.help_start, fam.help_end)
         };
 
         let (unit_start, unit_end) = if current_family.has_unit {
-            if fam.has_unit
-                && &self.family_bytes[fam.unit_start as usize..fam.unit_end as usize]
-                    == current_family.unit.as_slice()
+            if &self.family_bytes[fam.unit_start as usize..fam.unit_end as usize]
+                == current_family.unit.as_slice()
             {
                 (fam.unit_start, fam.unit_end)
             } else {
                 self.append_family_bytes(&current_family.unit)?
             }
         } else {
-            (fam.unit_start, fam.unit_start)
+            (fam.unit_start, fam.unit_end)
         };
 
         let entry = &mut self.families[idx];
@@ -597,8 +632,6 @@ impl StalenessTracker {
         entry.help_end = help_end;
         entry.unit_start = unit_start;
         entry.unit_end = unit_end;
-        entry.metric_type = current_family.metric_type;
-        entry.saw_total_suffix = current_family.saw_total_suffix;
         entry.has_help = current_family.has_help;
         entry.has_unit = current_family.has_unit;
         entry.current_batch_id = current_family.batch_id;
