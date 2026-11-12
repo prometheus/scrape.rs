@@ -176,13 +176,13 @@ impl SchedulingMode {
         }
     }
 
-    /// Concurrent jittered mode with `max_in_flight` HTTP concurrency, at most `2` (clamped to
-    /// `max_in_flight`) concurrent buffered bodies, and `1` shared reusable decoder.
+    /// Concurrent jittered mode with `max_in_flight` HTTP concurrency and up to `2` (clamped to
+    /// `max_in_flight`) concurrent buffered bodies and pooled decoders.
     #[must_use]
     pub fn concurrent(max_in_flight: NonZeroUsize) -> Self {
-        let body_cap = max_in_flight.get().min(DEFAULT_CONCURRENT_BUFFERED_BODIES);
-        let max_buffered_bodies = NonZeroUsize::new(body_cap).expect("min of >=1 and 2 is >=1");
-        let max_decoders = NonZeroUsize::new(1).expect("non-zero constant");
+        let pool_cap = max_in_flight.get().min(DEFAULT_CONCURRENT_BUFFERED_BODIES);
+        let max_buffered_bodies = NonZeroUsize::new(pool_cap).expect("min of >=1 and 2 is >=1");
+        let max_decoders = max_buffered_bodies;
         Self::Concurrent {
             max_in_flight,
             max_buffered_bodies,

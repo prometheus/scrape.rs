@@ -510,7 +510,7 @@ fn non_send_local_set_compatibility_for_thread_per_core_runtimes() {
         assert_eq!(*sink.batches.borrow(), 12);
 
         let stats = manager.stats();
-        assert_eq!(stats.total_decoders_created, 1);
+        assert!(stats.total_decoders_created <= 2);
         assert!(stats.total_body_buffers_created <= 2);
     });
 }

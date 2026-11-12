@@ -22,7 +22,7 @@ use std::time::Instant as StdInstant;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 #[cfg(feature = "arrow")]
-use prometheus_expfmt::arrow::{DecodeBudget, DecodeStep, OtapMetricRecords};
+use prometheus_expfmt::arrow::{DecodeBudget, DecodeCursor, DecodeStep, OtapMetricRecords};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 
@@ -175,10 +175,14 @@ pub trait RawScrapeSink {
 pub trait ArrowScrapeSink {
     /// Receives one bounded [`OtapMetricRecords`] chunk decoded from `target`.
     ///
-    /// Awaiting inside `on_batch` holds the active scrape's [`crate::scrape::PooledBodyBuffer`]
-    /// permit (and, when further chunks remain in the same scrape, its
-    /// [`crate::scrape::PooledDecoder`] permit). Returning [`ControlFlow::Break`] aborts the
-    /// active scrape, drops pooled buffers back into their freelists, and stops the manager loop.
+    /// On single-chunk scrapes (and on the final chunk of multi-chunk scrapes), both the
+    /// [`crate::scrape::PooledBodyBuffer`] and [`crate::scrape::PooledDecoder`] permits are
+    /// released back to their pools before `on_batch` is awaited. On intermediate chunks of a
+    /// multi-chunk scrape, awaiting inside `on_batch` holds both permits until decoding resumes;
+    /// size `max_buffered_bodies` and `max_decoders` via
+    /// [`SchedulingMode::concurrent_with_pools`] when sinks apply async backpressure on large
+    /// multi-chunk targets. Returning [`ControlFlow::Break`] aborts the active scrape, drops
+    /// pooled buffers back into their freelists, and stops the manager loop.
     fn on_batch(
         &self,
         target: &ScrapeTarget,
@@ -378,12 +382,8 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         let scrape_timestamp_ms = fetched.scrape_timestamp_ms;
 
         let decode_outcome = self
-            .decode_fetched_cooperatively(target, &fetched, sink)
+            .decode_fetched_cooperatively(target, fetched, sink)
             .await;
-
-        // Explicitly drop `fetched` right after decoding so its `Vec<u8>` returns to
-        // `self.body_pool` before `on_scrape_complete` awaits downstream work.
-        drop(fetched);
 
         let report = match decode_outcome {
             ControlFlow::Break(()) => return ControlFlow::Break(()),
@@ -467,9 +467,31 @@ impl<F: TargetFetcher> ScrapeManager<F> {
     async fn decode_fetched_cooperatively<S: ArrowScrapeSink>(
         &self,
         target: &ScrapeTarget,
-        fetched: &FetchedScrape,
+        fetched: FetchedScrape,
         sink: &S,
     ) -> ControlFlow<(), (u64, usize, Result<(), ScrapeError>)> {
+        struct ActiveDecodeGuard {
+            decoder: Option<crate::scrape::PooledDecoder>,
+            cursor: DecodeCursor,
+        }
+
+        impl ActiveDecodeGuard {
+            fn release(&mut self) {
+                if let Some(mut dec) = self.decoder.take() {
+                    dec.finish_decode(&mut self.cursor);
+                }
+            }
+        }
+
+        impl Drop for ActiveDecodeGuard {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        let scrape_timestamp_ms = fetched.scrape_timestamp_ms;
+        let format = fetched.format;
+        let mut body_lease = Some(fetched.body);
         let mut decoder = self.decoder_pool.acquire().await;
 
         let chunk_limit = if self.config.max_data_points_per_batch == 0 {
@@ -484,16 +506,27 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         let decode_opts = self
             .config
             .decode_options
-            .with_timestamp_ms(fetched.scrape_timestamp_ms)
+            .with_timestamp_ms(scrape_timestamp_ms)
             .with_max_data_points_per_batch(chunk_limit);
+
+        let cursor = match decoder.start_decode_stream(&format, &decode_opts) {
+            Ok(c) => c,
+            Err(err) => {
+                drop(decoder);
+                drop(body_lease);
+                return ControlFlow::Continue((0, 0, Err(ScrapeError::Decode(err))));
+            }
+        };
+        let mut guard = ActiveDecodeGuard {
+            decoder: Some(decoder),
+            cursor,
+        };
 
         let base_budget = self.config.decode_budget;
         let max_entries = base_budget.max_entries.max(1);
         let max_bytes = base_budget.max_bytes.max(1);
         let max_duration = base_budget.max_duration;
 
-        let body = fetched.body.as_slice();
-        let mut stream = decoder.decode_stream(body, &fetched.format, &decode_opts);
         let mut decoded_points = 0_u64;
         let mut batches_emitted = 0_usize;
         let mut slice_start_pos = 0_usize;
@@ -501,7 +534,11 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         let mut slice_started = StdInstant::now();
 
         loop {
-            let step_budget = if slice_entries == 0 && stream.pos() == slice_start_pos {
+            if guard.cursor.is_done() {
+                break;
+            }
+
+            let step_budget = if slice_entries == 0 && guard.cursor.pos() == slice_start_pos {
                 base_budget
             } else {
                 let remaining_duration = if max_duration.is_zero() {
@@ -514,23 +551,41 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                 DecodeBudget::new(
                     max_entries.saturating_sub(slice_entries).max(1),
                     max_bytes
-                        .saturating_sub(stream.pos().saturating_sub(slice_start_pos))
+                        .saturating_sub(guard.cursor.pos().saturating_sub(slice_start_pos))
                         .max(1),
                     remaining_duration,
                 )
             };
 
-            let records = match stream.step(step_budget) {
+            let step = {
+                let body = body_lease
+                    .as_ref()
+                    .expect("body_lease stays Some until cursor is_done")
+                    .as_slice();
+                let dec = guard
+                    .decoder
+                    .as_mut()
+                    .expect("decoder stays Some until cursor is_done");
+                dec.step_decode(&mut guard.cursor, body, step_budget)
+            };
+
+            let records = match step {
                 Ok(DecodeStep::Pending) => {
                     tokio::task::yield_now().await;
-                    slice_start_pos = stream.pos();
+                    slice_start_pos = guard.cursor.pos();
                     slice_entries = 0;
                     slice_started = StdInstant::now();
                     continue;
                 }
                 Ok(DecodeStep::Batch(records)) => records,
-                Ok(DecodeStep::Done) => break,
+                Ok(DecodeStep::Done) => {
+                    guard.release();
+                    let _ = body_lease.take();
+                    break;
+                }
                 Err(err) => {
+                    guard.release();
+                    let _ = body_lease.take();
                     return ControlFlow::Continue((
                         decoded_points,
                         batches_emitted,
@@ -539,6 +594,13 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                 }
             };
 
+            // Release both pooled permits before awaiting `on_batch` once the final chunk of the
+            // scrape has been materialized so downstream sink awaits do not block peer scrapes.
+            if guard.cursor.is_done() {
+                guard.release();
+                let _ = body_lease.take();
+            }
+
             let pts = records.num_data_points();
             decoded_points = decoded_points.saturating_add(pts as u64);
             slice_entries = slice_entries.saturating_add(pts.max(1));
@@ -546,7 +608,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
             if !records.is_empty() {
                 batches_emitted += 1;
                 if sink
-                    .on_batch(target, fetched.scrape_timestamp_ms, records)
+                    .on_batch(target, scrape_timestamp_ms, records)
                     .await
                     .is_break()
                 {
@@ -554,20 +616,21 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                 }
             }
 
-            if stream.pos() < body.len()
+            if let Some(body) = body_lease.as_ref()
+                && guard.cursor.pos() < body.len()
                 && (slice_entries >= max_entries
-                    || stream.pos().saturating_sub(slice_start_pos) >= max_bytes
+                    || guard.cursor.pos().saturating_sub(slice_start_pos) >= max_bytes
                     || slice_started.elapsed() >= max_duration)
             {
                 tokio::task::yield_now().await;
-                slice_start_pos = stream.pos();
+                slice_start_pos = guard.cursor.pos();
                 slice_entries = 0;
                 slice_started = StdInstant::now();
             }
         }
 
-        drop(stream);
-        drop(decoder);
+        guard.release();
+        drop(body_lease);
         ControlFlow::Continue((decoded_points, batches_emitted, Ok(())))
     }
 
