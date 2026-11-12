@@ -1311,15 +1311,16 @@ fn stale_nan_bit_pattern_and_multi_scrape_staleness_lifecycle() {
     // Row 0 is live `req_total{id="1"}`; Row 1 is stale `req_total{id="2"}` sharing parent_id 0;
     // Row 2 is stale `mem_bytes` with parent_id 1.
     assert_eq!(ndp3_flags.value(0), 0);
+    assert!(ndp3_vals.is_valid(0));
     assert_eq!(ndp3_vals.value(0), 15.0);
     assert_eq!(ndp3_parents.value(0), 0);
 
     assert_eq!(ndp3_flags.value(1), DATA_POINT_FLAG_NO_RECORDED_VALUE);
-    assert!(is_stale_nan(ndp3_vals.value(1)));
+    assert!(ndp3_vals.is_null(1));
     assert_eq!(ndp3_parents.value(1), 0);
 
     assert_eq!(ndp3_flags.value(2), DATA_POINT_FLAG_NO_RECORDED_VALUE);
-    assert!(is_stale_nan(ndp3_vals.value(2)));
+    assert!(ndp3_vals.is_null(2));
     assert_eq!(ndp3_parents.value(2), 1);
 
     let sdp3 = rec3.summary_data_points().unwrap();
@@ -1337,7 +1338,7 @@ fn stale_nan_bit_pattern_and_multi_scrape_staleness_lifecycle() {
         .downcast_ref::<arrow_array::Float64Array>()
         .unwrap();
     assert_eq!(sdp3_flags.value(0), DATA_POINT_FLAG_NO_RECORDED_VALUE);
-    assert!(is_stale_nan(sdp3_sums.value(0)));
+    assert_eq!(sdp3_sums.value(0), 0.0);
 
     let hdp3 = rec3.histogram_data_points().unwrap();
     assert_eq!(hdp3.num_rows(), 1);
@@ -1354,7 +1355,7 @@ fn stale_nan_bit_pattern_and_multi_scrape_staleness_lifecycle() {
         .downcast_ref::<arrow_array::Float64Array>()
         .unwrap();
     assert_eq!(hdp3_flags.value(0), DATA_POINT_FLAG_NO_RECORDED_VALUE);
-    assert!(is_stale_nan(hdp3_sums.value(0)));
+    assert!(hdp3_sums.is_null(0));
 
     // Scrape 4: disappeared series are not re-emitted, and `req_total{id="2"}` can reappear.
     let scrape4 = concat!(

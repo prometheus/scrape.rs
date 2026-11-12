@@ -689,6 +689,13 @@ pub(super) struct OptionalValueCol<T> {
 }
 
 impl<T: Copy + Default> OptionalValueCol<T> {
+    pub(super) fn with_capacity(cap: usize) -> Self {
+        Self {
+            values: Vec::with_capacity(cap),
+            valid: Vec::new(),
+        }
+    }
+
     pub(super) fn clear(&mut self) {
         self.values.clear();
         self.valid.clear();
@@ -995,7 +1002,7 @@ impl ExemplarTable {
 /// `NumberDpExemplarAttrs`.
 pub(super) struct NumberDpTable {
     pub(super) base: DpBaseCols,
-    pub(super) values: Vec<f64>,
+    pub(super) values: OptionalValueCol<f64>,
     pub(super) attrs: AttrTable,
     pub(super) exemplars: ExemplarTable,
 }
@@ -1004,7 +1011,7 @@ impl NumberDpTable {
     pub(super) fn with_capacity(data_points: usize, attrs: usize) -> Self {
         Self {
             base: DpBaseCols::with_capacity(data_points),
-            values: Vec::with_capacity(data_points),
+            values: OptionalValueCol::with_capacity(data_points),
             attrs: AttrTable::with_capacity(attrs),
             exemplars: ExemplarTable::default(),
         }
@@ -1019,7 +1026,7 @@ impl NumberDpTable {
 
     pub(super) fn retained_memory_bytes(&self) -> usize {
         self.base.retained_memory_bytes()
-            + self.values.capacity() * size_of::<f64>()
+            + self.values.retained_memory_bytes()
             + self.attrs.retained_memory_bytes()
             + self.exemplars.retained_memory_bytes()
     }
@@ -1042,15 +1049,13 @@ impl NumberDpTable {
             start_time_nullable,
             has_time,
             time_nullable,
+            self.values.is_nullable(),
             self.base.has_flags(),
         );
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
         self.base
             .append_columns(&mut cols, has_id, has_default_ts, &mut scratch.u32_buf);
-        cols.push(Arc::new(Float64Array::new(
-            scalar_from_slice(&self.values),
-            None,
-        )));
+        cols.push(self.values.to_f64_array());
         self.base.append_flags_column(&mut cols);
 
         Ok(Some(RecordBatch::try_new(schema, cols)?))
