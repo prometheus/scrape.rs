@@ -191,6 +191,29 @@ impl OtapMetricRecords {
         }
     }
 
+    /// Replaces or clears the [`RecordBatch`] stored under `payload_type`.
+    ///
+    /// Batches with `num_rows() == 0` are normalized to `None` to preserve OTAP's non-empty table
+    /// invariant.
+    pub fn set(&mut self, payload_type: MetricPayloadType, batch: Option<RecordBatch>) {
+        let normalized = batch.filter(|b| b.num_rows() > 0);
+        let slot = match payload_type {
+            MetricPayloadType::UnivariateMetrics => &mut self.univariate_metrics,
+            MetricPayloadType::NumberDataPoints => &mut self.number_data_points,
+            MetricPayloadType::SummaryDataPoints => &mut self.summary_data_points,
+            MetricPayloadType::HistogramDataPoints => &mut self.histogram_data_points,
+            MetricPayloadType::NumberDpAttrs => &mut self.number_dp_attrs,
+            MetricPayloadType::SummaryDpAttrs => &mut self.summary_dp_attrs,
+            MetricPayloadType::HistogramDpAttrs => &mut self.histogram_dp_attrs,
+            MetricPayloadType::NumberDpExemplars => &mut self.number_dp_exemplars,
+            MetricPayloadType::HistogramDpExemplars => &mut self.histogram_dp_exemplars,
+            MetricPayloadType::NumberDpExemplarAttrs => &mut self.number_dp_exemplar_attrs,
+            MetricPayloadType::HistogramDpExemplarAttrs => &mut self.histogram_dp_exemplar_attrs,
+            MetricPayloadType::MetricAttrs => &mut self.metric_attrs,
+        };
+        *slot = normalized;
+    }
+
     /// Iterates over all non-empty `(MetricPayloadType, &RecordBatch)` pairs in wire order.
     pub fn iter(&self) -> impl Iterator<Item = (MetricPayloadType, &RecordBatch)> {
         [
