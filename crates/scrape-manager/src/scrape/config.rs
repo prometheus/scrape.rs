@@ -45,6 +45,7 @@ pub const DEFAULT_USER_AGENT: &str =
 
 const DEFAULT_CONCURRENT_IN_FLIGHT: usize = 8;
 const DEFAULT_CONCURRENT_BUFFERED_BODIES: usize = 2;
+const MAX_SCHEDULE_DURATION: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// Single HTTP endpoint and associated target labels scheduled by a scrape pool.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -452,6 +453,18 @@ impl ScrapeConfig {
             return Err(ScrapeError::InvalidConfig(
                 "scrape_interval must be greater than zero".to_owned(),
             ));
+        }
+        if self.scrape_interval > MAX_SCHEDULE_DURATION {
+            return Err(ScrapeError::InvalidConfig(format!(
+                "scrape_interval ({:?}) exceeds maximum ({MAX_SCHEDULE_DURATION:?})",
+                self.scrape_interval
+            )));
+        }
+        if self.initial_delay > MAX_SCHEDULE_DURATION {
+            return Err(ScrapeError::InvalidConfig(format!(
+                "initial_delay ({:?}) exceeds maximum ({MAX_SCHEDULE_DURATION:?})",
+                self.initial_delay
+            )));
         }
         if self.scrape_timeout.is_zero() {
             return Err(ScrapeError::InvalidConfig(

@@ -183,7 +183,7 @@ impl TargetSchedule {
             let generation = self.next_generation;
             self.next_generation = self.next_generation.wrapping_add(1);
             let offset = target_offset(&target, self.interval, self.jitter_seed);
-            let due = base_instant + offset;
+            let due = base_instant.checked_add(offset).unwrap_or(base_instant);
             let target_arc = Arc::new(target);
 
             let slot = TargetSlot {
@@ -258,8 +258,6 @@ impl TargetSchedule {
     /// Pops one target whose scheduled `due <= now`, advancing its periodic timer to the next grid
     /// tick (`due + k * interval`) immediately so scrape latency never shifts future intervals.
     pub(crate) fn pop_due(&mut self, now: Instant) -> Option<DueTarget> {
-        let interval_ns = self.interval.as_nanos().max(1);
-
         while let Some(&Reverse(entry)) = self.heap.peek() {
             if entry.due > now {
                 return None;
@@ -273,16 +271,8 @@ impl TargetSchedule {
                 continue;
             }
 
-            let elapsed = now.saturating_duration_since(entry.due);
-            let missed_ticks = elapsed.as_nanos() / interval_ns + 1;
-            let skipped = u64::try_from(missed_ticks.saturating_sub(1)).unwrap_or(u64::MAX);
-            let advance = self
-                .interval
-                .saturating_mul(u32::try_from(missed_ticks).unwrap_or(u32::MAX));
-            let mut next_due = entry.due + advance;
-            if next_due <= now {
-                next_due = now + self.interval;
-            }
+            let (next_due, missed_ticks) = advance_grid_deadline(entry.due, now, self.interval);
+            let skipped = missed_ticks.saturating_sub(1);
             slot.next_due = next_due;
             self.heap.push(Reverse(HeapEntry {
                 due: next_due,
@@ -291,7 +281,7 @@ impl TargetSchedule {
             }));
 
             if slot.in_flight {
-                self.overruns = self.overruns.saturating_add(skipped.saturating_add(1));
+                self.overruns = self.overruns.saturating_add(missed_ticks);
                 continue;
             }
 
@@ -331,6 +321,27 @@ impl TargetSchedule {
     pub(crate) fn take_overruns(&mut self) -> u64 {
         std::mem::take(&mut self.overruns)
     }
+}
+
+/// Advances `due` (`<= now`) forward by `k * interval` onto the earliest grid instant strictly
+/// after `now`, returning `(next_due, k)` without panicking on `Duration` or `Instant` overflow.
+pub(crate) fn advance_grid_deadline(
+    due: Instant,
+    now: Instant,
+    interval: Duration,
+) -> (Instant, u64) {
+    let interval_ns = interval.as_nanos().max(1);
+    let elapsed = now.saturating_duration_since(due);
+    let missed_ticks = elapsed.as_nanos() / interval_ns + 1;
+    let next_due = u32::try_from(missed_ticks)
+        .ok()
+        .and_then(|ticks| interval.checked_mul(ticks))
+        .and_then(|advance| due.checked_add(advance))
+        .filter(|&candidate| candidate > now)
+        .or_else(|| now.checked_add(interval))
+        .unwrap_or(now);
+    let missed_u64 = u64::try_from(missed_ticks).unwrap_or(u64::MAX);
+    (next_due, missed_u64)
 }
 
 #[cfg(test)]

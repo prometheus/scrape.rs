@@ -30,7 +30,7 @@ use tokio::time::{Instant, sleep_until};
 use crate::scrape::DecoderPool;
 #[cfg(feature = "arrow")]
 use crate::scrape::http::current_timestamp_ms;
-use crate::scrape::schedule::TargetSchedule;
+use crate::scrape::schedule::{TargetSchedule, advance_grid_deadline};
 use crate::scrape::{
     BodyBufferPool, FetchedScrape, ReqwestFetcher, SchedulingMode, ScrapeConfig, ScrapeError,
     ScrapeTarget, SequentialSchedule, TargetFetcher,
@@ -627,8 +627,10 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         let mut targets: Vec<Arc<ScrapeTarget>> =
             initial_targets.into_iter().map(Arc::new).collect();
         let interval = self.config.scrape_interval;
-        let interval_ns = interval.as_nanos().max(1);
-        let mut next_due = Instant::now() + self.config.initial_delay;
+        let start_now = Instant::now();
+        let mut next_due = start_now
+            .checked_add(self.config.initial_delay)
+            .unwrap_or(start_now);
 
         loop {
             tokio::select! {
@@ -645,17 +647,14 @@ impl<F: TargetFetcher> ScrapeManager<F> {
 
                 () = sleep_until(next_due) => {
                     let now = Instant::now();
-                    let elapsed = now.saturating_duration_since(next_due);
-                    let missed_ticks = elapsed.as_nanos() / interval_ns + 1;
+                    let (advanced_due, missed_ticks) =
+                        advance_grid_deadline(next_due, now, interval);
                     if missed_ticks > 1 {
-                        let skipped = u64::try_from(missed_ticks - 1).unwrap_or(u64::MAX);
-                        self.counters.overrun.fetch_add(skipped, Ordering::Relaxed);
+                        self.counters
+                            .overrun
+                            .fetch_add(missed_ticks - 1, Ordering::Relaxed);
                     }
-                    let advance = interval.saturating_mul(u32::try_from(missed_ticks).unwrap_or(u32::MAX));
-                    next_due += advance;
-                    if next_due <= now {
-                        next_due = now + interval;
-                    }
+                    next_due = advanced_due;
 
                     let snapshot = targets.clone();
                     for target in snapshot {
@@ -684,16 +683,13 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                     // If the sequential pass ran past one or more scheduled grid ticks, skip those
                     // missed ticks and advance to the next future grid point (matching Go time.Ticker).
                     let finish_now = Instant::now();
-                    if finish_now > next_due {
-                        let late_ns = finish_now.duration_since(next_due).as_nanos();
-                        let skipped_ticks = late_ns / interval_ns + 1;
-                        let skipped = u64::try_from(skipped_ticks).unwrap_or(u64::MAX);
-                        self.counters.overrun.fetch_add(skipped, Ordering::Relaxed);
-                        let skip_advance = interval.saturating_mul(u32::try_from(skipped_ticks).unwrap_or(u32::MAX));
-                        next_due += skip_advance;
-                        if next_due <= finish_now {
-                            next_due = finish_now + interval;
-                        }
+                    if finish_now >= next_due {
+                        let (skipped_due, skipped_ticks) =
+                            advance_grid_deadline(next_due, finish_now, interval);
+                        self.counters
+                            .overrun
+                            .fetch_add(skipped_ticks, Ordering::Relaxed);
+                        next_due = skipped_due;
                     }
                 }
             }
@@ -710,7 +706,10 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         Exec: Fn(Arc<ScrapeTarget>) -> Fut,
         Fut: Future<Output = ControlFlow<()>>,
     {
-        let start_base = Instant::now() + self.config.initial_delay;
+        let start_now = Instant::now();
+        let start_base = start_now
+            .checked_add(self.config.initial_delay)
+            .unwrap_or(start_now);
         let mut schedule =
             TargetSchedule::new(self.config.scrape_interval, self.config.jitter_seed);
         schedule.sync_targets(initial_targets, start_base);
