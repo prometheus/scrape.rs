@@ -27,6 +27,7 @@ const SCRAPE_TIMEOUT_HEADER: &str = "X-Prometheus-Scrape-Timeout-Seconds";
 
 /// Errors produced while validating configuration, fetching HTTP payloads, or decoding scrapes.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ScrapeError {
     /// Invalid scrape pool or target configuration.
     #[error("invalid scrape configuration: {0}")]

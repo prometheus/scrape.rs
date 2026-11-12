@@ -251,6 +251,7 @@ impl SchedulingMode {
 
 /// Configuration for [`crate::scrape::ReqwestFetcher`] and scrape pool scheduling.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ScrapeConfig {
     /// Logical Prometheus `job` name associated with this scrape pool.
     pub job_name: String,
@@ -397,11 +398,26 @@ impl ScrapeConfig {
         self
     }
 
+    /// Sets [`ScrapeConfig::user_agent`].
+    #[must_use]
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = user_agent.into();
+        self
+    }
+
     /// Sets [`ScrapeConfig::decode_budget`].
     #[cfg(feature = "arrow")]
     #[must_use]
     pub const fn with_decode_budget(mut self, budget: DecodeBudget) -> Self {
         self.decode_budget = budget;
+        self
+    }
+
+    /// Sets [`ScrapeConfig::decode_options`].
+    #[cfg(feature = "arrow")]
+    #[must_use]
+    pub const fn with_decode_options(mut self, options: DecodeOptions) -> Self {
+        self.decode_options = options;
         self
     }
 

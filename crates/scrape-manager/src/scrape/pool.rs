@@ -83,15 +83,15 @@ impl BodyBufferPool {
         });
 
         buf.clear();
-        if capacity_hint > buf.capacity() {
-            buf.reserve(capacity_hint - buf.capacity());
-        }
-
-        PooledBodyBuffer {
+        let mut leased = PooledBodyBuffer {
             buf,
             pool: Arc::clone(&self.inner),
             _permit: permit,
+        };
+        if capacity_hint > leased.buf.capacity() {
+            leased.buf.reserve(capacity_hint - leased.buf.capacity());
         }
+        leased
     }
 
     /// Number of buffers currently leased by active scrapes.

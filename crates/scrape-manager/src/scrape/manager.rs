@@ -38,6 +38,7 @@ use crate::scrape::{
 
 /// Control-plane messages accepted by a running [`ScrapeManager`].
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum ScrapeCommand {
     /// Replaces the active target set while preserving the interval phase of unchanged targets.
     UpdateTargets(Vec<ScrapeTarget>),
@@ -79,6 +80,7 @@ impl ScrapeControl {
 
 /// Per-target outcome summary emitted at the end of every scrape attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScrapeReport {
     /// `true` when HTTP fetch and payload decoding succeeded (`up == 1`).
     pub up: bool,
@@ -100,6 +102,7 @@ pub struct ScrapeReport {
 
 /// Point-in-time counter and pool memory snapshot from [`ScrapeManager::stats`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ManagerStats {
     /// Total target scrape attempts started.
     pub scrapes_started: u64,
