@@ -1390,26 +1390,57 @@ fn stale_nan_bit_pattern_and_multi_scrape_staleness_lifecycle() {
     assert_eq!(tracker.active_series_len(), 2);
 
     // `flush_target_stale` marks all remaining active series stale and empties the tracker.
+    assert!(format!("{tracker:?}").contains("StalenessTracker"));
     let opts5 = DecodeOptions::new().with_timestamp_ms(5_000);
     let flushed = dec.flush_target_stale(&mut tracker, &opts5).unwrap();
     assert!(tracker.is_empty());
     assert_eq!(tracker.active_series_len(), 0);
     assert_eq!(flushed.num_metrics(), 1);
     assert_eq!(flushed.num_data_points(), 2);
-    let flushed_flags = flushed
-        .number_data_points()
+    let flushed_um = flushed.univariate_metrics().unwrap();
+    let flushed_desc = flushed_um
+        .column_by_name("description")
         .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(flushed_desc.value(0), "Total requests.");
+    let flushed_ndp = flushed.number_data_points().unwrap();
+    let flushed_flags = flushed_ndp
         .column_by_name("flags")
         .unwrap()
         .as_any()
         .downcast_ref::<arrow_array::UInt32Array>()
         .unwrap();
+    let flushed_vals = flushed_ndp
+        .column_by_name("double_value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::Float64Array>()
+        .unwrap();
+    let flushed_ts = flushed_ndp
+        .column_by_name("time_unix_nano")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
     assert_eq!(flushed_flags.value(0), DATA_POINT_FLAG_NO_RECORDED_VALUE);
     assert_eq!(flushed_flags.value(1), DATA_POINT_FLAG_NO_RECORDED_VALUE);
+    assert!(flushed_vals.is_null(0));
+    assert!(flushed_vals.is_null(1));
+    assert_eq!(flushed_ts.value(0), 5_000_000_000);
+    assert_eq!(flushed_ts.value(1), 5_000_000_000);
+    assert_eq!(flushed.number_dp_attrs().unwrap().num_rows(), 2);
 
-    // A second flush on an already-empty tracker produces an empty record set.
+    // A second flush on an already-empty tracker produces an empty record set, and consecutive
+    // empty scrapes return empty records cleanly.
     let empty_flush = dec.flush_target_stale(&mut tracker, &opts5).unwrap();
     assert!(empty_flush.is_empty());
+    assert!(
+        dec.decode_with_staleness(b"", &Format::TEXT, &opts5, &mut tracker)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1434,15 +1465,27 @@ fn decode_stream_with_staleness_chunks_disappeared_series_and_rolls_back_on_drop
     assert_eq!(chunks1.len(), 2);
     assert_eq!(tracker.active_series_len(), 4);
 
-    // Early drop mid-scrape rolls back uncommitted seen flags.
+    // Early drop mid-scrape (including a newly observed series `k="new"`) and mid-stale-drain
+    // (dropping after the first chunk of disappeared series) both roll back cleanly.
     {
         let mut partial = dec.decode_stream_with_staleness(
-            b"# TYPE g gauge\ng{k=\"1\"} 10\ng{k=\"2\"} 20\ng{k=\"3\"} 30\n",
+            b"# TYPE g gauge\ng{k=\"new\"} 99\ng{k=\"1\"} 10\ng{k=\"2\"} 20\n",
             &Format::TEXT,
             &opts,
             &mut tracker,
         );
         assert!(partial.next().unwrap().is_ok());
+    }
+    assert_eq!(tracker.active_series_len(), 4);
+    {
+        let mut partial_drain = dec.decode_stream_with_staleness(
+            b"# TYPE g gauge\ng{k=\"1\"} 10\n",
+            &Format::TEXT,
+            &opts,
+            &mut tracker,
+        );
+        // Chunk 1 has 1 live (`k="1"`) + 1 stale (`k="2"`), leaving `k="3"` and `k="4"` pending.
+        assert_eq!(partial_drain.next().unwrap().unwrap().num_data_points(), 2);
     }
     assert_eq!(tracker.active_series_len(), 4);
 
@@ -1463,5 +1506,385 @@ fn decode_stream_with_staleness_chunks_disappeared_series_and_rolls_back_on_drop
     assert_eq!(chunks2.len(), 2);
     assert_eq!(chunks2[0].num_data_points(), 2);
     assert_eq!(chunks2[1].num_data_points(), 2);
+    assert_eq!(chunks2[0].num_metrics(), 1);
+    assert_eq!(chunks2[1].num_metrics(), 1);
+    let c0_flags = chunks2[0]
+        .number_data_points()
+        .unwrap()
+        .column_by_name("flags")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt32Array>()
+        .unwrap();
+    assert_eq!(
+        c0_flags.values().as_ref(),
+        &[0, DATA_POINT_FLAG_NO_RECORDED_VALUE]
+    );
+    let c1_flags = chunks2[1]
+        .number_data_points()
+        .unwrap()
+        .column_by_name("flags")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt32Array>()
+        .unwrap();
+    assert_eq!(
+        c1_flags.values().as_ref(),
+        &[
+            DATA_POINT_FLAG_NO_RECORDED_VALUE,
+            DATA_POINT_FLAG_NO_RECORDED_VALUE
+        ]
+    );
+    assert_eq!(chunks2[0].number_dp_attrs().unwrap().num_rows(), 2);
+    assert_eq!(chunks2[1].number_dp_attrs().unwrap().num_rows(), 2);
     assert_eq!(tracker.active_series_len(), 1);
+}
+
+#[test]
+fn staleness_rehashing_compaction_exemplar_isolation_and_key_reordering() {
+    let mut dec = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::with_capacity(0, 0, 0);
+    assert_eq!(tracker.retained_memory_bytes(), 0);
+    assert_eq!(StalenessTracker::default().retained_memory_bytes(), 0);
+    let opts = DecodeOptions::new().with_timestamp_ms(1_000);
+
+    // 1. Trigger multiple `rehash_families` and `rehash_series` passes starting from zero capacity.
+    let mut initial = String::new();
+    for f in 0..40 {
+        initial.push_str(&format!("# HELP fam_{f} Help {f}.\n# TYPE fam_{f} gauge\n"));
+        initial.push_str(&format!("fam_{f}{{a=\"1\",z=\"v{f}_0\"}} {f}\n"));
+        initial.push_str(&format!("fam_{f}{{a=\"2\",z=\"v{f}_1\"}} {f}\n"));
+    }
+    let rec1 = dec
+        .decode_with_staleness(initial.as_bytes(), &Format::TEXT, &opts, &mut tracker)
+        .unwrap();
+    assert_eq!(rec1.num_data_points(), 80);
+    assert_eq!(tracker.active_series_len(), 80);
+
+    // 2. Reverse label key order (`z` interned before `a` on both batch and tracker) to exercise
+    //    `!sorted` attribute re-sorting in `record_series` and `emit_single_stale_series`.
+    let reversed_live = "# TYPE fam_0 gauge\nfam_0{z=\"v0_0\",a=\"1\"} 99\n";
+    let rec2 = dec
+        .decode_with_staleness(
+            reversed_live.as_bytes(),
+            &Format::TEXT,
+            &opts.with_timestamp_ms(2_000),
+            &mut tracker,
+        )
+        .unwrap();
+    assert_eq!(rec2.num_data_points(), 80); // 1 live + 79 stale
+    assert_eq!(tracker.active_series_len(), 1);
+
+    // 3. `clear()` resets active tracking while preserving capacity.
+    let cap_before_clear = tracker.retained_memory_bytes();
+    assert!(cap_before_clear > 0);
+    tracker.clear();
+    assert!(tracker.is_empty());
+    assert_eq!(tracker.retained_memory_bytes(), cap_before_clear);
+
+    // 4. Ephemeral OpenMetrics exemplar attributes must never enter `StalenessTracker` interners.
+    let mut ex_tracker = StalenessTracker::new();
+    let mut baseline_ex_mem = 0usize;
+    for i in 0..16 {
+        let om = format!(
+            "# TYPE rpc_total counter\n\
+             rpc_total{{env=\"prod\"}} {i} # {{req_id=\"ephemeral-{i:08}\",trace_id=\"nonhex-{i:08}\"}} 1.0\n\
+             rpc_total{{env=\"staging\"}} {i}\n\
+             # EOF\n"
+        );
+        dec.decode_with_staleness(
+            om.as_bytes(),
+            &Format::OPEN_METRICS_1_0_0,
+            &opts.with_timestamp_ms(3_000 + i * 1_000),
+            &mut ex_tracker,
+        )
+        .unwrap();
+        if i == 0 {
+            baseline_ex_mem = ex_tracker.retained_memory_bytes();
+            assert!(baseline_ex_mem > 0);
+        } else {
+            assert_eq!(
+                ex_tracker.retained_memory_bytes(),
+                baseline_ex_mem,
+                "ephemeral exemplar strings leaked into StalenessTracker at scrape {i}"
+            );
+        }
+    }
+
+    // 5. Series churn across rollouts triggers `compact()` and bounds `retained_memory_bytes()`.
+    let mut churn_tracker = StalenessTracker::new();
+    let mut post_compaction_mem = 0usize;
+    for gen_idx in 0..12 {
+        let mut scrape = String::from("# TYPE pod_cpu gauge\n");
+        for pod in 0..80 {
+            scrape.push_str(&format!("pod_cpu{{pod=\"pod-{gen_idx}-{pod}\"}} 1\n"));
+        }
+        dec.decode_with_staleness(
+            scrape.as_bytes(),
+            &Format::TEXT,
+            &opts.with_timestamp_ms(20_000 + gen_idx * 1_000),
+            &mut churn_tracker,
+        )
+        .unwrap();
+        assert_eq!(churn_tracker.active_series_len(), 80);
+        if gen_idx == 2 {
+            post_compaction_mem = churn_tracker.retained_memory_bytes();
+        } else if gen_idx > 2 {
+            assert!(
+                churn_tracker.retained_memory_bytes() <= post_compaction_mem * 2,
+                "StalenessTracker memory grew unbounded under churn at generation {gen_idx}"
+            );
+        }
+    }
+}
+
+#[test]
+fn staleness_wire_nans_type_transitions_policies_and_cooperative_cursor() {
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    let mut dec = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    let opts = DecodeOptions::new().with_timestamp_ms(1_000);
+
+    // 1. Wire `"NaN"` (`NORMAL_NAN`) is treated as a live sample (no `flags` column) and emits
+    //    `FLAG_NO_RECORDED_VALUE` when it disappears on the next scrape.
+    let nan_scrape = concat!(
+        "# TYPE g_nan gauge\ng_nan NaN\n",
+        "# TYPE s_nan summary\ns_nan{quantile=\"0.5\"} NaN\ns_nan_sum NaN\ns_nan_count 1\n",
+        "# TYPE h_nan histogram\nh_nan_bucket{le=\"+Inf\"} 1\nh_nan_sum NaN\nh_nan_count 1\n",
+    );
+    let nan_rec1 = dec
+        .decode_with_staleness(nan_scrape.as_bytes(), &Format::TEXT, &opts, &mut tracker)
+        .unwrap();
+    assert_eq!(tracker.active_series_len(), 3);
+    assert!(
+        nan_rec1
+            .number_data_points()
+            .unwrap()
+            .column_by_name("flags")
+            .is_none()
+    );
+    let nan_rec2 = dec
+        .decode_with_staleness(
+            b"",
+            &Format::TEXT,
+            &opts.with_timestamp_ms(2_000),
+            &mut tracker,
+        )
+        .unwrap();
+    assert!(tracker.is_empty());
+    assert_eq!(nan_rec2.num_data_points(), 3);
+
+    // 2. Direct check of `SparseFlagsCol` trailing-zero backfill (`flags != 0` at row 0 followed by
+    //    `flags == 0` at row 1) and `SeenState::SeenStale` on incoming `STALE_NAN` values.
+    let mut sparse_flags = super::columns::SparseFlagsCol::default();
+    sparse_flags.push(0, DATA_POINT_FLAG_NO_RECORDED_VALUE);
+    sparse_flags.push(1, 0);
+    let flags_arr = sparse_flags.to_array();
+    let flags_u32 = flags_arr
+        .as_any()
+        .downcast_ref::<arrow_array::UInt32Array>()
+        .unwrap();
+    assert_eq!(
+        flags_u32.values().as_ref(),
+        &[DATA_POINT_FLAG_NO_RECORDED_VALUE, 0]
+    );
+
+    // 3. `# TYPE` transitions (`histogram` -> `gauge`) and counter `_total` naming (`# TYPE req_total counter`
+    //    -> `# TYPE req counter` with `req_total` samples).
+    let mut type_tracker = StalenessTracker::new();
+    dec.decode_with_staleness(
+        b"# TYPE m histogram\nm_bucket{id=\"1\",le=\"+Inf\"} 2\nm_sum{id=\"1\"} 1.0\nm_count{id=\"1\"} 2\n\
+          # TYPE req_total counter\nreq_total{id=\"1\"} 10\n",
+        &Format::TEXT,
+        &opts,
+        &mut type_tracker,
+    )
+    .unwrap();
+    assert_eq!(type_tracker.active_series_len(), 2);
+
+    let trans_rec = dec
+        .decode_with_staleness(
+            b"# TYPE m gauge\nm{id=\"1\"} 5\n# TYPE req counter\nreq_total{id=\"1\"} 15\n",
+            &Format::TEXT,
+            &opts.with_timestamp_ms(2_000),
+            &mut type_tracker,
+        )
+        .unwrap();
+    // `m` (gauge) + `req_total` (counter, matched without false stale!) + `m` (stale histogram) = 3 metrics, 3 dps.
+    assert_eq!(trans_rec.num_metrics(), 3);
+    assert_eq!(trans_rec.num_data_points(), 3);
+    assert!(
+        trans_rec
+            .number_data_points()
+            .unwrap()
+            .column_by_name("flags")
+            .is_none()
+    );
+    assert_eq!(trans_rec.histogram_data_points().unwrap().num_rows(), 1);
+
+    // 4. `UntypedPolicy::Drop` suppresses stale emission for previously tracked untyped series, and
+    //    `track_timestamps_staleness` skips explicit wire timestamps unless enabled.
+    let mut pol_tracker = StalenessTracker::new();
+    dec.decode_with_staleness(
+        b"untyped_m 1\nts_m 2 1700000000000\n",
+        &Format::TEXT,
+        &opts,
+        &mut pol_tracker,
+    )
+    .unwrap();
+    // `ts_m` has an explicit timestamp and `track_timestamps_staleness` defaults to `false`.
+    assert_eq!(pol_tracker.active_series_len(), 1);
+    let dropped_stale = dec
+        .decode_with_staleness(
+            b"",
+            &Format::TEXT,
+            &opts
+                .with_timestamp_ms(2_000)
+                .with_untyped_policy(UntypedPolicy::Drop),
+            &mut pol_tracker,
+        )
+        .unwrap();
+    assert!(dropped_stale.is_empty());
+    assert!(pol_tracker.is_empty());
+
+    let track_ts_opts = opts.with_track_timestamps_staleness(true);
+    dec.decode_with_staleness(
+        b"ts_m 2 1700000000000\n",
+        &Format::TEXT,
+        &track_ts_opts,
+        &mut pol_tracker,
+    )
+    .unwrap();
+    assert_eq!(pol_tracker.active_series_len(), 1);
+    let ts_stale = dec
+        .decode_with_staleness(
+            b"",
+            &Format::TEXT,
+            &track_ts_opts.with_timestamp_ms(3_000),
+            &mut pol_tracker,
+        )
+        .unwrap();
+    assert_eq!(ts_stale.num_data_points(), 1);
+
+    // 5. Cooperative `step_decode_with_staleness`, `finish_decode_with_staleness`, and budgeted
+    //    `DecodeStream::next_cooperative` yielding `Pending` during EOF stale draining.
+    let mut coop_tracker = StalenessTracker::new();
+    dec.decode_with_staleness(
+        b"# TYPE g gauge\ng{k=\"1\"} 1\ng{k=\"2\"} 2\ng{k=\"3\"} 3\ng{k=\"4\"} 4\n",
+        &Format::TEXT,
+        &opts,
+        &mut coop_tracker,
+    )
+    .unwrap();
+    assert_eq!(coop_tracker.active_series_len(), 4);
+
+    // Init errors leave `coop_tracker` intact.
+    assert!(
+        dec.decode_with_staleness(b"g 1\n", &Format::UNKNOWN, &opts, &mut coop_tracker)
+            .is_err()
+    );
+    assert!(
+        dec.flush_target_stale(&mut coop_tracker, &opts.with_timestamp_ms(i64::MAX))
+            .is_err()
+    );
+    let mut bad_init_stream =
+        dec.decode_stream_with_staleness(b"g 1\n", &Format::UNKNOWN, &opts, &mut coop_tracker);
+    assert!(bad_init_stream.step(DecodeBudget::default()).is_err());
+    drop(bad_init_stream);
+    assert_eq!(coop_tracker.active_series_len(), 4);
+
+    // Aborting `step_decode_with_staleness` via `finish_decode_with_staleness` rolls back.
+    let budget_1 = DecodeBudget::default().with_max_entries(1);
+    let mut aborted_cur = dec.start_decode(&Format::TEXT, &opts).unwrap();
+    assert_eq!(
+        dec.step_decode_with_staleness(
+            &mut aborted_cur,
+            b"# TYPE g gauge\ng{k=\"new\"} 9\n",
+            budget_1,
+            &mut coop_tracker
+        )
+        .unwrap(),
+        DecodeStep::Pending
+    );
+    dec.finish_decode_with_staleness(&mut aborted_cur, &mut coop_tracker);
+    assert_eq!(coop_tracker.active_series_len(), 4);
+
+    // Drive `step_decode_with_staleness` on `b""` with `max_entries = 1` so EOF stale draining
+    // yields `DecodeStep::Pending` between disappeared series.
+    let mut drain_cur = dec
+        .start_decode(&Format::TEXT, &opts.with_timestamp_ms(2_000))
+        .unwrap();
+    let mut pending_drains = 0usize;
+    let mut drained_batch = None;
+    loop {
+        match dec
+            .step_decode_with_staleness(&mut drain_cur, b"", budget_1, &mut coop_tracker)
+            .unwrap()
+        {
+            DecodeStep::Pending => pending_drains += 1,
+            DecodeStep::Batch(b) => drained_batch = Some(b),
+            DecodeStep::Done => break,
+        }
+    }
+    assert!(pending_drains >= 3);
+    assert_eq!(drained_batch.unwrap().num_data_points(), 4);
+    assert!(coop_tracker.is_empty());
+
+    // Also verify `DecodeStream::next_cooperative` with `decode_stream_with_staleness`.
+    dec.decode_with_staleness(
+        b"# TYPE g gauge\ng{k=\"1\"} 1\ng{k=\"2\"} 2\ng{k=\"3\"} 3\n",
+        &Format::TEXT,
+        &opts,
+        &mut coop_tracker,
+    )
+    .unwrap();
+    struct YieldOnce(bool);
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                Poll::Pending
+            }
+        }
+    }
+    let stream_opts = opts
+        .with_timestamp_ms(3_000)
+        .with_max_data_points_per_batch(2);
+    let mut yields = 0usize;
+    let chunks = {
+        let fut = async {
+            let mut stream = dec.decode_stream_with_staleness(
+                b"",
+                &Format::TEXT,
+                &stream_opts,
+                &mut coop_tracker,
+            );
+            let mut chunks = Vec::new();
+            while let Some(res) = stream
+                .next_cooperative(budget_1, || {
+                    yields += 1;
+                    YieldOnce(false)
+                })
+                .await
+            {
+                chunks.push(res.unwrap());
+            }
+            chunks
+        };
+        let mut pinned = pin!(fut);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(out) = pinned.as_mut().poll(&mut cx) {
+                break out;
+            }
+        }
+    };
+    assert!(yields >= 2);
+    assert_eq!(chunks.len(), 2);
+    assert!(coop_tracker.is_empty());
 }
