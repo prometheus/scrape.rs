@@ -20,7 +20,7 @@ use flate2::write::GzDecoder;
 use prometheus_expfmt::arrow::DecodeError;
 use prometheus_expfmt::format::{EscapingScheme, FMT_TEXT, Format, FormatType, response_format};
 use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, HeaderValue, USER_AGENT,
+    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT,
 };
 
 use crate::scrape::{BodyBufferPool, PooledBodyBuffer, ScrapeConfig, ScrapeTarget};
@@ -208,7 +208,14 @@ impl ReqwestFetcher {
     /// Returns [`ScrapeError`] if `config` fails validation or the HTTP client cannot be built.
     pub fn new(config: &ScrapeConfig) -> Result<Self, ScrapeError> {
         config.validate()?;
+        // Disable automatic `reqwest` response decompression even if downstream crates enable
+        // `reqwest` compression features via Cargo unification, keeping `wire_bytes` and
+        // `max_body_bytes` enforcement exact.
         let client = reqwest::Client::builder()
+            .no_gzip()
+            .no_brotli()
+            .no_zstd()
+            .no_deflate()
             .timeout(config.scrape_timeout)
             .build()?;
         Self::with_client(client, config)
@@ -216,6 +223,10 @@ impl ReqwestFetcher {
 
     /// Wraps a caller-supplied [`reqwest::Client`] (for example, one built from custom TLS or
     /// proxy settings) with scrape request headers and limits from `config`.
+    ///
+    /// Caller-built clients should disable automatic response decompression (`.no_gzip()`,
+    /// `.no_brotli()`, `.no_zstd()`, `.no_deflate()`) so [`ReqwestFetcher`] can enforce
+    /// [`ScrapeConfig::max_body_bytes`] and measure [`FetchedScrape::wire_bytes`] directly.
     ///
     /// # Errors
     ///
@@ -255,15 +266,18 @@ impl TargetFetcher for ReqwestFetcher {
         let started = Instant::now();
         let timeout = self.scrape_timeout;
 
-        let mut req = self
+        let accept_encoding = if self.enable_compression {
+            HeaderValue::from_static("gzip")
+        } else {
+            HeaderValue::from_static("identity")
+        };
+        let req = self
             .client
             .get(target.url().clone())
             .header(ACCEPT, self.accept_header.clone())
+            .header(ACCEPT_ENCODING, accept_encoding)
             .header(SCRAPE_TIMEOUT_HEADER, self.timeout_header.clone())
             .header(USER_AGENT, self.user_agent.clone());
-        if self.enable_compression {
-            req = req.header(ACCEPT_ENCODING, "gzip");
-        }
 
         // NOTE: Do not lease a `PooledBodyBuffer` while awaiting response headers. Slow targets
         // that stall on TCP connect or server-side metric collection hold zero payload memory.
@@ -278,12 +292,7 @@ impl TargetFetcher for ReqwestFetcher {
             });
         }
 
-        let encoding = classify_content_encoding(
-            response
-                .headers()
-                .get(CONTENT_ENCODING)
-                .and_then(|v| v.to_str().ok()),
-        )?;
+        let encoding = classify_content_encoding(response.headers(), self.enable_compression)?;
 
         let content_length = response.content_length();
         if matches!(encoding, BodyEncoding::Identity)
@@ -372,19 +381,34 @@ enum BodyEncoding {
     Gzip,
 }
 
-fn classify_content_encoding(raw: Option<&str>) -> Result<BodyEncoding, ScrapeError> {
-    let Some(val) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(BodyEncoding::Identity);
-    };
-    if val.eq_ignore_ascii_case("identity") {
-        Ok(BodyEncoding::Identity)
-    } else if val.eq_ignore_ascii_case("gzip") || val.eq_ignore_ascii_case("x-gzip") {
-        Ok(BodyEncoding::Gzip)
-    } else {
-        Err(ScrapeError::UnsupportedEncoding {
-            encoding: val.to_owned(),
-        })
+fn classify_content_encoding(
+    headers: &HeaderMap,
+    enable_compression: bool,
+) -> Result<BodyEncoding, ScrapeError> {
+    let mut resolved = BodyEncoding::Identity;
+    for raw_header in headers.get_all(CONTENT_ENCODING) {
+        let Ok(raw_str) = raw_header.to_str() else {
+            return Err(ScrapeError::UnsupportedEncoding {
+                encoding: String::from_utf8_lossy(raw_header.as_bytes()).into_owned(),
+            });
+        };
+        for token in raw_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if token.eq_ignore_ascii_case("identity") {
+                continue;
+            }
+            if (token.eq_ignore_ascii_case("gzip") || token.eq_ignore_ascii_case("x-gzip"))
+                && enable_compression
+                && matches!(resolved, BodyEncoding::Identity)
+            {
+                resolved = BodyEncoding::Gzip;
+            } else {
+                return Err(ScrapeError::UnsupportedEncoding {
+                    encoding: raw_str.trim().to_owned(),
+                });
+            }
+        }
     }
+    Ok(resolved)
 }
 
 struct BoundedVecWriter<'a> {
