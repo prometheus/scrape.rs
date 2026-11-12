@@ -778,11 +778,16 @@ impl ArrowDecoder {
             self.reset_scrape();
             return Err(err);
         }
-        let batches = self.finish_batches(default_ts_ns.is_some());
-        if batches.is_err() {
-            self.reset_scrape();
-        }
-        batches
+        let batches = match self.finish_batches(default_ts_ns.is_some()) {
+            Ok(b) => b,
+            Err(err) => {
+                tracker.abort_scrape();
+                self.reset_scrape();
+                return Err(err);
+            }
+        };
+        tracker.commit_scrape();
+        Ok(batches)
     }
 
     /// Alias for [`ArrowDecoder::flush_target_stale`]: emits stale data points for all currently
@@ -1050,13 +1055,20 @@ impl ArrowDecoder {
                         } else {
                             false
                         };
-                        if !has_more_stale {
-                            *done = true;
-                        }
                         if self.metrics.is_empty() {
+                            *done = true;
+                            if let Some(tr) = tracker.as_deref_mut() {
+                                tr.commit_scrape();
+                            }
                             return Ok(DecodeStep::Done);
                         }
                         let batch = self.finish_batches(default_ts_ns.is_some())?;
+                        if !has_more_stale {
+                            *done = true;
+                            if let Some(tr) = tracker.as_deref_mut() {
+                                tr.commit_scrape();
+                            }
+                        }
                         if CHUNKED {
                             self.reset_batch_with_tracker(tracker);
                         }

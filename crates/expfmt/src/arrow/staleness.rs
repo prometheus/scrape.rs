@@ -178,10 +178,17 @@ struct TrackedFamily {
     help_end: u32,
     unit_start: u32,
     unit_end: u32,
+    pending_help_start: u32,
+    pending_help_end: u32,
+    pending_unit_start: u32,
+    pending_unit_end: u32,
     metric_type: MetricType,
     saw_total_suffix: bool,
     has_help: bool,
     has_unit: bool,
+    pending_has_help: bool,
+    pending_has_unit: bool,
+    has_pending_meta: bool,
     current_batch_id: Option<u16>,
 }
 
@@ -339,6 +346,7 @@ impl StalenessTracker {
         }
         for fam in &mut self.families {
             fam.current_batch_id = None;
+            fam.has_pending_meta = false;
         }
         for s in &mut self.series {
             s.seen = SeenState::Unseen;
@@ -358,20 +366,53 @@ impl StalenessTracker {
         self.batch_val_to_tracker.clear();
     }
 
-    /// Rolls back uncommitted observation flags from a failed or early-dropped scrape so the
-    /// committed active series set from the previous successful scrape remains intact.
+    /// Rolls back uncommitted observation flags and staged family metadata from a failed or
+    /// early-dropped scrape so the committed active series set from the previous successful scrape
+    /// remains intact.
     pub(super) fn abort_scrape(&mut self) {
         if !self.scrape_in_progress {
             return;
         }
         for fam in &mut self.families {
             fam.current_batch_id = None;
+            fam.has_pending_meta = false;
         }
         for s in &mut self.series {
             s.seen = SeenState::Unseen;
         }
         self.batch_key_to_tracker.clear();
         self.batch_val_to_tracker.clear();
+        self.stale_cursor = 0;
+        self.scrape_in_progress = false;
+    }
+
+    /// Commits staged family metadata and updates the active series set once all chunks and
+    /// `RecordBatch` finalizations for the scrape have succeeded.
+    pub(super) fn commit_scrape(&mut self) {
+        let mut active_count = 0usize;
+        for s in &mut self.series {
+            let live = s.seen == SeenState::SeenLive;
+            s.active = live;
+            if live {
+                active_count += 1;
+            }
+            s.seen = SeenState::Unseen;
+        }
+        for fam in &mut self.families {
+            if fam.has_pending_meta {
+                fam.help_start = fam.pending_help_start;
+                fam.help_end = fam.pending_help_end;
+                fam.unit_start = fam.pending_unit_start;
+                fam.unit_end = fam.pending_unit_end;
+                fam.has_help = fam.pending_has_help;
+                fam.has_unit = fam.pending_has_unit;
+                fam.has_pending_meta = false;
+            }
+            fam.current_batch_id = None;
+        }
+        self.batch_key_to_tracker.clear();
+        self.batch_val_to_tracker.clear();
+        self.active_count = active_count;
         self.stale_cursor = 0;
         self.scrape_in_progress = false;
     }
@@ -581,10 +622,17 @@ impl StalenessTracker {
             help_end,
             unit_start,
             unit_end,
+            pending_help_start: help_start,
+            pending_help_end: help_end,
+            pending_unit_start: unit_start,
+            pending_unit_end: unit_end,
             metric_type,
             saw_total_suffix,
-            has_help: current_family.has_help,
-            has_unit: current_family.has_unit,
+            has_help: false,
+            has_unit: false,
+            pending_has_help: current_family.has_help,
+            pending_has_unit: current_family.has_unit,
+            has_pending_meta: true,
             current_batch_id: current_family.batch_id,
         });
         self.family_buckets[slot] = FamilyBucket { hash, family_idx };
@@ -628,12 +676,13 @@ impl StalenessTracker {
         };
 
         let entry = &mut self.families[idx];
-        entry.help_start = help_start;
-        entry.help_end = help_end;
-        entry.unit_start = unit_start;
-        entry.unit_end = unit_end;
-        entry.has_help = current_family.has_help;
-        entry.has_unit = current_family.has_unit;
+        entry.pending_help_start = help_start;
+        entry.pending_help_end = help_end;
+        entry.pending_unit_start = unit_start;
+        entry.pending_unit_end = unit_end;
+        entry.pending_has_help = current_family.has_help;
+        entry.pending_has_unit = current_family.has_unit;
+        entry.has_pending_meta = true;
         entry.current_batch_id = current_family.batch_id;
         Ok(())
     }
@@ -694,8 +743,8 @@ impl StalenessTracker {
     /// current scrape, bounded by `max_data_points` when chunked streaming is active.
     ///
     /// Returns `Ok(true)` if additional stale series remain to be emitted in a subsequent chunk,
-    /// or `Ok(false)` once all disappeared series have been emitted and the tracker's active set
-    /// has been committed for the completed scrape.
+    /// or `Ok(false)` once all disappeared series have been staged into the final batch (ready for
+    /// [`Self::commit_scrape`] once `finish_batches` succeeds).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn finish_scrape_step(
         &mut self,
@@ -721,7 +770,6 @@ impl StalenessTracker {
             let fam = self.families[s.family_idx as usize];
             if fam.metric_type == MetricType::Unknown && opts.untyped_policy == UntypedPolicy::Drop
             {
-                self.series[idx].active = false;
                 self.stale_cursor += 1;
                 continue;
             }
@@ -745,31 +793,9 @@ impl StalenessTracker {
                 opts,
                 default_ts_ns,
             )?;
-            self.series[idx].active = false;
             self.stale_cursor += 1;
         }
 
-        // All disappeared series have been emitted; commit the new active set for the next scrape.
-        let mut active_count = 0usize;
-        for s in &mut self.series {
-            match s.seen {
-                SeenState::SeenLive => {
-                    s.active = true;
-                    active_count += 1;
-                }
-                SeenState::SeenStale => {
-                    s.active = false;
-                }
-                SeenState::Unseen => {}
-            }
-            s.seen = SeenState::Unseen;
-        }
-        for fam in &mut self.families {
-            fam.current_batch_id = None;
-        }
-        self.active_count = active_count;
-        self.stale_cursor = 0;
-        self.scrape_in_progress = false;
         Ok(false)
     }
 
@@ -791,14 +817,34 @@ impl StalenessTracker {
             id
         } else {
             let fam = self.families[fam_idx];
+            let (has_help, help_start, help_end, has_unit, unit_start, unit_end) =
+                if fam.has_pending_meta {
+                    (
+                        fam.pending_has_help,
+                        fam.pending_help_start,
+                        fam.pending_help_end,
+                        fam.pending_has_unit,
+                        fam.pending_unit_start,
+                        fam.pending_unit_end,
+                    )
+                } else {
+                    (
+                        fam.has_help,
+                        fam.help_start,
+                        fam.help_end,
+                        fam.has_unit,
+                        fam.unit_start,
+                        fam.unit_end,
+                    )
+                };
             let id = emit_family_row(
                 &self.family_bytes[fam.name_start as usize..fam.name_end as usize],
                 fam.metric_type,
                 fam.saw_total_suffix,
-                fam.has_help,
-                &self.family_bytes[fam.help_start as usize..fam.help_end as usize],
-                fam.has_unit,
-                &self.family_bytes[fam.unit_start as usize..fam.unit_end as usize],
+                has_help,
+                &self.family_bytes[help_start as usize..help_end as usize],
+                has_unit,
+                &self.family_bytes[unit_start as usize..unit_end as usize],
                 metrics,
                 opts,
             )?;
