@@ -140,7 +140,9 @@ fn main() {
 
     let mut suite = Suite::from_env("prometheus-scrape-manager").with_alloc(&ALLOC);
 
-    for (wait_label, header_wait) in [("none", Duration::ZERO), ("1ms", Duration::from_millis(1))] {
+    // Tokio's 1ms timer-wheel rounding plus OS timer slack makes `Duration::from_millis(1)`
+    // wait ~2.2ms per fetch in practice, so label the dimension `2ms` to reflect actual wait time.
+    for (wait_label, header_wait) in [("none", Duration::ZERO), ("2ms", Duration::from_millis(1))] {
         for (mode_label, scheduling, max_bodies, max_decoders) in modes {
             let payload = Arc::clone(&payload);
             let targets = Arc::clone(&targets);
