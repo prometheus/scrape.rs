@@ -515,6 +515,12 @@ impl PooledGzipDecoder {
         self.member_finished = false;
     }
 
+    fn reset_next_member(&mut self) {
+        let feed = self.decoder.reset(ChunkFeed::default());
+        let _ = self.decoder.reset(feed);
+        self.member_finished = false;
+    }
+
     pub(crate) fn shrink_retained(&mut self, max_retained_bytes: usize) {
         let cap = max_retained_bytes.min(64 * 1024);
         let feed = self.decoder.get_mut();
@@ -534,9 +540,7 @@ impl PooledGzipDecoder {
             return Ok(());
         }
         if self.member_finished {
-            return Err(ScrapeError::Decompress(
-                "unexpected trailing bytes after gzip stream".to_owned(),
-            ));
+            self.reset_next_member();
         }
         self.member_started = true;
         self.decoder.get_mut().push_bytes(chunk);
@@ -556,12 +560,12 @@ impl PooledGzipDecoder {
         loop {
             match self.decoder.read(&mut scratch) {
                 Ok(0) => {
-                    self.member_finished = true;
                     if !self.decoder.get_ref().is_empty() {
-                        return Err(ScrapeError::Decompress(
-                            "unexpected trailing bytes after gzip stream".to_owned(),
-                        ));
+                        // RFC 1952 §2.2 allows concatenating multiple gzip members in one stream.
+                        self.reset_next_member();
+                        continue;
                     }
+                    self.member_finished = true;
                     return Ok(());
                 }
                 Ok(n) => {
@@ -773,5 +777,27 @@ demo_requests_total{instance=\"b\",method=\"POST\"} 40\n\
 
         release.await.expect("release join");
         server.await.expect("server join");
+    }
+
+    #[test]
+    fn pooled_gzip_decoder_decodes_concatenated_multi_member_streams() {
+        let mut member1 = GzEncoder::new(Vec::new(), Compression::fast());
+        member1.write_all(b"metric_one 1\n").expect("m1 write");
+        let mut combined = member1.finish().expect("m1 finish");
+
+        let mut member2 = GzEncoder::new(Vec::new(), Compression::default());
+        member2.write_all(b"metric_two 2\n").expect("m2 write");
+        combined.extend_from_slice(&member2.finish().expect("m2 finish"));
+
+        let mut dec = PooledGzipDecoder::new();
+        for chunk_size in [combined.len(), 7, 1] {
+            dec.reset_for_scrape();
+            let mut out = Vec::new();
+            for chunk in combined.chunks(chunk_size) {
+                dec.push_chunk(chunk, &mut out, 1024).expect("push chunk");
+            }
+            dec.finish(&mut out, 1024).expect("finish");
+            assert_eq!(out, b"metric_one 1\nmetric_two 2\n");
+        }
     }
 }
