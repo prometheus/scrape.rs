@@ -195,9 +195,9 @@ struct TrackedFamily {
 #[derive(Clone, Copy)]
 struct TrackedSeries {
     family_idx: u32,
-    kind: DpKind,
     attr_start: u32,
     attr_len: u32,
+    kind: DpKind,
     /// Committed active status from the end of the previous successful scrape.
     active: bool,
     /// Observation state during the current in-progress scrape.
@@ -210,12 +210,25 @@ struct TrackedSeries {
 /// consecutive scrapes. When passed to [`super::ArrowDecoder::decode_with_staleness`] or
 /// [`super::ArrowDecoder::decode_stream_with_staleness`], any series that was active at the end of
 /// the previous scrape and is absent from the current scrape is emitted as a stale data point with
-/// `flags = DATA_POINT_FLAG_NO_RECORDED_VALUE` (`1`) and [`STALE_NAN`], and then removed from the
-/// active set so subsequent scrapes do not re-emit it.
+/// `flags = DATA_POINT_FLAG_NO_RECORDED_VALUE` (`1`), and then removed from the active set so
+/// subsequent scrapes do not re-emit it.
+///
+/// # Memory model and optional usage
+///
+/// Emitting a stale OTAP data point when a series disappears from a target's exposition requires
+/// retaining that target's active metric names and interned label sets across scrapes (mirroring
+/// Go Prometheus's per-target `scrapeCache`). Because retaining per-target active series consumes
+/// live heap proportional to the target's active series count, staleness tracking is strictly
+/// opt-in: callers that do not need scrape-time staleness markers can call
+/// [`super::ArrowDecoder::decode`] or [`super::ArrowDecoder::decode_stream`] with zero cross-scrape
+/// series retention.
 ///
 /// All family metadata, label keys, label values, and sorted attribute slices are interned into
 /// contiguous arena buffers so steady-state scrapes with a stable series set perform zero heap
-/// allocations.
+/// allocations. Under label churn, [`StalenessTracker`] automatically compacts deactivated series,
+/// unreferenced families, and unreferenced interned strings (and clears arenas when active series
+/// drop to zero) so retained live heap stays bounded by the currently active series set rather than
+/// cumulative historical cardinality.
 pub struct StalenessTracker {
     families: Vec<TrackedFamily>,
     family_bytes: Vec<u8>,
@@ -253,32 +266,55 @@ impl std::fmt::Debug for StalenessTracker {
 }
 
 impl StalenessTracker {
-    /// Creates a new [`StalenessTracker`] with default initial buffer capacities.
+    /// Creates an empty [`StalenessTracker`] that performs zero heap allocations until its first
+    /// non-empty scrape.
     #[must_use]
-    pub fn new() -> Self {
-        Self::with_capacity(64, 256, 512)
+    pub const fn new() -> Self {
+        Self {
+            families: Vec::new(),
+            family_bytes: Vec::new(),
+            family_buckets: Vec::new(),
+
+            key_interner: StringInterner::new(),
+            val_interner: StringInterner::new(),
+
+            series: Vec::new(),
+            series_attrs: Vec::new(),
+            series_buckets: Vec::new(),
+
+            batch_key_to_tracker: Vec::new(),
+            batch_val_to_tracker: Vec::new(),
+            temp_tracker_attrs: Vec::new(),
+
+            active_count: 0,
+            stale_cursor: 0,
+            scrape_in_progress: false,
+        }
     }
 
     /// Creates a new [`StalenessTracker`] pre-sized for `families` metric families, `series`
     /// distinct time series, and `attrs` total label pairs.
     #[must_use]
     pub fn with_capacity(families: usize, series: usize, attrs: usize) -> Self {
+        if families == 0 && series == 0 && attrs == 0 {
+            return Self::new();
+        }
         let fam_bucket_cap = (families.saturating_mul(2)).next_power_of_two().max(16);
         let ser_bucket_cap = (series.saturating_mul(2)).next_power_of_two().max(16);
         Self {
             families: Vec::with_capacity(families),
-            family_bytes: Vec::with_capacity(families.saturating_mul(64)),
+            family_bytes: Vec::with_capacity(families.saturating_mul(32)),
             family_buckets: vec![FamilyBucket::EMPTY; fam_bucket_cap],
 
-            key_interner: StringInterner::with_capacity(64, 1024),
-            val_interner: StringInterner::with_capacity(256, 4096),
+            key_interner: StringInterner::with_capacity(families.min(64), families * 8),
+            val_interner: StringInterner::with_capacity(series.min(256), attrs * 8),
 
             series: Vec::with_capacity(series),
             series_attrs: Vec::with_capacity(attrs),
             series_buckets: vec![SeriesBucket::EMPTY; ser_bucket_cap],
 
-            batch_key_to_tracker: Vec::with_capacity(64),
-            batch_val_to_tracker: Vec::with_capacity(256),
+            batch_key_to_tracker: Vec::with_capacity(families.min(64)),
+            batch_val_to_tracker: Vec::with_capacity(series.min(256)),
             temp_tracker_attrs: Vec::with_capacity(16),
 
             active_count: 0,
@@ -415,6 +451,200 @@ impl StalenessTracker {
         self.active_count = active_count;
         self.stale_cursor = 0;
         self.scrape_in_progress = false;
+
+        if active_count == 0 {
+            self.clear();
+        } else if self.series.len() > active_count.saturating_mul(2).max(64)
+            || self.families.len() > active_count.saturating_mul(2).max(64)
+        {
+            self.compact();
+        }
+    }
+
+    /// Rebuilds the tracker's family, interner, and series arenas containing only currently
+    /// `active` series so deactivated series under label churn do not accumulate unbounded memory
+    /// or linear-scan overhead.
+    #[cold]
+    fn compact(&mut self) {
+        let active_count = self.active_count;
+        let mut fam_remap = vec![NONE_IDX; self.families.len()];
+        let mut key_remap = vec![NONE_IDX; self.key_interner.len()];
+        let mut val_remap = vec![NONE_IDX; self.val_interner.len()];
+
+        let mut next_families: Vec<TrackedFamily> =
+            Vec::with_capacity(self.families.len().min(active_count));
+        let mut next_family_bytes: Vec<u8> = Vec::new();
+        let mut next_keys = StringInterner::with_capacity(self.key_interner.len(), 0);
+        let mut next_vals =
+            StringInterner::with_capacity(active_count.min(self.val_interner.len()), 0);
+
+        let ser_bucket_cap = (active_count.saturating_mul(2)).next_power_of_two().max(16);
+        let mut next_series = Vec::with_capacity(active_count);
+        let mut next_series_attrs = Vec::with_capacity(active_count.saturating_mul(4));
+        let mut next_series_buckets = vec![SeriesBucket::EMPTY; ser_bucket_cap];
+        let ser_mask = ser_bucket_cap - 1;
+
+        for idx in 0..self.series.len() {
+            let s = self.series[idx];
+            if !s.active {
+                continue;
+            }
+
+            let old_fam_idx = s.family_idx as usize;
+            let new_fam_idx = if fam_remap[old_fam_idx] != NONE_IDX {
+                fam_remap[old_fam_idx]
+            } else {
+                let fam = self.families[old_fam_idx];
+                let name = &self.family_bytes[fam.name_start as usize..fam.name_end as usize];
+                let name_start = next_family_bytes.len() as u32;
+                next_family_bytes.extend_from_slice(name);
+                let name_end = next_family_bytes.len() as u32;
+
+                let (help_start, help_end) = if fam.has_help {
+                    let h = &self.family_bytes[fam.help_start as usize..fam.help_end as usize];
+                    let hs = next_family_bytes.len() as u32;
+                    next_family_bytes.extend_from_slice(h);
+                    (hs, next_family_bytes.len() as u32)
+                } else {
+                    (name_end, name_end)
+                };
+
+                let (unit_start, unit_end) = if fam.has_unit {
+                    let u = &self.family_bytes[fam.unit_start as usize..fam.unit_end as usize];
+                    let us = next_family_bytes.len() as u32;
+                    next_family_bytes.extend_from_slice(u);
+                    (us, next_family_bytes.len() as u32)
+                } else {
+                    (help_end, help_end)
+                };
+
+                let new_idx = next_families.len() as u32;
+                next_families.push(TrackedFamily {
+                    name_start,
+                    name_end,
+                    help_start,
+                    help_end,
+                    unit_start,
+                    unit_end,
+                    pending_help_start: help_start,
+                    pending_help_end: help_end,
+                    pending_unit_start: unit_start,
+                    pending_unit_end: unit_end,
+                    metric_type: fam.metric_type,
+                    saw_total_suffix: fam.saw_total_suffix,
+                    has_help: fam.has_help,
+                    has_unit: fam.has_unit,
+                    pending_has_help: fam.has_help,
+                    pending_has_unit: fam.has_unit,
+                    has_pending_meta: false,
+                    current_batch_id: None,
+                });
+                fam_remap[old_fam_idx] = new_idx;
+                new_idx
+            };
+
+            let attr_start = s.attr_start as usize;
+            let attr_end = attr_start + s.attr_len as usize;
+            self.temp_tracker_attrs.clear();
+            let mut prev_nk: Option<u32> = None;
+            let mut sorted = true;
+
+            for &(tk, tv) in &self.series_attrs[attr_start..attr_end] {
+                let tk_idx = tk as usize;
+                let nk = if key_remap[tk_idx] != NONE_IDX {
+                    key_remap[tk_idx]
+                } else {
+                    let id = next_keys
+                        .intern(self.key_interner.get_bytes(tk))
+                        .expect("compacted key bytes <= existing interner bytes");
+                    key_remap[tk_idx] = id;
+                    id
+                };
+
+                let tv_idx = tv as usize;
+                let nv = if val_remap[tv_idx] != NONE_IDX {
+                    val_remap[tv_idx]
+                } else {
+                    let id = next_vals
+                        .intern(self.val_interner.get_bytes(tv))
+                        .expect("compacted val bytes <= existing interner bytes");
+                    val_remap[tv_idx] = id;
+                    id
+                };
+
+                if let Some(prev) = prev_nk
+                    && nk < prev
+                {
+                    sorted = false;
+                }
+                prev_nk = Some(nk);
+                self.temp_tracker_attrs.push((nk, nv));
+            }
+
+            if !sorted {
+                self.temp_tracker_attrs.sort_unstable_by_key(|&(k, _)| k);
+            }
+
+            let new_attr_start = next_series_attrs.len() as u32;
+            let new_attr_len = self.temp_tracker_attrs.len() as u32;
+            next_series_attrs.extend_from_slice(&self.temp_tracker_attrs);
+
+            let new_series_idx = next_series.len() as u32;
+            next_series.push(TrackedSeries {
+                family_idx: new_fam_idx,
+                attr_start: new_attr_start,
+                attr_len: new_attr_len,
+                kind: s.kind,
+                active: true,
+                seen: SeenState::Unseen,
+            });
+
+            let hash = hash_series(new_fam_idx, s.kind, &self.temp_tracker_attrs);
+            let mut slot = (hash as usize) & ser_mask;
+            while next_series_buckets[slot].series_idx != NONE_IDX {
+                slot = (slot + 1) & ser_mask;
+            }
+            next_series_buckets[slot] = SeriesBucket {
+                hash,
+                series_idx: new_series_idx,
+            };
+        }
+
+        let fam_bucket_cap = (next_families.len().saturating_mul(2))
+            .next_power_of_two()
+            .max(16);
+        let fam_mask = fam_bucket_cap - 1;
+        let mut next_family_buckets = vec![FamilyBucket::EMPTY; fam_bucket_cap];
+        for (idx, fam) in next_families.iter().enumerate() {
+            let name = &next_family_bytes[fam.name_start as usize..fam.name_end as usize];
+            let hash = hash_family_key(name, fam.metric_type, fam.saw_total_suffix);
+            let mut slot = (hash as usize) & fam_mask;
+            while next_family_buckets[slot].family_idx != NONE_IDX {
+                slot = (slot + 1) & fam_mask;
+            }
+            next_family_buckets[slot] = FamilyBucket {
+                hash,
+                family_idx: idx as u32,
+            };
+        }
+
+        self.families = next_families;
+        self.family_bytes = next_family_bytes;
+        self.family_buckets = next_family_buckets;
+        self.key_interner = next_keys;
+        self.val_interner = next_vals;
+        self.series = next_series;
+        self.series_attrs = next_series_attrs;
+        self.series_buckets = next_series_buckets;
+        if self.batch_key_to_tracker.capacity() > self.key_interner.len().saturating_mul(4).max(64)
+        {
+            self.batch_key_to_tracker.shrink_to(64);
+        }
+        if self.batch_val_to_tracker.capacity() > self.val_interner.len().saturating_mul(4).max(256)
+        {
+            self.batch_val_to_tracker
+                .shrink_to(self.val_interner.len().saturating_mul(2).max(64));
+        }
     }
 
     /// Records a data point observed during the current scrape.
@@ -482,6 +712,9 @@ impl StalenessTracker {
             self.temp_tracker_attrs.sort_unstable_by_key(|&(k, _)| k);
         }
 
+        if self.series_buckets.is_empty() {
+            self.series_buckets.resize(16, SeriesBucket::EMPTY);
+        }
         let hash = hash_series(fam_idx, kind, &self.temp_tracker_attrs);
         let mask = self.series_buckets.len() - 1;
         let mut slot = (hash as usize) & mask;
@@ -567,6 +800,9 @@ impl StalenessTracker {
             }
         }
 
+        if self.family_buckets.is_empty() {
+            self.family_buckets.resize(16, FamilyBucket::EMPTY);
+        }
         let hash = hash_family_key(name, metric_type, saw_total_suffix);
         let mask = self.family_buckets.len() - 1;
         let mut slot = (hash as usize) & mask;
