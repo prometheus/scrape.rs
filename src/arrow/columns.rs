@@ -521,6 +521,12 @@ impl SparseTimestampCol {
 
 /// Staging buffer for an optional `flags` (`UInt32`) column on data point tables that stays
 /// unallocated when every row in the batch has `flags == 0`.
+///
+/// OTAP marks `flags` as `default_values_optional` on `NumberDataPoints`, `SummaryDataPoints`, and
+/// `HistogramDataPoints`, omitting the column whenever all rows carry `0`. Keeping `values`
+/// unallocated until the first non-zero flag arrives avoids per-batch `UInt32` buffer allocations
+/// and preserves identical schemas on non-stale scrapes (>99.9% of batches), while backfilling
+/// leading `0` entries if a stale point appears mid-batch.
 #[derive(Default)]
 pub(super) struct SparseFlagsCol {
     values: Vec<u32>,
