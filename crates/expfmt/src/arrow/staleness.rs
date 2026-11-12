@@ -360,31 +360,41 @@ impl StalenessTracker {
         let mut sorted = true;
 
         for &(bk, bv) in batch_attrs {
-            while self.batch_key_to_tracker.len() <= bk as usize {
-                let next_k = self.batch_key_to_tracker.len() as u32;
-                let tk = self
+            // Map only the batch IDs actually referenced by series attributes (`NONE_IDX` marks
+            // unmapped slots) so ephemeral exemplar labels in `batch_keys`/`batch_vals` are never
+            // copied into the tracker's persistent interners.
+            let bk_idx = bk as usize;
+            if bk_idx >= self.batch_key_to_tracker.len() {
+                self.batch_key_to_tracker.resize(bk_idx + 1, NONE_IDX);
+            }
+            let mut tk = self.batch_key_to_tracker[bk_idx];
+            if tk == NONE_IDX {
+                tk = self
                     .key_interner
-                    .intern(batch_keys.get_bytes(next_k))
+                    .intern(batch_keys.get_bytes(bk))
                     .ok_or_else(|| DecodeError::CapacityOverflow {
                         table: "DpAttrs.key",
                         count: self.key_interner.len(),
                     })?;
-                self.batch_key_to_tracker.push(tk);
+                self.batch_key_to_tracker[bk_idx] = tk;
             }
-            while self.batch_val_to_tracker.len() <= bv as usize {
-                let next_v = self.batch_val_to_tracker.len() as u32;
-                let tv = self
+
+            let bv_idx = bv as usize;
+            if bv_idx >= self.batch_val_to_tracker.len() {
+                self.batch_val_to_tracker.resize(bv_idx + 1, NONE_IDX);
+            }
+            let mut tv = self.batch_val_to_tracker[bv_idx];
+            if tv == NONE_IDX {
+                tv = self
                     .val_interner
-                    .intern(batch_vals.get_bytes(next_v))
+                    .intern(batch_vals.get_bytes(bv))
                     .ok_or_else(|| DecodeError::CapacityOverflow {
                         table: "DpAttrs.str",
                         count: self.val_interner.len(),
                     })?;
-                self.batch_val_to_tracker.push(tv);
+                self.batch_val_to_tracker[bv_idx] = tv;
             }
 
-            let tk = self.batch_key_to_tracker[bk as usize];
-            let tv = self.batch_val_to_tracker[bv as usize];
             if let Some(prev) = prev_tk
                 && tk < prev
             {
