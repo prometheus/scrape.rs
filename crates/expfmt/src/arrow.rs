@@ -1350,7 +1350,9 @@ impl ArrowDecoder {
             .values
             .push(dp_index, (!is_stale).then_some(value));
 
-        if let Some(tr) = tracker.as_deref_mut() {
+        if (sample_ts_ms.is_none() || opts.track_timestamps_staleness)
+            && let Some(tr) = tracker.as_deref_mut()
+        {
             tr.record_series(
                 &mut self.current_family,
                 DpKind::Number,

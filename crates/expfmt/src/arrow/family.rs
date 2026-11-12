@@ -691,7 +691,9 @@ impl FamilyAssembly {
                     })?;
                     sum_dp.quantile_offsets.push(q_off);
 
-                    if let Some(tr) = tracker.as_deref_mut() {
+                    if (group.ts_ns.is_none() || opts.track_timestamps_staleness)
+                        && let Some(tr) = tracker.as_deref_mut()
+                    {
                         tr.record_series(
                             current_family,
                             DpKind::Summary,
@@ -799,7 +801,9 @@ impl FamilyAssembly {
                     hist_dp.bucket_offsets.push(bucket_off);
                     hist_dp.bounds_offsets.push(bounds_off);
 
-                    if let Some(tr) = tracker.as_deref_mut() {
+                    if (group.ts_ns.is_none() || opts.track_timestamps_staleness)
+                        && let Some(tr) = tracker.as_deref_mut()
+                    {
                         tr.record_series(
                             current_family,
                             DpKind::Histogram,
