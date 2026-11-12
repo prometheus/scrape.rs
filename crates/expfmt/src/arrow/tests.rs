@@ -1408,7 +1408,7 @@ fn stale_nan_bit_pattern_and_multi_scrape_staleness_lifecycle() {
     assert_eq!(flushed_flags.value(1), DATA_POINT_FLAG_NO_RECORDED_VALUE);
 
     // A second flush on an already-empty tracker produces an empty record set.
-    let empty_flush = dec.encode_stale_target(&mut tracker, &opts5).unwrap();
+    let empty_flush = dec.flush_target_stale(&mut tracker, &opts5).unwrap();
     assert!(empty_flush.is_empty());
 }
 
