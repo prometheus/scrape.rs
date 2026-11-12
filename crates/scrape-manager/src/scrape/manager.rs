@@ -753,7 +753,11 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                 }
 
                 Some((slot_id, generation, out)) = in_flight.next(), if !in_flight.is_empty() => {
-                    schedule.complete(slot_id, generation);
+                    schedule.complete(slot_id, generation, Instant::now());
+                    let overruns = schedule.take_overruns();
+                    if overruns > 0 {
+                        self.counters.overrun.fetch_add(overruns, Ordering::Relaxed);
+                    }
                     if out.is_break() {
                         return;
                     }

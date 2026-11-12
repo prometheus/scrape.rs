@@ -296,8 +296,12 @@ impl TargetSchedule {
         None
     }
 
-    /// Marks an in-flight scrape finished so the target may run on future ticks.
-    pub(crate) fn complete(&mut self, slot_id: usize, generation: u64) {
+    /// Marks an in-flight scrape finished at `now`, advancing past any periodic ticks that elapsed
+    /// while the scrape was still running (for example when `in_flight.len() == max_in_flight`
+    /// suppressed `pop_due` during the overrun).
+    pub(crate) fn complete(&mut self, slot_id: usize, generation: u64, now: Instant) {
+        let mut new_heap_entry = None;
+        let mut added_overruns = 0_u64;
         let reclaim = if let Some(slot) = self.slots.get_mut(slot_id).and_then(Option::as_mut)
             && slot.generation == generation
         {
@@ -305,11 +309,28 @@ impl TargetSchedule {
             if slot.removed {
                 Some(Arc::clone(&slot.target))
             } else {
+                if slot.next_due <= now {
+                    let (next_due, missed_ticks) =
+                        advance_grid_deadline(slot.next_due, now, self.interval);
+                    slot.next_due = next_due;
+                    added_overruns = missed_ticks;
+                    new_heap_entry = Some(HeapEntry {
+                        due: next_due,
+                        slot_id,
+                        generation: slot.generation,
+                    });
+                }
                 None
             }
         } else {
             None
         };
+        if added_overruns > 0 {
+            self.overruns = self.overruns.saturating_add(added_overruns);
+        }
+        if let Some(entry) = new_heap_entry {
+            self.heap.push(Reverse(entry));
+        }
         if let Some(target) = reclaim {
             self.removed_in_flight.remove(&target);
             self.slots[slot_id] = None;
@@ -394,17 +415,21 @@ mod tests {
         while let Some(other) = sched.pop_due(second_tick) {
             // Only t2 can pop while t1 is still in_flight.
             assert_eq!(other.target.url(), t2.url());
-            sched.complete(other.slot_id, other.generation);
+            sched.complete(other.slot_id, other.generation, second_tick);
         }
         assert_eq!(sched.take_overruns(), 1);
 
         // Completing t1 allows it to fire cleanly at `first_due + 20s`.
-        sched.complete(popped.slot_id, popped.generation);
+        sched.complete(
+            popped.slot_id,
+            popped.generation,
+            second_tick + Duration::from_secs(1),
+        );
         let third_tick = first_due + interval * 2;
         let mut fired_urls = Vec::new();
         while let Some(d) = sched.pop_due(third_tick) {
             fired_urls.push(d.target.url().as_str().to_owned());
-            sched.complete(d.slot_id, d.generation);
+            sched.complete(d.slot_id, d.generation, third_tick);
         }
         assert!(fired_urls.iter().any(|u| u == t1.url().as_str()));
     }
@@ -435,10 +460,40 @@ mod tests {
         assert_eq!(sched.take_overruns(), 1);
 
         // Once the first scrape finishes, `t1` runs on the following tick.
-        sched.complete(active.slot_id, active.generation);
+        sched.complete(
+            active.slot_id,
+            active.generation,
+            first_due + interval + Duration::from_secs(1),
+        );
         let next = sched
             .pop_due(first_due + interval * 2)
             .expect("fires after completion");
         assert_eq!(next.target.url(), t1.url());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_after_saturated_overrun_skips_missed_tick_and_counts_overrun() {
+        let interval = Duration::from_secs(10);
+        let base = Instant::now();
+        let t1 = ScrapeTarget::parse("http://127.0.0.1:8091/metrics").expect("t1");
+
+        let mut sched = TargetSchedule::new(interval, 19);
+        sched.sync_targets(vec![t1.clone()], base);
+
+        let first_due = sched.peek_next_due().expect("due");
+        let active = sched.pop_due(first_due).expect("pop first");
+
+        // Simulate `in_flight.len() == max_in_flight`: `pop_due` is never called at `first_due + 10s`,
+        // and the scrape finishes 4s into the missed interval (`first_due + 14s`).
+        let finish_at = first_due + Duration::from_secs(14);
+        sched.complete(active.slot_id, active.generation, finish_at);
+        assert_eq!(sched.take_overruns(), 1);
+
+        // Must NOT immediately re-scrape at `first_due + 14s`; must wait until `first_due + 20s`.
+        assert!(sched.pop_due(finish_at).is_none());
+        let resumed = sched
+            .pop_due(first_due + interval * 2)
+            .expect("fires on next grid tick");
+        assert_eq!(resumed.target.url(), t1.url());
     }
 }
