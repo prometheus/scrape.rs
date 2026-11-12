@@ -320,13 +320,18 @@ impl TargetFetcher for ReqwestFetcher {
             _ => 0,
         };
 
-        let remaining = timeout.saturating_sub(started.elapsed());
+        let header_elapsed = started.elapsed();
+        let remaining = timeout.saturating_sub(header_elapsed);
         if remaining.is_zero() {
             return Err(ScrapeError::TimedOut { timeout });
         }
 
-        let (body, wire_bytes) = tokio::time::timeout(remaining, async {
-            let mut body = pool.acquire(cap_hint).await;
+        // NOTE: Acquire the `PooledBodyBuffer` outside the `scrape_timeout` window so downstream
+        // sink or pool backpressure never marks healthy HTTP targets as `TimedOut` (`up = false`).
+        let mut body = pool.acquire(cap_hint).await;
+        let body_started = Instant::now();
+
+        let wire_bytes = tokio::time::timeout(remaining, async {
             let mut wire_bytes = 0usize;
 
             match encoding {
@@ -366,13 +371,13 @@ impl TargetFetcher for ReqwestFetcher {
                 }
             }
 
-            Ok::<(PooledBodyBuffer, usize), ScrapeError>((body, wire_bytes))
+            Ok::<usize, ScrapeError>(wire_bytes)
         })
         .await
         .map_err(|_| ScrapeError::TimedOut { timeout })??;
 
         let scrape_timestamp_ms = current_timestamp_ms();
-        let fetch_duration = started.elapsed();
+        let fetch_duration = header_elapsed.saturating_add(body_started.elapsed());
 
         Ok(FetchedScrape {
             body,
@@ -619,6 +624,50 @@ demo_requests_total{instance=\"b\",method=\"POST\"} 40\n\
         assert_eq!(pool.total_buffers_created(), 1);
         assert!(pool.retained_memory_bytes() <= 512);
 
+        server.await.expect("server join");
+    }
+
+    #[tokio::test]
+    async fn body_buffer_pool_wait_does_not_count_against_scrape_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut req_buf = [0u8; 1024];
+            let _ = sock.read(&mut req_buf).await.expect("read");
+            let body = b"up_metric 1\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.expect("write hdr");
+            sock.write_all(body).await.expect("write body");
+        });
+
+        let cfg = ScrapeConfig::new("pool-wait")
+            .with_scrape_interval(Duration::from_secs(5))
+            .with_scrape_timeout(Duration::from_millis(80));
+        let fetcher = ReqwestFetcher::new(&cfg).expect("fetcher");
+        let pool = BodyBufferPool::new(NonZeroUsize::MIN, cfg.max_retained_body_bytes);
+        let target = ScrapeTarget::parse(&format!("http://{addr}/metrics")).expect("target");
+
+        // Hold the sole buffer permit longer than `scrape_timeout` (160ms > 80ms).
+        let held = pool.acquire(0).await;
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(160)).await;
+            drop(held);
+        });
+
+        let fetched = fetcher
+            .fetch(&target, &pool)
+            .await
+            .expect("pool wait must not trigger TimedOut on fast target");
+        assert_eq!(fetched.body.as_slice(), b"up_metric 1\n");
+        assert!(fetched.fetch_duration < Duration::from_millis(80));
+        drop(fetched);
+
+        release.await.expect("release join");
         server.await.expect("server join");
     }
 }
