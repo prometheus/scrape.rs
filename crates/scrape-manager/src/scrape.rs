@@ -32,8 +32,8 @@ mod schedule;
 
 pub use config::{
     DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_DATA_POINTS_PER_BATCH, DEFAULT_MAX_RETAINED_BODY_BYTES,
-    DEFAULT_SCRAPE_INTERVAL, DEFAULT_SCRAPE_TIMEOUT, DEFAULT_USER_AGENT, SchedulingMode,
-    ScrapeConfig, ScrapeTarget, SequentialSchedule,
+    DEFAULT_MAX_RETAINED_DECODER_BYTES, DEFAULT_SCRAPE_INTERVAL, DEFAULT_SCRAPE_TIMEOUT,
+    DEFAULT_USER_AGENT, SchedulingMode, ScrapeConfig, ScrapeTarget, SequentialSchedule,
 };
 pub use http::{
     FetchedScrape, ReqwestFetcher, ScrapeError, TargetFetcher, build_accept_header,

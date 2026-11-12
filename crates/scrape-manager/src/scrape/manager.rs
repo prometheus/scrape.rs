@@ -225,7 +225,10 @@ impl<F> ScrapeManager<F> {
             config.max_retained_body_bytes,
         );
         #[cfg(feature = "arrow")]
-        let decoder_pool = DecoderPool::new(config.scheduling.max_decoders());
+        let decoder_pool = DecoderPool::new(
+            config.scheduling.max_decoders(),
+            config.max_retained_decoder_bytes,
+        );
         Ok(Self {
             config,
             fetcher,

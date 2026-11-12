@@ -214,6 +214,7 @@ pub struct DecoderPool {
 struct DecoderPoolInner {
     semaphore: Arc<Semaphore>,
     idle: Mutex<Vec<ArrowDecoder>>,
+    max_retained_bytes: usize,
     active_leases: AtomicUsize,
     peak_leases: AtomicUsize,
     total_created: AtomicUsize,
@@ -221,14 +222,17 @@ struct DecoderPoolInner {
 
 #[cfg(feature = "arrow")]
 impl DecoderPool {
-    /// Creates a new [`DecoderPool`] allowing at most `max_decoders` concurrent leases.
+    /// Creates a new [`DecoderPool`] allowing at most `max_decoders` concurrent leases and
+    /// retaining at most `max_retained_bytes` of scratch capacity per idle decoder (`0` retains
+    /// no idle decoders).
     #[must_use]
-    pub fn new(max_decoders: NonZeroUsize) -> Self {
+    pub fn new(max_decoders: NonZeroUsize, max_retained_bytes: usize) -> Self {
         let cap = max_decoders.get();
         Self {
             inner: Arc::new(DecoderPoolInner {
                 semaphore: Arc::new(Semaphore::new(cap)),
                 idle: Mutex::new(Vec::with_capacity(cap)),
+                max_retained_bytes,
                 active_leases: AtomicUsize::new(0),
                 peak_leases: AtomicUsize::new(0),
                 total_created: AtomicUsize::new(0),
@@ -323,7 +327,15 @@ impl DerefMut for PooledDecoder {
 impl Drop for PooledDecoder {
     fn drop(&mut self) {
         self.pool.active_leases.fetch_sub(1, Ordering::Relaxed);
-        if let Some(decoder) = self.decoder.take() {
+        if let Some(mut decoder) = self.decoder.take() {
+            if decoder.retained_memory_bytes() > self.pool.max_retained_bytes {
+                let fresh = ArrowDecoder::new();
+                if fresh.retained_memory_bytes() <= self.pool.max_retained_bytes {
+                    decoder = fresh;
+                } else {
+                    return;
+                }
+            }
             let mut idle = self
                 .pool
                 .idle
@@ -331,5 +343,74 @@ impl Drop for PooledDecoder {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             idle.push(decoder);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn body_buffer_pool_reuses_slots_and_shrinks_outliers() {
+        let pool = BodyBufferPool::new(NonZeroUsize::MIN, 1_024);
+        let mut lease = pool.acquire(256).await;
+        assert_eq!(pool.active_leases(), 1);
+        lease.resize(16 * 1024, b'x');
+        assert_eq!(lease.as_ref().len(), 16 * 1024);
+        drop(lease);
+
+        assert_eq!(pool.active_leases(), 0);
+        assert_eq!(pool.peak_leases(), 1);
+        assert_eq!(pool.total_buffers_created(), 1);
+        assert!(pool.retained_memory_bytes() <= 1_024);
+
+        let zero_pool = BodyBufferPool::new(NonZeroUsize::MIN, 0);
+        let mut z = zero_pool.acquire(512).await;
+        z.extend_from_slice(b"abc");
+        drop(z);
+        assert_eq!(zero_pool.retained_memory_bytes(), 0);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[tokio::test]
+    async fn decoder_pool_caps_retained_memory_after_outlier_scrape() {
+        use prometheus_expfmt::arrow::DecodeOptions;
+        use prometheus_expfmt::format::Format;
+
+        let baseline = ArrowDecoder::new().retained_memory_bytes();
+        let cap = baseline + 16 * 1024;
+        let pool = DecoderPool::new(NonZeroUsize::MIN, cap);
+
+        let mut big = String::from("# TYPE big_metric gauge\n");
+        for i in 0..8_000 {
+            big.push_str(&format!(
+                "big_metric{{instance=\"host-{i}\",pod=\"pod-{i}-long-label-value\"}} {i}\n"
+            ));
+        }
+
+        let mut dec = pool.acquire().await;
+        let _ = dec
+            .decode(big.as_bytes(), &Format::TEXT, &DecodeOptions::new())
+            .expect("decode big");
+        assert!(
+            dec.retained_memory_bytes() > cap,
+            "expected outlier scrape to grow decoder past {cap}, got {}",
+            dec.retained_memory_bytes()
+        );
+        drop(dec);
+
+        assert_eq!(pool.total_decoders_created(), 1);
+        assert!(
+            pool.retained_memory_bytes() <= cap,
+            "expected idle decoder <= {cap} bytes, got {}",
+            pool.retained_memory_bytes()
+        );
+
+        let zero_pool = DecoderPool::new(NonZeroUsize::MIN, 0);
+        let dec0 = zero_pool.acquire().await;
+        drop(dec0);
+        assert_eq!(zero_pool.retained_memory_bytes(), 0);
     }
 }

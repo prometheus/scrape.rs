@@ -33,6 +33,9 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Default cap on `Vec<u8>` capacity retained in [`crate::scrape::BodyBufferPool`] (`4 MiB`).
 pub const DEFAULT_MAX_RETAINED_BODY_BYTES: usize = 4 * 1024 * 1024;
 
+/// Default cap on scratch capacity retained per idle decoder in [`crate::scrape::DecoderPool`] (`4 MiB`).
+pub const DEFAULT_MAX_RETAINED_DECODER_BYTES: usize = 4 * 1024 * 1024;
+
 /// Default maximum data points per emitted Arrow chunk (`2,048`).
 pub const DEFAULT_MAX_DATA_POINTS_PER_BATCH: usize = 2_048;
 
@@ -275,6 +278,9 @@ pub struct ScrapeConfig {
     pub max_body_bytes: usize,
     /// Maximum capacity in bytes retained per idle `Vec<u8>` in [`crate::scrape::BodyBufferPool`].
     pub max_retained_body_bytes: usize,
+    /// Maximum scratch capacity in bytes retained per idle decoder in [`crate::scrape::DecoderPool`]
+    /// (`0` drops idle decoders after every scrape).
+    pub max_retained_decoder_bytes: usize,
     /// Maximum data points emitted per decoded Arrow chunk (`0` decodes each scrape as one batch).
     pub max_data_points_per_batch: usize,
     /// `User-Agent` header value sent on HTTP scrape requests.
@@ -301,6 +307,7 @@ impl Default for ScrapeConfig {
             enable_compression: true,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_retained_body_bytes: DEFAULT_MAX_RETAINED_BODY_BYTES,
+            max_retained_decoder_bytes: DEFAULT_MAX_RETAINED_DECODER_BYTES,
             max_data_points_per_batch: DEFAULT_MAX_DATA_POINTS_PER_BATCH,
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             #[cfg(feature = "arrow")]
@@ -388,6 +395,13 @@ impl ScrapeConfig {
     #[must_use]
     pub const fn with_max_retained_body_bytes(mut self, max_bytes: usize) -> Self {
         self.max_retained_body_bytes = max_bytes;
+        self
+    }
+
+    /// Sets [`ScrapeConfig::max_retained_decoder_bytes`].
+    #[must_use]
+    pub const fn with_max_retained_decoder_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_retained_decoder_bytes = max_bytes;
         self
     }
 
