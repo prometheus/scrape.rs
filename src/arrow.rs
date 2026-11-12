@@ -641,13 +641,13 @@ impl ArrowDecoder {
 
     /// Decodes a single exposition scrape buffer of `format` into OTAP metric
     /// [`arrow_array::RecordBatch`]es while tracking active series in `tracker` and emitting stale
-    /// data points (`flags = DATA_POINT_FLAG_NO_RECORDED_VALUE`, [`STALE_NAN`]) for any series
-    /// that was active in the previous scrape of this target and disappeared from `input`.
+    /// data points (`flags = DATA_POINT_FLAG_NO_RECORDED_VALUE` with omitted values) for any
+    /// series that was active in the previous scrape of this target and disappeared from `input`.
     ///
     /// Series present in `input` whose sample value already carries [`STALE_NAN`] are emitted with
-    /// `flags = DATA_POINT_FLAG_NO_RECORDED_VALUE` and removed from `tracker`'s active set. If
-    /// decoding fails with [`DecodeError`], `tracker` rolls back to the active series set from the
-    /// previous successful scrape.
+    /// `flags = DATA_POINT_FLAG_NO_RECORDED_VALUE` (and omitted values) and removed from
+    /// `tracker`'s active set. If decoding fails with [`DecodeError`], `tracker` rolls back to the
+    /// active series set from the previous successful scrape.
     ///
     /// # Errors
     ///
@@ -719,8 +719,8 @@ impl ArrowDecoder {
 
     /// Streams `input` as a sequence of non-empty [`OtapMetricRecords`] chunks bounded by
     /// [`DecodeOptions::max_data_points_per_batch`] while tracking active series in `tracker` and
-    /// emitting stale data points (`flags = DATA_POINT_FLAG_NO_RECORDED_VALUE`, [`STALE_NAN`]) at
-    /// end-of-scrape for any series that disappeared since the previous scrape.
+    /// emitting stale data points (`flags = DATA_POINT_FLAG_NO_RECORDED_VALUE` with omitted
+    /// values) at end-of-scrape for any series that disappeared since the previous scrape.
     ///
     /// If a stream chunk returns [`DecodeError`] or [`DecodeStream`] is dropped before reaching
     /// end-of-input, `tracker` rolls back to the committed active series set from the previous
@@ -735,8 +735,8 @@ impl ArrowDecoder {
         self.decode_stream_inner(input, format, opts, Some(tracker))
     }
 
-    /// Emits stale data points (`flags = DATA_POINT_FLAG_NO_RECORDED_VALUE`, [`STALE_NAN`]) at
-    /// `opts.timestamp_ms` for every currently active series in `tracker` and clears the active
+    /// Emits stale data points (`flags = DATA_POINT_FLAG_NO_RECORDED_VALUE` with omitted values)
+    /// at `opts.timestamp_ms` for every currently active series in `tracker` and clears the active
     /// set.
     ///
     /// Call this when an entire target scrape fails (for example, on an HTTP or connection error)
@@ -1318,7 +1318,8 @@ impl ArrowDecoder {
         self.extract_series_labels_into_temp(label_spans, full_input, None)?;
         self.num_dp.attrs.extend_for_parent(dp_id, &self.temp_attrs);
 
-        if let Some((ex_val, ex_ts_ms, ex_spans)) = exemplar_parts {
+        let is_stale = is_stale_nan(value);
+        if !is_stale && let Some((ex_val, ex_ts_ms, ex_spans)) = exemplar_parts {
             self.append_number_exemplar(
                 dp_id,
                 ex_val,
@@ -1337,7 +1338,6 @@ impl ArrowDecoder {
             Some(ms) => Some(ms_to_ns(ms)?),
             None => default_ts_ns,
         };
-        let is_stale = is_stale_nan(value);
         let flags = if is_stale {
             DATA_POINT_FLAG_NO_RECORDED_VALUE
         } else {
@@ -1346,7 +1346,9 @@ impl ArrowDecoder {
         self.num_dp
             .base
             .push_with_flags(parent_id, start_ts_ns, resolved_ts_ns, flags);
-        self.num_dp.values.push(value);
+        self.num_dp
+            .values
+            .push(dp_index, (!is_stale).then_some(value));
 
         if let Some(tr) = tracker.as_deref_mut() {
             tr.record_series(
