@@ -13,14 +13,22 @@
 
 //! Bounded-memory HTTP target scraping and interval scheduling.
 //!
-//! Provides reusable scratch pools ([`BodyBufferPool`] and, with the `arrow` feature enabled,
-//! [`DecoderPool`]) and an HTTP target fetcher ([`ReqwestFetcher`]) that delays body buffer
-//! acquisition until response headers arrive so slow targets waiting on network I/O do not hold
-//! payload buffers.
+//! [`ScrapeManager`] coordinates periodic target scraping in two user-selectable modes via
+//! [`SchedulingMode`]:
+//! - [`SchedulingMode::Sequential`]: scrapes one target at a time with a single reusable HTTP body
+//!   buffer and a single decoder, using either a job-wide tick ([`SequentialSchedule::CycleTick`])
+//!   or deterministic per-target FNV-1a phase offsets ([`SequentialSchedule::Jittered`]).
+//! - [`SchedulingMode::Concurrent`]: schedules every target on its own deterministic jittered
+//!   interval (`hash(target) % scrape_interval`) while decoupling in-flight HTTP header concurrency
+//!   (`max_in_flight`) from pooled response body buffers (`max_buffered_bodies`) and pooled
+//!   decoders (`max_decoders`). Slow targets stalled on TCP connect or server-side metric
+//!   generation neither delay sibling targets nor hold response payload buffers.
 
 mod config;
 mod http;
+mod manager;
 mod pool;
+mod schedule;
 
 pub use config::{
     DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_DATA_POINTS_PER_BATCH, DEFAULT_MAX_RETAINED_BODY_BYTES,
@@ -31,7 +39,12 @@ pub use http::{
     FetchedScrape, ReqwestFetcher, ScrapeError, TargetFetcher, build_accept_header,
     format_scrape_timeout_seconds, resolve_scrape_format,
 };
+#[cfg(feature = "arrow")]
+pub use manager::ArrowScrapeSink;
+pub use manager::{
+    ManagerStats, RawScrapeSink, ScrapeCommand, ScrapeControl, ScrapeManager, ScrapeReport,
+};
 pub use pool::{BodyBufferPool, PooledBodyBuffer};
-
 #[cfg(feature = "arrow")]
 pub use pool::{DecoderPool, PooledDecoder};
+pub use schedule::target_offset;
