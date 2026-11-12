@@ -270,8 +270,6 @@ pub struct ScrapeConfig {
     pub escaping_scheme: EscapingScheme,
     /// Negotiate and transparently decompress `Content-Encoding: gzip` responses when `true`.
     pub enable_compression: bool,
-    /// Preserve explicit sample timestamps when `true`; override with scrape time when `false`.
-    pub honor_timestamps: bool,
     /// Maximum uncompressed HTTP response body size in bytes (`0` disables the limit).
     pub max_body_bytes: usize,
     /// Maximum capacity in bytes retained per idle `Vec<u8>` in [`crate::scrape::BodyBufferPool`].
@@ -300,7 +298,6 @@ impl Default for ScrapeConfig {
             enable_open_metrics: true,
             escaping_scheme: EscapingScheme::default(),
             enable_compression: true,
-            honor_timestamps: true,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_retained_body_bytes: DEFAULT_MAX_RETAINED_BODY_BYTES,
             max_data_points_per_batch: DEFAULT_MAX_DATA_POINTS_PER_BATCH,

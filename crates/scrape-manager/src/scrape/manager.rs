@@ -450,7 +450,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
             self.config.max_data_points_per_batch
         };
 
-        // TODO(bwplotka): Wire `self.config.honor_timestamps` once
+        // TODO(bwplotka): Add and wire `ScrapeConfig::honor_timestamps` once
         // `DecodeOptions::with_honor_timestamps` lands in
         // https://github.com/prometheus/scrape.rs/issues/33.
         let decode_opts = self
