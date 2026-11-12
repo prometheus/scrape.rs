@@ -92,9 +92,11 @@ pub struct ScrapeReport {
     pub wire_bytes: usize,
     /// Uncompressed exposition payload bytes.
     pub uncompressed_bytes: usize,
-    /// Total metric data points decoded across all chunks (`0` on raw scrapes or errors).
+    /// Total metric data points delivered to [`ArrowScrapeSink::on_batch`] during this scrape
+    /// (`0` on raw scrapes or when failing before the first batch).
     pub data_points_decoded: u64,
-    /// Number of Arrow chunks emitted (`0` on empty/raw scrapes or errors).
+    /// Number of Arrow chunks delivered to [`ArrowScrapeSink::on_batch`] during this scrape
+    /// (`0` on empty/raw scrapes or when failing before the first batch).
     pub batches_emitted: usize,
     /// Error description when `up == false`.
     pub error: Option<String>,
@@ -112,7 +114,7 @@ pub struct ManagerStats {
     pub scrapes_failed: u64,
     /// Missed interval ticks caused by slow cycles or targets still in flight at their next tick.
     pub scrapes_overrun: u64,
-    /// Total metric data points decoded across all completed Arrow scrapes.
+    /// Total metric data points decoded across all succeeded Arrow scrapes.
     pub data_points_decoded: u64,
     /// Maximum number of response body buffers leased simultaneously.
     pub peak_buffered_bodies: usize,
@@ -144,6 +146,10 @@ struct AtomicCounters {
 pub trait RawScrapeSink {
     /// Handles a completed or failed target fetch, returning [`ControlFlow::Break`] to stop the
     /// manager loop early.
+    ///
+    /// Note that `Ok(fetched)` owns a [`crate::scrape::PooledBodyBuffer`] permit from
+    /// [`crate::scrape::BodyBufferPool`] until `fetched` is dropped; drop `fetched` before
+    /// awaiting slow downstream I/O to avoid stalling concurrent scrapes.
     fn on_raw_scrape(
         &self,
         target: &ScrapeTarget,
@@ -155,12 +161,24 @@ pub trait RawScrapeSink {
 ///
 /// Intentionally omits `Send` bounds so single-threaded `!Send` runtimes (such as Tokio
 /// `LocalSet` workers) can pass local channels or `Rc`/`RefCell` state directly.
+///
+/// # Transactional scrape atomicity and pool permits
+///
+/// Because [`ArrowScrapeSink::on_batch`] streams decoded chunks incrementally to bound scratch
+/// memory, a multi-chunk scrape can fail on a later chunk (for example, on malformed trailing
+/// syntax or a missing OpenMetrics `# EOF`). Chunks delivered to `on_batch` are therefore
+/// tentative until [`ArrowScrapeSink::on_scrape_complete`] observes `report.up == true`. Sinks
+/// that require transactional Prometheus scrape semantics (matching Go `app.Commit()` /
+/// `app.Rollback()`) should stage per-scrape batches and discard the `report.batches_emitted`
+/// tentative chunks whenever `report.up == false`.
 #[cfg(feature = "arrow")]
 pub trait ArrowScrapeSink {
     /// Receives one bounded [`OtapMetricRecords`] chunk decoded from `target`.
     ///
-    /// Returning [`ControlFlow::Break`] aborts the active scrape, drops pooled buffers back into
-    /// their freelists, and stops the manager loop.
+    /// Awaiting inside `on_batch` holds the active scrape's [`crate::scrape::PooledBodyBuffer`]
+    /// permit (and, when further chunks remain in the same scrape, its
+    /// [`crate::scrape::PooledDecoder`] permit). Returning [`ControlFlow::Break`] aborts the
+    /// active scrape, drops pooled buffers back into their freelists, and stops the manager loop.
     fn on_batch(
         &self,
         target: &ScrapeTarget,
@@ -171,6 +189,10 @@ pub trait ArrowScrapeSink {
     /// Receives final outcome telemetry for `target` after all chunks have been delivered and both
     /// the body buffer and [`prometheus_expfmt::arrow::ArrowDecoder`] have been returned to their
     /// pools.
+    ///
+    /// When `report.up == false` and `report.batches_emitted > 0`, decoding failed after earlier
+    /// chunks were streamed to [`ArrowScrapeSink::on_batch`]; transactional sinks must roll back
+    /// those tentative batches.
     fn on_scrape_complete(
         &self,
         target: &ScrapeTarget,
@@ -365,7 +387,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
 
         let report = match decode_outcome {
             ControlFlow::Break(()) => return ControlFlow::Break(()),
-            ControlFlow::Continue(Ok((points, batches))) => {
+            ControlFlow::Continue((points, batches, Ok(()))) => {
                 self.counters.succeeded.fetch_add(1, Ordering::Relaxed);
                 self.counters
                     .points_decoded
@@ -381,7 +403,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                     error: None,
                 }
             }
-            ControlFlow::Continue(Err(err)) => {
+            ControlFlow::Continue((points, batches, Err(err))) => {
                 self.counters.failed.fetch_add(1, Ordering::Relaxed);
                 ScrapeReport {
                     up: false,
@@ -389,8 +411,8 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                     duration: started.elapsed(),
                     wire_bytes,
                     uncompressed_bytes,
-                    data_points_decoded: 0,
-                    batches_emitted: 0,
+                    data_points_decoded: points,
+                    batches_emitted: batches,
                     error: Some(err.to_string()),
                 }
             }
@@ -447,7 +469,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         target: &ScrapeTarget,
         fetched: &FetchedScrape,
         sink: &S,
-    ) -> ControlFlow<(), Result<(u64, usize), ScrapeError>> {
+    ) -> ControlFlow<(), (u64, usize, Result<(), ScrapeError>)> {
         let mut decoder = self.decoder_pool.acquire().await;
 
         let chunk_limit = if self.config.max_data_points_per_batch == 0 {
@@ -508,7 +530,13 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                 }
                 Ok(DecodeStep::Batch(records)) => records,
                 Ok(DecodeStep::Done) => break,
-                Err(err) => return ControlFlow::Continue(Err(ScrapeError::Decode(err))),
+                Err(err) => {
+                    return ControlFlow::Continue((
+                        decoded_points,
+                        batches_emitted,
+                        Err(ScrapeError::Decode(err)),
+                    ));
+                }
             };
 
             let pts = records.num_data_points();
@@ -540,7 +568,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
 
         drop(stream);
         drop(decoder);
-        ControlFlow::Continue(Ok((decoded_points, batches_emitted)))
+        ControlFlow::Continue((decoded_points, batches_emitted, Ok(())))
     }
 
     async fn run_once_with<'a, Exec, Fut>(
