@@ -108,23 +108,26 @@ pub trait TargetFetcher {
 
 /// Builds a Prometheus-compatible `Accept` header value for text and OpenMetrics scraping.
 ///
-/// Mirrors the quality weights in Prometheus `scrape.acceptHeader` while advertising the
-/// configured [`EscapingScheme`] when non-default (`allow-utf-8`, `dots`, or `values`).
+/// Mirrors Prometheus `scrape.acceptHeader`: appends `;escaping=<scheme>` exclusively to `1.0.0`
+/// protocols (`application/openmetrics-text;version=1.0.0` and `text/plain;version=1.0.0`) and
+/// omits it on legacy `0.0.1` and `0.0.4` media types.
 #[must_use]
 pub fn build_accept_header(enable_open_metrics: bool, escaping: EscapingScheme) -> String {
-    let esc_param = match escaping {
-        EscapingScheme::EscapeUnderscores => String::new(),
-        other => format!(";escaping={}", other.as_str()),
-    };
+    let esc = escaping.as_str();
     if enable_open_metrics {
         format!(
-            "application/openmetrics-text;version=1.0.0{esc_param};q=0.6,\
-             application/openmetrics-text;version=0.0.1{esc_param};q=0.5,\
-             text/plain;version=0.0.4{esc_param};q=0.4,\
-             */*;q=0.1"
+            "application/openmetrics-text;version=1.0.0;escaping={esc};q=0.7,\
+             application/openmetrics-text;version=0.0.1;q=0.6,\
+             text/plain;version=1.0.0;escaping={esc};q=0.5,\
+             text/plain;version=0.0.4;q=0.4,\
+             */*;q=0.3"
         )
     } else {
-        format!("text/plain;version=0.0.4{esc_param};q=0.4,*/*;q=0.1")
+        format!(
+            "text/plain;version=1.0.0;escaping={esc};q=0.7,\
+             text/plain;version=0.0.4;q=0.6,\
+             */*;q=0.5"
+        )
     }
 }
 
@@ -437,13 +440,21 @@ mod tests {
     #[test]
     fn accept_header_respects_openmetrics_and_escaping() {
         let om = build_accept_header(true, EscapingScheme::EscapeUnderscores);
-        assert!(om.contains("application/openmetrics-text;version=1.0.0;q=0.6"));
-        assert!(om.contains("text/plain;version=0.0.4;q=0.4"));
+        assert_eq!(
+            om,
+            "application/openmetrics-text;version=1.0.0;escaping=underscores;q=0.7,\
+             application/openmetrics-text;version=0.0.1;q=0.6,\
+             text/plain;version=1.0.0;escaping=underscores;q=0.5,\
+             text/plain;version=0.0.4;q=0.4,\
+             */*;q=0.3"
+        );
 
         let utf8 = build_accept_header(false, EscapingScheme::AllowUtf8);
         assert_eq!(
             utf8,
-            "text/plain;version=0.0.4;escaping=allow-utf-8;q=0.4,*/*;q=0.1"
+            "text/plain;version=1.0.0;escaping=allow-utf-8;q=0.7,\
+             text/plain;version=0.0.4;q=0.6,\
+             */*;q=0.5"
         );
     }
 
