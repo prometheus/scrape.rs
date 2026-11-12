@@ -13,9 +13,9 @@
 
 //! Prometheus `StaleNaN` detection and cross-scrape per-target series staleness tracking.
 //!
-//! Prometheus marks disappeared time series with a distinguished quiet IEEE 754 `NaN` bit pattern
-//! ([`STALE_NAN_BITS`] / [`STALE_NAN`], matching Go's `model/value.StaleNaN`). In OpenTelemetry
-//! and OTAP, stale data points carry [`DATA_POINT_FLAG_NO_RECORDED_VALUE`] (`1`,
+//! Prometheus marks disappeared time series with a distinguished signaling IEEE 754 `NaN` bit
+//! pattern ([`STALE_NAN_BITS`] / [`STALE_NAN`], matching Go's `model/value.StaleNaN`). In
+//! OpenTelemetry and OTAP, stale data points carry [`DATA_POINT_FLAG_NO_RECORDED_VALUE`] (`1`,
 //! `DataPointFlags::FLAG_NO_RECORDED_VALUE`) in the optional `flags` (`UInt32`) column on
 //! `NumberDataPoints`, `SummaryDataPoints`, and `HistogramDataPoints`.
 //!
@@ -39,6 +39,11 @@ use super::options::{DecodeError, DecodeOptions, UntypedPolicy};
 pub const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 
 /// IEEE 754 `f64` value with [`STALE_NAN_BITS`] bit representation.
+///
+/// NOTE: Because [`STALE_NAN_BITS`] clears the MSB of the mantissa (making it a signaling `NaN`),
+/// floating-point arithmetic operations may quietize bit 51 under IEEE 754 / Rust float semantics.
+/// Move this value bitwise (`from_bits` / `to_bits`) and inspect it with [`is_stale_nan`] rather
+/// than passing it through arithmetic expressions.
 pub const STALE_NAN: f64 = f64::from_bits(STALE_NAN_BITS);
 
 /// OpenTelemetry `DataPointFlags::FLAG_NO_RECORDED_VALUE` bitmask (`1`) indicating a stale data
@@ -47,6 +52,9 @@ pub const DATA_POINT_FLAG_NO_RECORDED_VALUE: u32 = 1;
 
 /// Returns `true` if `v` has the exact IEEE 754 bit pattern of Prometheus's `StaleNaN` marker
 /// ([`STALE_NAN_BITS`]).
+///
+/// Inspects raw bits via `f64::to_bits`; callers must avoid performing arithmetic on `v` prior to
+/// calling this function because arithmetic on signaling `NaN`s may quietize the mantissa MSB.
 #[inline]
 #[must_use]
 pub const fn is_stale_nan(v: f64) -> bool {
@@ -192,6 +200,15 @@ pub struct StalenessTracker {
 impl Default for StalenessTracker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Debug for StalenessTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StalenessTracker")
+            .field("active_series_len", &self.active_series_len())
+            .field("retained_memory_bytes", &self.retained_memory_bytes())
+            .finish_non_exhaustive()
     }
 }
 
