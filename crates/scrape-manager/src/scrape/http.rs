@@ -800,4 +800,92 @@ demo_requests_total{instance=\"b\",method=\"POST\"} 40\n\
             assert_eq!(out, b"metric_one 1\nmetric_two 2\n");
         }
     }
+
+    #[tokio::test]
+    async fn reqwest_fetcher_rejects_non_200_bad_encoding_large_content_length_and_timeouts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = tokio::spawn(async move {
+            let mut req_buf = [0u8; 2048];
+
+            // 1. 204 No Content -> UnexpectedStatus { status: 204 } (no buffer allocated).
+            let (mut s1, _) = listener.accept().await.expect("accept 1");
+            let n1 = s1.read(&mut req_buf).await.expect("read 1");
+            let req1 = String::from_utf8_lossy(&req_buf[..n1]).to_ascii_lowercase();
+            assert!(req1.contains("accept-encoding: identity"));
+            s1.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write 1");
+
+            // 2. Unsolicited gzip when `enable_compression = false` -> UnsupportedEncoding.
+            let (mut s2, _) = listener.accept().await.expect("accept 2");
+            let _ = s2.read(&mut req_buf).await.expect("read 2");
+            s2.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write 2");
+
+            // 3. Uncompressed Content-Length > max_body_bytes -> fast BodyTooLarge (0 buffers allocated).
+            let (mut s3, _) = listener.accept().await.expect("accept 3");
+            let _ = s3.read(&mut req_buf).await.expect("read 3");
+            s3.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write 3");
+
+            // 4. Stalled headers -> TimedOut, and basic-auth password must not appear in error text.
+            let (mut s4, _) = listener.accept().await.expect("accept 4");
+            let _ = s4.read(&mut req_buf).await.expect("read 4");
+            tokio::time::sleep(Duration::from_millis(180)).await;
+        });
+
+        let cfg = ScrapeConfig::new("errors")
+            .with_scrape_interval(Duration::from_secs(5))
+            .with_scrape_timeout(Duration::from_millis(60))
+            .with_enable_compression(false)
+            .with_max_body_bytes(512);
+        let fetcher = ReqwestFetcher::new(&cfg).expect("fetcher");
+        let pool = BodyBufferPool::new(NonZeroUsize::MIN, 512);
+        let target = ScrapeTarget::parse(&format!("http://{addr}/metrics")).expect("target");
+
+        let e1 = fetcher.fetch(&target, &pool).await.expect_err("204 fails");
+        assert!(matches!(e1, ScrapeError::UnexpectedStatus { status: 204 }));
+        assert_eq!(pool.total_buffers_created(), 0);
+
+        let e2 = fetcher
+            .fetch(&target, &pool)
+            .await
+            .expect_err("unsolicited gzip fails");
+        assert!(matches!(e2, ScrapeError::UnsupportedEncoding { .. }));
+        assert_eq!(pool.total_buffers_created(), 0);
+
+        let e3 = fetcher
+            .fetch(&target, &pool)
+            .await
+            .expect_err("oversized Content-Length fails before buffer lease");
+        assert!(matches!(e3, ScrapeError::BodyTooLarge { limit_bytes: 512 }));
+        assert_eq!(pool.total_buffers_created(), 0);
+
+        let e4 = fetcher
+            .fetch(&target, &pool)
+            .await
+            .expect_err("stalled headers time out");
+        assert!(matches!(e4, ScrapeError::TimedOut { .. }));
+        assert_eq!(pool.active_leases(), 0);
+
+        server.await.expect("server join");
+
+        // Closed loopback port with basic-auth credentials must strip password from ScrapeError.
+        let closed_target =
+            ScrapeTarget::parse("http://admin:super_secret_pw@127.0.0.1:1/metrics").unwrap();
+        let conn_err = fetcher
+            .fetch(&closed_target, &pool)
+            .await
+            .expect_err("closed port fails");
+        assert!(
+            !conn_err.to_string().contains("super_secret_pw"),
+            "password leaked in ScrapeError: {conn_err}"
+        );
+    }
 }

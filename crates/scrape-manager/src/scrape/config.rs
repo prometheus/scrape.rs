@@ -513,3 +513,70 @@ impl ScrapeConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrape_target_parse_enforces_http_and_https_schemes() {
+        let http = ScrapeTarget::parse("http://127.0.0.1:9090/metrics")
+            .expect("http")
+            .with_labels([("job", "prom"), ("env", "prod")]);
+        assert_eq!(http.labels().len(), 2);
+
+        let https = ScrapeTarget::parse("https://example.com/metrics").expect("https");
+        assert_eq!(https.url().scheme(), "https");
+
+        assert!(matches!(
+            ScrapeTarget::parse("ftp://example.com/metrics"),
+            Err(ScrapeError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            ScrapeTarget::parse("not a url"),
+            Err(ScrapeError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn scheduling_mode_and_config_validation_cover_edge_cases() {
+        let one = NonZeroUsize::MIN;
+        let two = NonZeroUsize::new(2).unwrap();
+        let c1 = SchedulingMode::concurrent(one);
+        assert_eq!(c1.max_in_flight(), one);
+        assert_eq!(c1.max_buffered_bodies(), one);
+        assert_eq!(c1.max_decoders(), one);
+
+        let clamped = SchedulingMode::concurrent_with_pools(one, two, two);
+        assert_eq!(clamped.max_buffered_bodies(), one);
+        assert_eq!(clamped.max_decoders(), one);
+
+        let unlimited = ScrapeConfig::new("job").with_max_body_bytes(0);
+        assert_eq!(unlimited.effective_max_body_bytes(), usize::MAX);
+        assert!(unlimited.validate().is_ok());
+
+        let invalid_cases = [
+            ScrapeConfig::new("   "),
+            ScrapeConfig::new("job").with_scrape_interval(Duration::ZERO),
+            ScrapeConfig::new("job")
+                .with_scrape_interval(MAX_SCHEDULE_DURATION + Duration::from_secs(1)),
+            ScrapeConfig::new("job")
+                .with_initial_delay(MAX_SCHEDULE_DURATION + Duration::from_secs(1)),
+            ScrapeConfig::new("job").with_scrape_timeout(Duration::ZERO),
+            ScrapeConfig::new("job")
+                .with_scrape_interval(Duration::from_secs(5))
+                .with_scrape_timeout(Duration::from_secs(6)),
+            ScrapeConfig::new("job").with_user_agent("bad\r\nheader"),
+            ScrapeConfig::new("job")
+                .with_scheduling(SchedulingMode::concurrent_with_pools(one, two, one)),
+            ScrapeConfig::new("job")
+                .with_scheduling(SchedulingMode::concurrent_with_pools(one, one, two)),
+        ];
+        for (idx, cfg) in invalid_cases.iter().enumerate() {
+            assert!(
+                matches!(cfg.validate(), Err(ScrapeError::InvalidConfig(_))),
+                "case {idx} unexpectedly passed validate: {cfg:?}"
+            );
+        }
+    }
+}
