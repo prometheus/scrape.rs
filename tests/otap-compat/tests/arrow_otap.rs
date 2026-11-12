@@ -1219,12 +1219,19 @@ fn staleness_tracker_and_flags_round_trip_through_otap_and_otlp() {
         "rpc_seconds{service=\"auth\",quantile=\"0.5\"} 0.02\n",
         "rpc_seconds_sum{service=\"auth\"} 4.5\n",
         "rpc_seconds_count{service=\"auth\"} 100\n",
+        "rpc_seconds{service=\"billing\",quantile=\"0.5\"} 0.01\n",
+        "rpc_seconds_sum{service=\"billing\"} 1.0\n",
+        "rpc_seconds_count{service=\"billing\"} 20\n",
         "# HELP lat_seconds Latency histogram.\n",
         "# TYPE lat_seconds histogram\n",
         "lat_seconds_bucket{route=\"/v1\",le=\"0.1\"} 2\n",
         "lat_seconds_bucket{route=\"/v1\",le=\"+Inf\"} 5\n",
         "lat_seconds_sum{route=\"/v1\"} 1.25\n",
         "lat_seconds_count{route=\"/v1\"} 5\n",
+        "lat_seconds_bucket{route=\"/v2\",le=\"0.1\"} 1\n",
+        "lat_seconds_bucket{route=\"/v2\",le=\"+Inf\"} 2\n",
+        "lat_seconds_sum{route=\"/v2\"} 0.3\n",
+        "lat_seconds_count{route=\"/v2\"} 2\n",
     );
 
     let opts1 = DecodeOptions::new().with_timestamp_ms(1_700_000_000_000);
@@ -1232,20 +1239,61 @@ fn staleness_tracker_and_flags_round_trip_through_otap_and_otlp() {
         .decode_with_staleness(scrape1.as_bytes(), &Format::TEXT, &opts1, &mut tracker)
         .expect("scrape 1 decodes");
     assert_matches_otap_schema(&rec1);
-    assert_eq!(tracker.active_series_len(), 4);
+    assert_eq!(tracker.active_series_len(), 6);
 
     // Scrape 2 omits `req_total{instance="b",job="api"}`, `rpc_seconds{service="auth"}`, and
-    // `lat_seconds{route="/v1"}`, leaving only `req_total{instance="a",job="api"}` live.
+    // `lat_seconds{route="/v1"}`, mixing live and stale rows in `NumberDataPoints`,
+    // `SummaryDataPoints`, and `HistogramDataPoints`.
     let scrape2 = concat!(
         "# HELP req_total Total requests.\n",
         "# TYPE req_total counter\n",
         "req_total{instance=\"a\",job=\"api\"} 15\n",
+        "# HELP rpc_seconds RPC duration.\n",
+        "# TYPE rpc_seconds summary\n",
+        "rpc_seconds{service=\"billing\",quantile=\"0.5\"} 0.01\n",
+        "rpc_seconds_sum{service=\"billing\"} 1.5\n",
+        "rpc_seconds_count{service=\"billing\"} 25\n",
+        "# HELP lat_seconds Latency histogram.\n",
+        "# TYPE lat_seconds histogram\n",
+        "lat_seconds_bucket{route=\"/v2\",le=\"0.1\"} 2\n",
+        "lat_seconds_bucket{route=\"/v2\",le=\"+Inf\"} 4\n",
+        "lat_seconds_sum{route=\"/v2\"} 0.6\n",
+        "lat_seconds_count{route=\"/v2\"} 4\n",
     );
     let opts2 = DecodeOptions::new().with_timestamp_ms(1_700_000_015_000);
     let rec2 = decoder
         .decode_with_staleness(scrape2.as_bytes(), &Format::TEXT, &opts2, &mut tracker)
         .expect("scrape 2 decodes with staleness");
-    assert_eq!(tracker.active_series_len(), 1);
+    assert_eq!(tracker.active_series_len(), 3);
+
+    // Verify chunked `decode_stream_with_staleness` (`max_data_points_per_batch = 2`) produces
+    // OTLP-equivalent metrics across chunks.
+    let mut stream_dec = ArrowDecoder::new();
+    let mut stream_tracker = StalenessTracker::new();
+    stream_dec
+        .decode_with_staleness(
+            scrape1.as_bytes(),
+            &Format::TEXT,
+            &opts1,
+            &mut stream_tracker,
+        )
+        .unwrap();
+    let streamed_otlp2: Vec<_> = stream_dec
+        .decode_stream_with_staleness(
+            scrape2.as_bytes(),
+            &Format::TEXT,
+            &opts2.with_max_data_points_per_batch(2),
+            &mut stream_tracker,
+        )
+        .map(|res| {
+            let chunk = res.expect("streamed staleness chunk succeeds");
+            let mut otap = to_otap_arrow_records(&chunk);
+            otap.encode_transport_optimized().unwrap();
+            otap.decode_transport_optimized_ids().unwrap();
+            otap_to_otlp(&otap)
+        })
+        .collect();
+    assert_eq!(stream_tracker.active_series_len(), 3);
 
     let mut otap2 = to_otap_arrow_records(&rec2);
     let plain_otlp2 = otap_to_otlp(&otap2);
@@ -1287,15 +1335,29 @@ fn staleness_tracker_and_flags_round_trip_through_otap_and_otlp() {
             unit: String::new(),
             metadata: vec![kv_str(PROMETHEUS_TYPE_METADATA_KEY, "summary")],
             data: Some(metric::Data::Summary(Summary {
-                data_points: vec![SummaryDataPoint {
-                    attributes: vec![kv_str("service", "auth")],
-                    start_time_unix_nano: 0,
-                    time_unix_nano: ts2_ns,
-                    count: 0,
-                    sum: 0.0,
-                    quantile_values: Vec::new(),
-                    flags: DATA_POINT_FLAG_NO_RECORDED_VALUE,
-                }],
+                data_points: vec![
+                    SummaryDataPoint {
+                        attributes: vec![kv_str("service", "billing")],
+                        start_time_unix_nano: 0,
+                        time_unix_nano: ts2_ns,
+                        count: 25,
+                        sum: 1.5,
+                        quantile_values: vec![ValueAtQuantile {
+                            quantile: 0.5,
+                            value: 0.01,
+                        }],
+                        flags: 0,
+                    },
+                    SummaryDataPoint {
+                        attributes: vec![kv_str("service", "auth")],
+                        start_time_unix_nano: 0,
+                        time_unix_nano: ts2_ns,
+                        count: 0,
+                        sum: 0.0,
+                        quantile_values: Vec::new(),
+                        flags: DATA_POINT_FLAG_NO_RECORDED_VALUE,
+                    },
+                ],
             })),
         },
         Metric {
@@ -1305,32 +1367,50 @@ fn staleness_tracker_and_flags_round_trip_through_otap_and_otlp() {
             metadata: vec![kv_str(PROMETHEUS_TYPE_METADATA_KEY, "histogram")],
             data: Some(metric::Data::Histogram(Histogram {
                 aggregation_temporality: AggregationTemporality::Cumulative as i32,
-                data_points: vec![HistogramDataPoint {
-                    attributes: vec![kv_str("route", "/v1")],
-                    start_time_unix_nano: 0,
-                    time_unix_nano: ts2_ns,
-                    count: 0,
-                    sum: None,
-                    bucket_counts: Vec::new(),
-                    explicit_bounds: Vec::new(),
-                    exemplars: Vec::new(),
-                    flags: DATA_POINT_FLAG_NO_RECORDED_VALUE,
-                    min: None,
-                    max: None,
-                }],
+                data_points: vec![
+                    HistogramDataPoint {
+                        attributes: vec![kv_str("route", "/v2")],
+                        start_time_unix_nano: 0,
+                        time_unix_nano: ts2_ns,
+                        count: 4,
+                        sum: Some(0.6),
+                        bucket_counts: vec![2, 2],
+                        explicit_bounds: vec![0.1],
+                        exemplars: Vec::new(),
+                        flags: 0,
+                        min: None,
+                        max: None,
+                    },
+                    HistogramDataPoint {
+                        attributes: vec![kv_str("route", "/v1")],
+                        start_time_unix_nano: 0,
+                        time_unix_nano: ts2_ns,
+                        count: 0,
+                        sum: None,
+                        bucket_counts: Vec::new(),
+                        explicit_bounds: Vec::new(),
+                        exemplars: Vec::new(),
+                        flags: DATA_POINT_FLAG_NO_RECORDED_VALUE,
+                        min: None,
+                        max: None,
+                    },
+                ],
             })),
         },
     ]));
 
     assert_equivalent(std::slice::from_ref(&expected2), &[plain_otlp2]);
-    assert_equivalent(&[expected2], &[round_tripped_otlp2]);
+    assert_equivalent(std::slice::from_ref(&expected2), &[round_tripped_otlp2]);
+    assert_equivalent(&[expected2], &streamed_otlp2);
 
-    // Target scrape failure: `flush_target_stale` marks the remaining active series stale.
+    // Target scrape failure: `flush_target_stale` marks all 3 remaining active series stale.
     let opts3 = DecodeOptions::new().with_timestamp_ms(1_700_000_030_000);
     let rec3 = decoder
         .flush_target_stale(&mut tracker, &opts3)
         .expect("flush_target_stale succeeds");
     assert!(tracker.is_empty());
+    assert_eq!(rec3.num_metrics(), 3);
+    assert_eq!(rec3.num_data_points(), 3);
 
     let mut otap3 = to_otap_arrow_records(&rec3);
     otap3
@@ -1342,11 +1422,22 @@ fn staleness_tracker_and_flags_round_trip_through_otap_and_otlp() {
     let OtlpProtoMessage::Metrics(otlp3) = otap_to_otlp(&otap3) else {
         panic!("expected OTLP MetricsData");
     };
-    let m3 = &otlp3.resource_metrics[0].scope_metrics[0].metrics[0];
-    let Some(metric::Data::Sum(sum3)) = &m3.data else {
-        panic!("expected Sum metric");
-    };
-    assert_eq!(sum3.data_points.len(), 1);
-    assert_eq!(sum3.data_points[0].flags, DATA_POINT_FLAG_NO_RECORDED_VALUE);
-    assert_eq!(sum3.data_points[0].value, None);
+    assert_eq!(otlp3.resource_metrics[0].scope_metrics[0].metrics.len(), 3);
+    for m in &otlp3.resource_metrics[0].scope_metrics[0].metrics {
+        match &m.data {
+            Some(metric::Data::Sum(s)) => {
+                assert_eq!(s.data_points[0].flags, DATA_POINT_FLAG_NO_RECORDED_VALUE);
+                assert_eq!(s.data_points[0].value, None);
+            }
+            Some(metric::Data::Summary(s)) => {
+                assert_eq!(s.data_points[0].flags, DATA_POINT_FLAG_NO_RECORDED_VALUE);
+                assert_eq!(s.data_points[0].sum, 0.0);
+            }
+            Some(metric::Data::Histogram(h)) => {
+                assert_eq!(h.data_points[0].flags, DATA_POINT_FLAG_NO_RECORDED_VALUE);
+                assert_eq!(h.data_points[0].sum, None);
+            }
+            other => panic!("unexpected metric data: {other:?}"),
+        }
+    }
 }
