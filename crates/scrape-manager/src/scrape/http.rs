@@ -13,7 +13,7 @@
 
 use std::future::Future;
 use std::io::{self, Write};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flate2::write::GzDecoder;
 #[cfg(feature = "arrow")]
@@ -22,6 +22,7 @@ use prometheus_expfmt::format::{EscapingScheme, FMT_TEXT, Format, FormatType, re
 use reqwest::header::{
     ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT,
 };
+use tokio::time::Instant;
 
 use crate::scrape::{BodyBufferPool, PooledBodyBuffer, ScrapeConfig, ScrapeTarget};
 
@@ -216,7 +217,6 @@ impl ReqwestFetcher {
             .no_brotli()
             .no_zstd()
             .no_deflate()
-            .timeout(config.scrape_timeout)
             .build()?;
         Self::with_client(client, config)
     }
@@ -283,7 +283,8 @@ impl TargetFetcher for ReqwestFetcher {
         // that stall on TCP connect or server-side metric collection hold zero payload memory.
         let mut response = tokio::time::timeout(timeout, req.send())
             .await
-            .map_err(|_| ScrapeError::TimedOut { timeout })??;
+            .map_err(|_| ScrapeError::TimedOut { timeout })?
+            .map_err(|err| map_reqwest_error(err, timeout))?;
 
         let status = response.status();
         if status != reqwest::StatusCode::OK {
@@ -330,7 +331,11 @@ impl TargetFetcher for ReqwestFetcher {
 
             match encoding {
                 BodyEncoding::Identity => {
-                    while let Some(chunk) = response.chunk().await? {
+                    while let Some(chunk) = response
+                        .chunk()
+                        .await
+                        .map_err(|err| map_reqwest_error(err, timeout))?
+                    {
                         wire_bytes = wire_bytes.saturating_add(chunk.len());
                         if body.len().saturating_add(chunk.len()) > self.max_body_bytes {
                             return Err(ScrapeError::BodyTooLarge {
@@ -345,7 +350,11 @@ impl TargetFetcher for ReqwestFetcher {
                         buf: &mut body,
                         limit: self.max_body_bytes,
                     });
-                    while let Some(chunk) = response.chunk().await? {
+                    while let Some(chunk) = response
+                        .chunk()
+                        .await
+                        .map_err(|err| map_reqwest_error(err, timeout))?
+                    {
                         wire_bytes = wire_bytes.saturating_add(chunk.len());
                         decoder
                             .write_all(&chunk)
@@ -372,6 +381,14 @@ impl TargetFetcher for ReqwestFetcher {
             fetch_duration,
             wire_bytes,
         })
+    }
+}
+
+fn map_reqwest_error(err: reqwest::Error, timeout: Duration) -> ScrapeError {
+    if err.is_timeout() {
+        ScrapeError::TimedOut { timeout }
+    } else {
+        ScrapeError::from(err)
     }
 }
 
