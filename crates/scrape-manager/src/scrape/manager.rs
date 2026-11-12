@@ -753,7 +753,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                 cmd = ctrl_rx.recv() => {
                     match cmd {
                         Some(ScrapeCommand::UpdateTargets(new_targets)) => {
-                            schedule.sync_targets(new_targets, Instant::now());
+                            schedule.sync_targets(new_targets, Instant::now().max(start_base));
                         }
                         Some(ScrapeCommand::Shutdown) | None => return,
                     }

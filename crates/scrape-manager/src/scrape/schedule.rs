@@ -231,6 +231,27 @@ impl TargetSchedule {
             }
             false
         });
+
+        let active = self.index_by_target.len();
+        if self.heap.len() > active.saturating_mul(2).max(64) {
+            self.compact_heap(active);
+        }
+    }
+
+    fn compact_heap(&mut self, active: usize) {
+        let mut rebuilt = BinaryHeap::with_capacity(active);
+        for (slot_id, slot_opt) in self.slots.iter().enumerate() {
+            if let Some(slot) = slot_opt
+                && !slot.removed
+            {
+                rebuilt.push(Reverse(HeapEntry {
+                    due: slot.next_due,
+                    slot_id,
+                    generation: slot.generation,
+                }));
+            }
+        }
+        self.heap = rebuilt;
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -495,5 +516,22 @@ mod tests {
             .pop_due(first_due + interval * 2)
             .expect("fires on next grid tick");
         assert_eq!(resumed.target.url(), t1.url());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rapid_target_churn_compacts_stale_heap_entries() {
+        let interval = Duration::from_secs(60);
+        let base = Instant::now();
+        let mut sched = TargetSchedule::new(interval, 3);
+
+        for batch in 0..200 {
+            let t = ScrapeTarget::parse(&format!("http://127.0.0.1:9100/m/{batch}")).expect("url");
+            sched.sync_targets(vec![t], base);
+        }
+        assert!(
+            sched.heap.len() <= 64,
+            "expected compacted heap <= 64 entries after churn, got {}",
+            sched.heap.len()
+        );
     }
 }

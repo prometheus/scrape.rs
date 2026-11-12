@@ -260,6 +260,63 @@ async fn cycle_tick_finishes_current_pass_across_target_updates() {
     assert_eq!(seen.get(t3.url().as_str()).map(Vec::len), Some(1));
 }
 
+#[tokio::test(start_paused = true)]
+async fn empty_startup_honors_initial_delay_on_update_targets_and_stops_on_channel_drop() {
+    let t1 = ScrapeTarget::parse("http://10.3.0.1:9100/metrics").unwrap();
+    let fetcher = SimulatedLatencyFetcher {
+        slow_url: String::new(),
+        slow_delay: Duration::from_millis(10),
+        fast_delay: Duration::from_millis(10),
+        payload: b"metric_a 1\n".to_vec(),
+    };
+
+    let cfg = ScrapeConfig::new("dynamic-sd")
+        .with_scrape_interval(Duration::from_secs(10))
+        .with_scrape_timeout(Duration::from_secs(5))
+        .with_initial_delay(Duration::from_secs(6))
+        .with_scheduling(SchedulingMode::concurrent(NonZeroUsize::new(4).unwrap()));
+
+    let start = Instant::now();
+    let manager = ScrapeManager::new(cfg, fetcher).expect("manager");
+    let (ctrl, ctrl_rx) = ScrapeManager::control_channel();
+    let sink = RecordingRawSink::new();
+    let observer = ctrl.clone();
+
+    let t1_for_driver = t1.clone();
+    let driver = async move {
+        // Start with 0 targets; push `t1` at t = 1s while still inside the 6s `initial_delay`.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(ctrl.update_targets(vec![t1_for_driver]));
+
+        // Wait past `initial_delay + scrape_interval` so `t1` scrapes at least once after t >= 6s.
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        assert!(ctrl.update_targets(Vec::new()));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Drop the last active sender (`ctrl`) after dropping `observer` below -> clean exit.
+        drop(ctrl);
+    };
+
+    // Drop `observer` inside the driver check after run_raw exits to verify `false` return value.
+    let check_closed = async move {
+        driver.await;
+    };
+    drop(observer);
+    let (probe_ctrl, probe_rx) = ScrapeManager::control_channel();
+    drop(probe_rx);
+    assert!(!probe_ctrl.update_targets(Vec::new()));
+    assert!(!probe_ctrl.shutdown());
+
+    tokio::join!(manager.run_raw(Vec::new(), ctrl_rx, &sink), check_closed);
+
+    let seen = sink.seen.lock().expect("lock");
+    let stamps = seen.get(t1.url().as_str()).expect("t1 scraped");
+    assert!(
+        stamps[0].duration_since(start) >= Duration::from_secs(6),
+        "expected first scrape after 6s initial_delay, got {:?}",
+        stamps[0].duration_since(start)
+    );
+}
+
 #[tokio::test]
 async fn real_http_concurrent_header_stalls_complete_in_parallel_with_bounded_buffers() {
     let mut targets = Vec::new();
