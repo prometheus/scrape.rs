@@ -12,7 +12,7 @@
 // limitations under the License.
 
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,26 +67,12 @@ fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct TargetKey {
-    url: String,
-    labels: BTreeMap<String, String>,
-}
-
-impl TargetKey {
-    fn from_target(target: &ScrapeTarget) -> Self {
-        Self {
-            url: target.url().as_str().to_owned(),
-            labels: target.labels().clone(),
-        }
-    }
-}
-
 #[derive(Debug)]
 struct TargetSlot {
     target: Arc<ScrapeTarget>,
     generation: u64,
     next_due: Instant,
+    seen_epoch: u64,
     in_flight: bool,
     removed: bool,
 }
@@ -131,9 +117,10 @@ pub(crate) struct TargetSchedule {
     interval: Duration,
     jitter_seed: u64,
     next_generation: u64,
+    sync_epoch: u64,
     slots: Vec<Option<TargetSlot>>,
     free_slots: Vec<usize>,
-    index_by_key: HashMap<TargetKey, usize>,
+    index_by_target: HashMap<Arc<ScrapeTarget>, usize>,
     heap: BinaryHeap<Reverse<HeapEntry>>,
     overruns: u64,
 }
@@ -144,9 +131,10 @@ impl TargetSchedule {
             interval,
             jitter_seed,
             next_generation: 1,
+            sync_epoch: 0,
             slots: Vec::new(),
             free_slots: Vec::new(),
-            index_by_key: HashMap::new(),
+            index_by_target: HashMap::new(),
             heap: BinaryHeap::new(),
             overruns: 0,
         }
@@ -154,18 +142,19 @@ impl TargetSchedule {
 
     /// Reconciles the active target list against `targets` at `base_instant`.
     ///
-    /// Unchanged targets preserve their existing `next_due` phase and `in_flight` state; newly
-    /// discovered targets are scheduled at `base_instant + target_offset(target)`. Duplicate
-    /// targets within `targets` are deduplicated automatically.
+    /// Unchanged targets preserve their existing `next_due` phase and `in_flight` state without
+    /// cloning URL or label allocations; newly discovered targets are scheduled at
+    /// `base_instant + target_offset(target)`. Duplicate targets within `targets` are deduplicated
+    /// automatically.
     pub(crate) fn sync_targets(&mut self, targets: Vec<ScrapeTarget>, base_instant: Instant) {
-        let mut seen = HashSet::with_capacity(targets.len());
+        self.sync_epoch = self.sync_epoch.wrapping_add(1);
+        let epoch = self.sync_epoch;
 
         for target in targets {
-            let key = TargetKey::from_target(&target);
-            if !seen.insert(key.clone()) {
-                continue;
-            }
-            if self.index_by_key.contains_key(&key) {
+            if let Some(&slot_id) = self.index_by_target.get(&target) {
+                if let Some(slot) = self.slots.get_mut(slot_id).and_then(Option::as_mut) {
+                    slot.seen_epoch = epoch;
+                }
                 continue;
             }
 
@@ -173,11 +162,13 @@ impl TargetSchedule {
             self.next_generation = self.next_generation.wrapping_add(1);
             let offset = target_offset(&target, self.interval, self.jitter_seed);
             let due = base_instant + offset;
+            let target_arc = Arc::new(target);
 
             let slot = TargetSlot {
-                target: Arc::new(target),
+                target: Arc::clone(&target_arc),
                 generation,
                 next_due: due,
+                seen_epoch: epoch,
                 in_flight: false,
                 removed: false,
             };
@@ -191,7 +182,7 @@ impl TargetSchedule {
                 id
             };
 
-            self.index_by_key.insert(key, slot_id);
+            self.index_by_target.insert(target_arc, slot_id);
             self.heap.push(Reverse(HeapEntry {
                 due,
                 slot_id,
@@ -199,28 +190,27 @@ impl TargetSchedule {
             }));
         }
 
-        let mut to_remove = Vec::new();
-        for (key, &slot_id) in &self.index_by_key {
-            if !seen.contains(key) {
-                to_remove.push((key.clone(), slot_id));
+        let slots = &mut self.slots;
+        let free_slots = &mut self.free_slots;
+        self.index_by_target.retain(|_, &mut slot_id| {
+            let Some(slot) = slots.get_mut(slot_id).and_then(Option::as_mut) else {
+                return false;
+            };
+            if slot.seen_epoch == epoch {
+                return true;
             }
-        }
-
-        for (key, slot_id) in to_remove {
-            self.index_by_key.remove(&key);
-            if let Some(slot) = self.slots.get_mut(slot_id).and_then(Option::as_mut) {
-                if slot.in_flight {
-                    slot.removed = true;
-                } else {
-                    self.slots[slot_id] = None;
-                    self.free_slots.push(slot_id);
-                }
+            if slot.in_flight {
+                slot.removed = true;
+            } else {
+                slots[slot_id] = None;
+                free_slots.push(slot_id);
             }
-        }
+            false
+        });
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.index_by_key.is_empty()
+        self.index_by_target.is_empty()
     }
 
     /// Returns the earliest `Instant` at which a valid non-removed target is due.

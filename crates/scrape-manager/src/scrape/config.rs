@@ -47,7 +47,7 @@ const DEFAULT_CONCURRENT_IN_FLIGHT: usize = 8;
 const DEFAULT_CONCURRENT_BUFFERED_BODIES: usize = 2;
 
 /// Single HTTP endpoint and associated target labels scheduled by a scrape pool.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScrapeTarget {
     url: reqwest::Url,
     labels: BTreeMap<String, String>,
