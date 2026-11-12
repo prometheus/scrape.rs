@@ -658,22 +658,29 @@ impl<F: TargetFetcher> ScrapeManager<F> {
 
                     let snapshot = targets.clone();
                     for target in snapshot {
-                        tokio::select! {
-                            biased;
+                        let fut = exec_one(target);
+                        tokio::pin!(fut);
+                        loop {
+                            tokio::select! {
+                                biased;
 
-                            cmd = ctrl_rx.recv() => {
-                                match cmd {
-                                    Some(ScrapeCommand::UpdateTargets(new_targets)) => {
-                                        targets = new_targets.into_iter().map(Arc::new).collect();
-                                        break;
+                                cmd = ctrl_rx.recv() => {
+                                    match cmd {
+                                        Some(ScrapeCommand::UpdateTargets(new_targets)) => {
+                                            // Stage the updated target list for the next cycle
+                                            // tick without cancelling the in-flight scrape or
+                                            // skipping remaining targets in the current pass.
+                                            targets = new_targets.into_iter().map(Arc::new).collect();
+                                        }
+                                        Some(ScrapeCommand::Shutdown) | None => return,
                                     }
-                                    Some(ScrapeCommand::Shutdown) | None => return,
                                 }
-                            }
 
-                            out = exec_one(target) => {
-                                if out.is_break() {
-                                    return;
+                                out = &mut fut => {
+                                    if out.is_break() {
+                                        return;
+                                    }
+                                    break;
                                 }
                             }
                         }

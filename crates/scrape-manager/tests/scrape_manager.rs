@@ -208,6 +208,58 @@ async fn sequential_modes_use_single_buffer_and_count_overruns() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn cycle_tick_finishes_current_pass_across_target_updates() {
+    let t0 = ScrapeTarget::parse("http://10.2.0.1:9100/metrics").unwrap();
+    let t1 = ScrapeTarget::parse("http://10.2.0.2:9100/metrics").unwrap();
+    let t2 = ScrapeTarget::parse("http://10.2.0.3:9100/metrics").unwrap();
+    let t3 = ScrapeTarget::parse("http://10.2.0.4:9100/metrics").unwrap();
+
+    let fetcher = SimulatedLatencyFetcher {
+        slow_url: t0.url().as_str().to_owned(),
+        slow_delay: Duration::from_secs(2),
+        fast_delay: Duration::from_secs(2),
+        payload: b"metric_a 1\n".to_vec(),
+    };
+
+    let cfg = ScrapeConfig::new("seq-update")
+        .with_scrape_interval(Duration::from_secs(10))
+        .with_scrape_timeout(Duration::from_secs(5))
+        .with_scheduling(SchedulingMode::sequential());
+
+    let manager = ScrapeManager::new(cfg, fetcher).expect("manager");
+    let (ctrl, ctrl_rx) = ScrapeManager::control_channel();
+    let sink = RecordingRawSink::new();
+
+    let t3_for_driver = t3.clone();
+    let driver = async move {
+        // Send `UpdateTargets` at t = 1s while `t0` is mid-scrape; `t0`, `t1`, and `t2` must all
+        // complete pass 1, and `t3` must take effect on pass 2 (t = 10s).
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(ctrl.update_targets(vec![t3_for_driver]));
+        tokio::time::sleep(Duration::from_secs(14)).await;
+        let _ = ctrl.shutdown();
+    };
+
+    tokio::join!(
+        manager.run_raw(vec![t0.clone(), t1.clone(), t2.clone()], ctrl_rx, &sink),
+        driver
+    );
+
+    let stats = manager.stats();
+    assert_eq!(
+        stats.scrapes_started,
+        stats.scrapes_succeeded + stats.scrapes_failed
+    );
+    assert_eq!(stats.scrapes_succeeded, 4);
+
+    let seen = sink.seen.lock().expect("lock");
+    assert_eq!(seen.get(t0.url().as_str()).map(Vec::len), Some(1));
+    assert_eq!(seen.get(t1.url().as_str()).map(Vec::len), Some(1));
+    assert_eq!(seen.get(t2.url().as_str()).map(Vec::len), Some(1));
+    assert_eq!(seen.get(t3.url().as_str()).map(Vec::len), Some(1));
+}
+
 #[tokio::test]
 async fn real_http_concurrent_header_stalls_complete_in_parallel_with_bounded_buffers() {
     let mut targets = Vec::new();
