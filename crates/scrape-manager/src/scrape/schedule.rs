@@ -68,13 +68,13 @@ fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct TargetKey {
+pub(crate) struct TargetKey {
     url: String,
     labels: BTreeMap<String, String>,
 }
 
 impl TargetKey {
-    fn from_target(target: &ScrapeTarget) -> Self {
+    pub(crate) fn from_target(target: &ScrapeTarget) -> Self {
         Self {
             url: target.url().as_str().to_owned(),
             labels: target.labels().clone(),
@@ -152,12 +152,18 @@ impl TargetSchedule {
         }
     }
 
-    /// Reconciles the active target list against `targets` at `base_instant`.
+    /// Reconciles the active target list against `targets` at `base_instant`, returning any idle
+    /// targets that were immediately removed from the schedule.
     ///
     /// Unchanged targets preserve their existing `next_due` phase and `in_flight` state; newly
     /// discovered targets are scheduled at `base_instant + target_offset(target)`. Duplicate
-    /// targets within `targets` are deduplicated automatically.
-    pub(crate) fn sync_targets(&mut self, targets: Vec<ScrapeTarget>, base_instant: Instant) {
+    /// targets within `targets` are deduplicated automatically. Targets removed while an active
+    /// scrape is still `in_flight` are returned later from [`Self::complete`].
+    pub(crate) fn sync_targets(
+        &mut self,
+        targets: Vec<ScrapeTarget>,
+        base_instant: Instant,
+    ) -> Vec<Arc<ScrapeTarget>> {
         let mut seen = HashSet::with_capacity(targets.len());
 
         for target in targets {
@@ -206,17 +212,21 @@ impl TargetSchedule {
             }
         }
 
+        let mut removed_idle = Vec::new();
         for (key, slot_id) in to_remove {
             self.index_by_key.remove(&key);
             if let Some(slot) = self.slots.get_mut(slot_id).and_then(Option::as_mut) {
                 if slot.in_flight {
                     slot.removed = true;
                 } else {
-                    self.slots[slot_id] = None;
+                    if let Some(taken) = self.slots[slot_id].take() {
+                        removed_idle.push(taken.target);
+                    }
                     self.free_slots.push(slot_id);
                 }
             }
         }
+        removed_idle
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -290,8 +300,13 @@ impl TargetSchedule {
         None
     }
 
-    /// Marks an in-flight scrape finished so the target may run on future ticks.
-    pub(crate) fn complete(&mut self, slot_id: usize, generation: u64) {
+    /// Marks an in-flight scrape finished so the target may run on future ticks, returning the
+    /// target if it was removed by [`Self::sync_targets`] while in flight.
+    pub(crate) fn complete(
+        &mut self,
+        slot_id: usize,
+        generation: u64,
+    ) -> Option<Arc<ScrapeTarget>> {
         let reclaim = if let Some(slot) = self.slots.get_mut(slot_id).and_then(Option::as_mut)
             && slot.generation == generation
         {
@@ -301,8 +316,11 @@ impl TargetSchedule {
             false
         };
         if reclaim {
-            self.slots[slot_id] = None;
+            let removed = self.slots[slot_id].take().map(|s| s.target);
             self.free_slots.push(slot_id);
+            removed
+        } else {
+            None
         }
     }
 

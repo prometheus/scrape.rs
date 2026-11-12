@@ -1441,3 +1441,110 @@ fn staleness_tracker_and_flags_round_trip_through_otap_and_otlp() {
         }
     }
 }
+
+#[test]
+fn metric_relabeling_fast_and_per_datapoint_paths_roundtrip_otap_schema() {
+    use prometheus_relabel::{Action, Config as RelabelConfig, LabelSet, Regexp};
+    use prometheus_scrape_manager::scrape::apply_metric_relabel;
+
+    let mut decoder = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    let opts1 = DecodeOptions::new().with_timestamp_ms(1_700_000_000_000);
+    let payload1 = b"# TYPE up_gauge gauge\n\
+up_gauge 1\n\
+# TYPE http_requests_total counter\n\
+http_requests_total{instance=\"app-internal\",method=\"GET\",drop_me=\"x\"} 10\n\
+http_requests_total{instance=\"app-internal\",method=\"DEBUG\",drop_me=\"y\"} 99\n";
+
+    let raw1 = decoder
+        .decode_with_staleness(payload1, &Format::TEXT, &opts1, &mut tracker)
+        .expect("decode 1");
+
+    let target_labels = LabelSet::from([
+        ("job".to_owned(), "api".to_owned()),
+        ("instance".to_owned(), "10.0.0.5:8080".to_owned()),
+        ("k8s.pod.name".to_owned(), "api-pod-0".to_owned()),
+    ]);
+
+    // 1. Batch-invariant fast path: copies target labels + static label and renames colliding `instance` -> `exported_instance`.
+    let fast_rules = vec![
+        RelabelConfig {
+            source_labels: vec!["k8s.pod.name".to_owned()],
+            target_label: "pod".to_owned(),
+            replacement: "$1".to_owned(),
+            action: Action::Replace,
+            ..RelabelConfig::default()
+        },
+        RelabelConfig {
+            target_label: "container".to_owned(),
+            replacement: "api".to_owned(),
+            action: Action::Replace,
+            ..RelabelConfig::default()
+        },
+    ];
+    let fast_rec = apply_metric_relabel(raw1.clone(), &target_labels, false, &fast_rules)
+        .expect("fast relabel");
+    let mut fast_otap = to_otap_arrow_records(&fast_rec);
+    fast_otap
+        .encode_transport_optimized()
+        .expect("transport optimize fast_rec");
+    fast_otap
+        .decode_transport_optimized_ids()
+        .expect("transport decode fast_rec");
+    let OtlpProtoMessage::Metrics(fast_otlp) = otap_to_otlp(&fast_otap) else {
+        panic!("expected Metrics");
+    };
+    assert_eq!(
+        fast_otlp.resource_metrics[0].scope_metrics[0].metrics.len(),
+        2
+    );
+
+    // 2. Per-datapoint fallback path: drops `method="DEBUG"`, drops `drop_me` label, and rewrites `__name__`.
+    let fallback_rules = vec![
+        RelabelConfig {
+            source_labels: vec!["method".to_owned()],
+            regex: Regexp::must_new("DEBUG"),
+            action: Action::Drop,
+            ..RelabelConfig::default()
+        },
+        RelabelConfig {
+            regex: Regexp::must_new("drop_me"),
+            action: Action::LabelDrop,
+            ..RelabelConfig::default()
+        },
+        RelabelConfig {
+            source_labels: vec!["__name__".to_owned()],
+            regex: Regexp::must_new("http_requests_total"),
+            target_label: "__name__".to_owned(),
+            replacement: "http_reqs_filtered_total".to_owned(),
+            action: Action::Replace,
+            ..RelabelConfig::default()
+        },
+        RelabelConfig {
+            source_labels: vec!["k8s.pod.name".to_owned()],
+            target_label: "pod".to_owned(),
+            replacement: "$1".to_owned(),
+            action: Action::Replace,
+            ..RelabelConfig::default()
+        },
+    ];
+    let fb_rec = apply_metric_relabel(raw1, &target_labels, false, &fallback_rules)
+        .expect("fallback relabel");
+    let mut fb_otap = to_otap_arrow_records(&fb_rec);
+    fb_otap
+        .encode_transport_optimized()
+        .expect("transport optimize fb_rec");
+    fb_otap
+        .decode_transport_optimized_ids()
+        .expect("transport decode fb_rec");
+    let OtlpProtoMessage::Metrics(fb_otlp) = otap_to_otlp(&fb_otap) else {
+        panic!("expected Metrics");
+    };
+    let fb_metrics = &fb_otlp.resource_metrics[0].scope_metrics[0].metrics;
+    assert_eq!(fb_metrics.len(), 2);
+    assert!(
+        fb_metrics
+            .iter()
+            .any(|m| m.name == "http_reqs_filtered_total")
+    );
+}

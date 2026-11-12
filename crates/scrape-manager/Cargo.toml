@@ -17,10 +17,19 @@ exclude = [
 publish = false
 
 [features]
-default = ["arrow"]
-arrow = ["prometheus-expfmt/arrow"]
+default = ["arrow", "rustls-provider"]
+arrow = [
+    "prometheus-expfmt/arrow",
+    "dep:arrow-array",
+    "dep:arrow-buffer",
+    "dep:arrow-schema",
+]
+rustls-provider = ["reqwest/rustls"]
 
 [dependencies]
+arrow-array = { workspace = true, optional = true }
+arrow-buffer = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }
 futures-util = { workspace = true }

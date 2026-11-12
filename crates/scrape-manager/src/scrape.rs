@@ -28,6 +28,8 @@ mod config;
 mod http;
 mod manager;
 mod pool;
+#[cfg(feature = "arrow")]
+mod relabel_arrow;
 mod schedule;
 
 pub use config::{
@@ -47,4 +49,6 @@ pub use manager::{
 pub use pool::{BodyBufferPool, PooledBodyBuffer};
 #[cfg(feature = "arrow")]
 pub use pool::{DecoderPool, PooledDecoder};
+#[cfg(feature = "arrow")]
+pub use relabel_arrow::apply_metric_relabel;
 pub use schedule::target_offset;

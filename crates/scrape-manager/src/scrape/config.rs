@@ -18,6 +18,10 @@ use std::time::Duration;
 #[cfg(feature = "arrow")]
 use prometheus_expfmt::arrow::{DecodeBudget, DecodeOptions};
 use prometheus_expfmt::format::EscapingScheme;
+use prometheus_relabel::{
+    ADDRESS_LABEL, Config as RelabelConfig, LabelSet, METRICS_PATH_LABEL, PARAM_LABEL_PREFIX,
+    PopulatedTarget, SCHEME_LABEL, TargetPopulateConfig, ValidationScheme, populate_labels,
+};
 
 use crate::scrape::ScrapeError;
 
@@ -76,6 +80,58 @@ impl ScrapeTarget {
             )));
         }
         Ok(Self::new(url))
+    }
+
+    /// Constructs a [`ScrapeTarget`] from a relabeled [`PopulatedTarget`], resolving its HTTP URL
+    /// from `__scheme__`, `__address__`, `__metrics_path__`, and any `__param_<name>` labels and
+    /// attaching all non-reserved (`!__`) labels as [`ScrapeTarget::labels`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScrapeError::InvalidConfig`] if `__address__` is missing or the resulting URL is
+    /// not a valid `http` or `https` endpoint.
+    pub fn from_populated(populated: &PopulatedTarget) -> Result<Self, ScrapeError> {
+        let scheme = populated
+            .labels
+            .get(SCHEME_LABEL)
+            .map_or("http", String::as_str);
+        let addr = populated
+            .labels
+            .get(ADDRESS_LABEL)
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ScrapeError::InvalidConfig("populated target missing __address__".to_owned())
+            })?;
+        let raw_path = populated
+            .labels
+            .get(METRICS_PATH_LABEL)
+            .map_or("/metrics", String::as_str);
+        let base_url = if raw_path.starts_with('/') {
+            format!("{scheme}://{addr}{raw_path}")
+        } else {
+            format!("{scheme}://{addr}/{raw_path}")
+        };
+
+        let mut target = Self::parse(&base_url)?;
+        let mut has_params = false;
+        for (k, v) in &populated.labels {
+            if let Some(param_name) = k.strip_prefix(PARAM_LABEL_PREFIX)
+                && !param_name.is_empty()
+                && !v.is_empty()
+            {
+                if !has_params {
+                    has_params = true;
+                }
+                target
+                    .url
+                    .query_pairs_mut()
+                    .append_pair(param_name, v.as_str());
+            }
+        }
+        let _ = has_params;
+        target.labels = populated.public_labels();
+        Ok(target)
     }
 
     /// Inserts or replaces a target metadata label (such as `instance` or `job`).
@@ -272,6 +328,13 @@ pub struct ScrapeConfig {
     pub enable_compression: bool,
     /// Preserve explicit sample timestamps when `true`; override with scrape time when `false`.
     pub honor_timestamps: bool,
+    /// Preserve sample labels that collide with target labels when `true`; prefix conflicting
+    /// sample labels with `exported_` when `false`.
+    pub honor_labels: bool,
+    /// Target relabeling rules applied by [`ScrapeConfig::populate_target`].
+    pub relabel_configs: Vec<RelabelConfig>,
+    /// Per-scrape sample relabeling rules applied after decoding.
+    pub metric_relabel_configs: Vec<RelabelConfig>,
     /// Maximum uncompressed HTTP response body size in bytes (`0` disables the limit).
     pub max_body_bytes: usize,
     /// Maximum capacity in bytes retained per idle `Vec<u8>` in [`crate::scrape::BodyBufferPool`].
@@ -280,6 +343,10 @@ pub struct ScrapeConfig {
     pub max_data_points_per_batch: usize,
     /// `User-Agent` header value sent on HTTP scrape requests.
     pub user_agent: String,
+    /// Track per-target active series across scrapes and emit `FLAG_NO_RECORDED_VALUE` markers
+    /// when series disappear, a target scrape fails, or a target is removed.
+    #[cfg(feature = "arrow")]
+    pub track_staleness: bool,
     /// Cooperative per-step parsing budget when the `arrow` feature is enabled.
     #[cfg(feature = "arrow")]
     pub decode_budget: DecodeBudget,
@@ -301,10 +368,15 @@ impl Default for ScrapeConfig {
             escaping_scheme: EscapingScheme::default(),
             enable_compression: true,
             honor_timestamps: true,
+            honor_labels: false,
+            relabel_configs: Vec::new(),
+            metric_relabel_configs: Vec::new(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_retained_body_bytes: DEFAULT_MAX_RETAINED_BODY_BYTES,
             max_data_points_per_batch: DEFAULT_MAX_DATA_POINTS_PER_BATCH,
             user_agent: DEFAULT_USER_AGENT.to_owned(),
+            #[cfg(feature = "arrow")]
+            track_staleness: false,
             #[cfg(feature = "arrow")]
             decode_budget: DecodeBudget::default(),
             #[cfg(feature = "arrow")]
@@ -400,6 +472,35 @@ impl ScrapeConfig {
         self
     }
 
+    /// Sets [`ScrapeConfig::honor_labels`].
+    #[must_use]
+    pub const fn with_honor_labels(mut self, honor: bool) -> Self {
+        self.honor_labels = honor;
+        self
+    }
+
+    /// Sets [`ScrapeConfig::relabel_configs`].
+    #[must_use]
+    pub fn with_relabel_configs(mut self, configs: Vec<RelabelConfig>) -> Self {
+        self.relabel_configs = configs;
+        self
+    }
+
+    /// Sets [`ScrapeConfig::metric_relabel_configs`].
+    #[must_use]
+    pub fn with_metric_relabel_configs(mut self, configs: Vec<RelabelConfig>) -> Self {
+        self.metric_relabel_configs = configs;
+        self
+    }
+
+    /// Sets [`ScrapeConfig::track_staleness`].
+    #[cfg(feature = "arrow")]
+    #[must_use]
+    pub const fn with_track_staleness(mut self, enable: bool) -> Self {
+        self.track_staleness = enable;
+        self
+    }
+
     /// Sets [`ScrapeConfig::decode_budget`].
     #[cfg(feature = "arrow")]
     #[must_use]
@@ -408,13 +509,57 @@ impl ScrapeConfig {
         self
     }
 
-    /// Validates interval, timeout, and pool invariants.
+    /// Populates discovered target labels, runs [`ScrapeConfig::relabel_configs`], and resolves the
+    /// resulting [`ScrapeTarget`] URL and public labels (`Ok(None)` if dropped by relabeling).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScrapeError::InvalidConfig`] if target relabeling or URL resolution fails.
+    pub fn populate_target(
+        &self,
+        raw_labels: &LabelSet,
+        group_labels: &LabelSet,
+    ) -> Result<Option<ScrapeTarget>, ScrapeError> {
+        let populate_cfg = TargetPopulateConfig {
+            job_name: self.job_name.clone(),
+            scrape_interval: format_prometheus_duration(self.scrape_interval),
+            scrape_timeout: format_prometheus_duration(self.scrape_timeout),
+            ..TargetPopulateConfig::default()
+        };
+        let Some(populated) = populate_labels(
+            raw_labels,
+            group_labels,
+            &populate_cfg,
+            &self.relabel_configs,
+        )
+        .map_err(|err| ScrapeError::InvalidConfig(err.to_string()))?
+        else {
+            return Ok(None);
+        };
+        ScrapeTarget::from_populated(&populated).map(Some)
+    }
+
+    pub(crate) fn normalize_relabel_configs(&mut self) -> Result<(), ScrapeError> {
+        for (idx, cfg) in self.relabel_configs.iter_mut().enumerate() {
+            cfg.validate(ValidationScheme::Utf8).map_err(|err| {
+                ScrapeError::InvalidConfig(format!("relabel_configs[{idx}]: {err}"))
+            })?;
+        }
+        for (idx, cfg) in self.metric_relabel_configs.iter_mut().enumerate() {
+            cfg.validate(ValidationScheme::Utf8).map_err(|err| {
+                ScrapeError::InvalidConfig(format!("metric_relabel_configs[{idx}]: {err}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Validates interval, timeout, pool, and relabel rule invariants.
     ///
     /// # Errors
     ///
     /// Returns [`ScrapeError::InvalidConfig`] if `job_name` is empty, `scrape_interval` or
-    /// `scrape_timeout` is zero, `scrape_timeout > scrape_interval`, or a concurrent pool size
-    /// exceeds `max_in_flight`.
+    /// `scrape_timeout` is zero, `scrape_timeout > scrape_interval`, a concurrent pool size
+    /// exceeds `max_in_flight`, or any relabel rule is invalid.
     pub fn validate(&self) -> Result<(), ScrapeError> {
         if self.job_name.trim().is_empty() {
             return Err(ScrapeError::InvalidConfig(
@@ -454,6 +599,18 @@ impl ScrapeConfig {
                 )));
             }
         }
+        for (idx, cfg) in self.relabel_configs.iter().enumerate() {
+            let mut copy = cfg.clone();
+            copy.validate(ValidationScheme::Utf8).map_err(|err| {
+                ScrapeError::InvalidConfig(format!("relabel_configs[{idx}]: {err}"))
+            })?;
+        }
+        for (idx, cfg) in self.metric_relabel_configs.iter().enumerate() {
+            let mut copy = cfg.clone();
+            copy.validate(ValidationScheme::Utf8).map_err(|err| {
+                ScrapeError::InvalidConfig(format!("metric_relabel_configs[{idx}]: {err}"))
+            })?;
+        }
         Ok(())
     }
 
@@ -465,5 +622,23 @@ impl ScrapeConfig {
         } else {
             self.max_body_bytes
         }
+    }
+}
+
+/// Formats `duration` using Prometheus duration units (`s`, `ms`) accepted by
+/// `prometheus_relabel::populate_labels`, clamping sub-millisecond positive values up to `1ms`.
+pub(crate) fn format_prometheus_duration(duration: Duration) -> String {
+    if duration.is_zero() {
+        return "0".to_owned();
+    }
+    let total_ms = duration.as_millis().max(1);
+    let secs = total_ms / 1_000;
+    let rem_ms = total_ms % 1_000;
+    if secs > 0 && rem_ms == 0 {
+        format!("{secs}s")
+    } else if secs > 0 {
+        format!("{secs}s{rem_ms}ms")
+    } else {
+        format!("{rem_ms}ms")
     }
 }

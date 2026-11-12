@@ -11,9 +11,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "arrow")]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::Arc;
+#[cfg(feature = "arrow")]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 #[cfg(feature = "arrow")]
@@ -22,19 +27,21 @@ use std::time::Instant as StdInstant;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 #[cfg(feature = "arrow")]
-use prometheus_expfmt::arrow::{DecodeBudget, DecodeStep, OtapMetricRecords};
+use prometheus_expfmt::arrow::{DecodeBudget, DecodeStep, OtapMetricRecords, StalenessTracker};
+#[cfg(feature = "arrow")]
+use prometheus_expfmt::format::Format;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 
 #[cfg(feature = "arrow")]
-use crate::scrape::DecoderPool;
-#[cfg(feature = "arrow")]
 use crate::scrape::http::current_timestamp_ms;
-use crate::scrape::schedule::TargetSchedule;
+use crate::scrape::schedule::{TargetKey, TargetSchedule};
 use crate::scrape::{
     BodyBufferPool, FetchedScrape, ReqwestFetcher, SchedulingMode, ScrapeConfig, ScrapeError,
     ScrapeTarget, SequentialSchedule, TargetFetcher,
 };
+#[cfg(feature = "arrow")]
+use crate::scrape::{DecoderPool, apply_metric_relabel};
 
 /// Control-plane messages accepted by a running [`ScrapeManager`].
 #[derive(Clone, Debug)]
@@ -187,7 +194,28 @@ pub struct ScrapeManager<F = ReqwestFetcher> {
     body_pool: BodyBufferPool,
     #[cfg(feature = "arrow")]
     decoder_pool: DecoderPool,
+    #[cfg(feature = "arrow")]
+    staleness_trackers: Mutex<HashMap<TargetKey, StalenessTracker>>,
     counters: AtomicCounters,
+}
+
+#[cfg(feature = "arrow")]
+struct TrackerLease<'a> {
+    map: &'a Mutex<HashMap<TargetKey, StalenessTracker>>,
+    key: Option<TargetKey>,
+    tracker: StalenessTracker,
+}
+
+#[cfg(feature = "arrow")]
+impl Drop for TrackerLease<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            let tracker = std::mem::take(&mut self.tracker);
+            if let Ok(mut guard) = self.map.lock() {
+                guard.insert(key, tracker);
+            }
+        }
+    }
 }
 
 impl ScrapeManager<ReqwestFetcher> {
@@ -215,8 +243,9 @@ impl<F> ScrapeManager<F> {
     /// # Errors
     ///
     /// Returns [`ScrapeError::InvalidConfig`] if `config` fails validation.
-    pub fn new(config: ScrapeConfig, fetcher: F) -> Result<Self, ScrapeError> {
+    pub fn new(mut config: ScrapeConfig, fetcher: F) -> Result<Self, ScrapeError> {
         config.validate()?;
+        config.normalize_relabel_configs()?;
         let body_pool = BodyBufferPool::new(
             config.scheduling.max_buffered_bodies(),
             config.max_retained_body_bytes,
@@ -229,6 +258,8 @@ impl<F> ScrapeManager<F> {
             body_pool,
             #[cfg(feature = "arrow")]
             decoder_pool,
+            #[cfg(feature = "arrow")]
+            staleness_trackers: Mutex::new(HashMap::new()),
             counters: AtomicCounters::default(),
         })
     }
@@ -302,10 +333,15 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         ctrl_rx: mpsc::UnboundedReceiver<ScrapeCommand>,
         sink: &S,
     ) {
-        self.run_loop(initial_targets, ctrl_rx, |target| async move {
-            let res = self.scrape_once_raw(&target).await;
-            sink.on_raw_scrape(&target, res).await
-        })
+        self.run_loop(
+            initial_targets,
+            ctrl_rx,
+            |target| async move {
+                let res = self.scrape_once_raw(&target).await;
+                sink.on_raw_scrape(&target, res).await
+            },
+            |_| async { ControlFlow::Continue(()) },
+        )
         .await;
     }
 
@@ -323,10 +359,34 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         let fetched = match self.fetcher.fetch(target, &self.body_pool).await {
             Ok(ok) => ok,
             Err(err) => {
+                let scrape_timestamp_ms = current_timestamp_ms();
+                if self.config.track_staleness
+                    && let Some(mut lease) = self.lease_non_empty_tracker(target)
+                {
+                    match self
+                        .decode_bytes_cooperatively(
+                            target,
+                            b"",
+                            &Format::TEXT,
+                            scrape_timestamp_ms,
+                            Some(&mut lease.tracker),
+                            sink,
+                        )
+                        .await
+                    {
+                        ControlFlow::Break(()) => return ControlFlow::Break(()),
+                        ControlFlow::Continue(Ok((pts, _))) => {
+                            self.counters
+                                .points_decoded
+                                .fetch_add(pts, Ordering::Relaxed);
+                        }
+                        ControlFlow::Continue(Err(_)) => {}
+                    }
+                }
                 self.counters.failed.fetch_add(1, Ordering::Relaxed);
                 let report = ScrapeReport {
                     up: false,
-                    scrape_timestamp_ms: current_timestamp_ms(),
+                    scrape_timestamp_ms,
                     duration: started.elapsed(),
                     wire_bytes: 0,
                     uncompressed_bytes: 0,
@@ -349,10 +409,22 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         let uncompressed_bytes = fetched.uncompressed_bytes();
         let scrape_timestamp_ms = fetched.scrape_timestamp_ms;
 
+        let mut tracker_lease = self
+            .config
+            .track_staleness
+            .then(|| self.lease_tracker(target));
         let decode_outcome = self
-            .decode_fetched_cooperatively(target, &fetched, sink)
+            .decode_bytes_cooperatively(
+                target,
+                fetched.body.as_slice(),
+                &fetched.format,
+                scrape_timestamp_ms,
+                tracker_lease.as_mut().map(|l| &mut l.tracker),
+                sink,
+            )
             .await;
 
+        drop(tracker_lease);
         // Explicitly drop `fetched` right after decoding so its `Vec<u8>` returns to
         // `self.body_pool` before `on_scrape_complete` awaits downstream work.
         drop(fetched);
@@ -433,20 +505,107 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         ctrl_rx: mpsc::UnboundedReceiver<ScrapeCommand>,
         sink: &S,
     ) {
-        self.run_loop(initial_targets, ctrl_rx, |target| async move {
-            match self.scrape_once_arrow(&target, sink).await {
-                ControlFlow::Continue(_) => ControlFlow::Continue(()),
-                ControlFlow::Break(()) => ControlFlow::Break(()),
-            }
-        })
+        self.run_loop(
+            initial_targets,
+            ctrl_rx,
+            |target| async move {
+                match self.scrape_once_arrow(&target, sink).await {
+                    ControlFlow::Continue(_) => ControlFlow::Continue(()),
+                    ControlFlow::Break(()) => ControlFlow::Break(()),
+                }
+            },
+            |removed| self.evict_removed_target(removed, sink),
+        )
         .await;
     }
 
     #[cfg(feature = "arrow")]
-    async fn decode_fetched_cooperatively<S: ArrowScrapeSink>(
+    fn lease_tracker(&self, target: &ScrapeTarget) -> TrackerLease<'_> {
+        let key = TargetKey::from_target(target);
+        let tracker = self
+            .staleness_trackers
+            .lock()
+            .expect("staleness_trackers mutex poisoned")
+            .remove(&key)
+            .unwrap_or_default();
+        TrackerLease {
+            map: &self.staleness_trackers,
+            key: Some(key),
+            tracker,
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    fn lease_non_empty_tracker(&self, target: &ScrapeTarget) -> Option<TrackerLease<'_>> {
+        let key = TargetKey::from_target(target);
+        let mut guard = self
+            .staleness_trackers
+            .lock()
+            .expect("staleness_trackers mutex poisoned");
+        let is_non_empty = guard.get(&key).is_some_and(|t| !t.is_empty());
+        if !is_non_empty {
+            return None;
+        }
+        let tracker = guard.remove(&key).unwrap_or_default();
+        drop(guard);
+        Some(TrackerLease {
+            map: &self.staleness_trackers,
+            key: Some(key),
+            tracker,
+        })
+    }
+
+    #[cfg(feature = "arrow")]
+    async fn evict_removed_target<S: ArrowScrapeSink>(
+        &self,
+        target: Arc<ScrapeTarget>,
+        sink: &S,
+    ) -> ControlFlow<()> {
+        if !self.config.track_staleness {
+            return ControlFlow::Continue(());
+        }
+        let key = TargetKey::from_target(&target);
+        let removed_tracker = self
+            .staleness_trackers
+            .lock()
+            .expect("staleness_trackers mutex poisoned")
+            .remove(&key);
+        let Some(mut tracker) = removed_tracker else {
+            return ControlFlow::Continue(());
+        };
+        if tracker.is_empty() {
+            return ControlFlow::Continue(());
+        }
+        match self
+            .decode_bytes_cooperatively(
+                &target,
+                b"",
+                &Format::TEXT,
+                current_timestamp_ms(),
+                Some(&mut tracker),
+                sink,
+            )
+            .await
+        {
+            ControlFlow::Break(()) => ControlFlow::Break(()),
+            ControlFlow::Continue(Ok((pts, _))) => {
+                self.counters
+                    .points_decoded
+                    .fetch_add(pts, Ordering::Relaxed);
+                ControlFlow::Continue(())
+            }
+            ControlFlow::Continue(Err(_)) => ControlFlow::Continue(()),
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    async fn decode_bytes_cooperatively<S: ArrowScrapeSink>(
         &self,
         target: &ScrapeTarget,
-        fetched: &FetchedScrape,
+        body: &[u8],
+        format: &Format,
+        scrape_timestamp_ms: i64,
+        tracker: Option<&mut StalenessTracker>,
         sink: &S,
     ) -> ControlFlow<(), Result<(u64, usize), ScrapeError>> {
         let mut decoder = self.decoder_pool.acquire().await;
@@ -463,7 +622,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         let decode_opts = self
             .config
             .decode_options
-            .with_timestamp_ms(fetched.scrape_timestamp_ms)
+            .with_timestamp_ms(scrape_timestamp_ms)
             .with_max_data_points_per_batch(chunk_limit);
 
         let base_budget = self.config.decode_budget;
@@ -471,8 +630,10 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         let max_bytes = base_budget.max_bytes.max(1);
         let max_duration = base_budget.max_duration;
 
-        let body = fetched.body.as_slice();
-        let mut stream = decoder.decode_stream(body, &fetched.format, &decode_opts);
+        let mut stream = match tracker {
+            Some(tr) => decoder.decode_stream_with_staleness(body, format, &decode_opts, tr),
+            None => decoder.decode_stream(body, format, &decode_opts),
+        };
         let mut decoded_points = 0_u64;
         let mut batches_emitted = 0_usize;
         let mut slice_start_pos = 0_usize;
@@ -499,7 +660,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                 )
             };
 
-            let records = match stream.step(step_budget) {
+            let raw_records = match stream.step(step_budget) {
                 Ok(DecodeStep::Pending) => {
                     tokio::task::yield_now().await;
                     slice_start_pos = stream.pos();
@@ -512,14 +673,26 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                 Err(err) => return ControlFlow::Continue(Err(ScrapeError::Decode(err))),
             };
 
+            let raw_pts = raw_records.num_data_points();
+            slice_entries = slice_entries.saturating_add(raw_pts.max(1));
+
+            let records = match apply_metric_relabel(
+                raw_records,
+                target.labels(),
+                self.config.honor_labels,
+                &self.config.metric_relabel_configs,
+            ) {
+                Ok(relabeled) => relabeled,
+                Err(err) => return ControlFlow::Continue(Err(ScrapeError::Decode(err))),
+            };
+
             let pts = records.num_data_points();
             decoded_points = decoded_points.saturating_add(pts as u64);
-            slice_entries = slice_entries.saturating_add(pts.max(1));
 
             if !records.is_empty() {
                 batches_emitted += 1;
                 if sink
-                    .on_batch(target, fetched.scrape_timestamp_ms, records)
+                    .on_batch(target, scrape_timestamp_ms, records)
                     .await
                     .is_break()
                 {
@@ -587,43 +760,60 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         }
     }
 
-    async fn run_loop<Exec, Fut>(
+    async fn run_loop<Exec, Fut, OnRem, RemFut>(
         &self,
         initial_targets: Vec<ScrapeTarget>,
         ctrl_rx: mpsc::UnboundedReceiver<ScrapeCommand>,
         exec_one: Exec,
+        on_target_removed: OnRem,
     ) where
         Exec: Fn(Arc<ScrapeTarget>) -> Fut,
         Fut: Future<Output = ControlFlow<()>>,
+        OnRem: Fn(Arc<ScrapeTarget>) -> RemFut,
+        RemFut: Future<Output = ControlFlow<()>>,
     {
         match self.config.scheduling {
             SchedulingMode::Sequential {
                 schedule: SequentialSchedule::CycleTick,
             } => {
-                self.run_sequential_cycle_tick(initial_targets, ctrl_rx, exec_one)
-                    .await;
+                self.run_sequential_cycle_tick(
+                    initial_targets,
+                    ctrl_rx,
+                    exec_one,
+                    on_target_removed,
+                )
+                .await;
             }
             SchedulingMode::Sequential {
                 schedule: SequentialSchedule::Jittered,
             } => {
-                self.run_jittered(initial_targets, ctrl_rx, 1, exec_one)
+                self.run_jittered(initial_targets, ctrl_rx, 1, exec_one, on_target_removed)
                     .await;
             }
             SchedulingMode::Concurrent { max_in_flight, .. } => {
-                self.run_jittered(initial_targets, ctrl_rx, max_in_flight.get(), exec_one)
-                    .await;
+                self.run_jittered(
+                    initial_targets,
+                    ctrl_rx,
+                    max_in_flight.get(),
+                    exec_one,
+                    on_target_removed,
+                )
+                .await;
             }
         }
     }
 
-    async fn run_sequential_cycle_tick<Exec, Fut>(
+    async fn run_sequential_cycle_tick<Exec, Fut, OnRem, RemFut>(
         &self,
         initial_targets: Vec<ScrapeTarget>,
         mut ctrl_rx: mpsc::UnboundedReceiver<ScrapeCommand>,
         exec_one: Exec,
+        on_target_removed: OnRem,
     ) where
         Exec: Fn(Arc<ScrapeTarget>) -> Fut,
         Fut: Future<Output = ControlFlow<()>>,
+        OnRem: Fn(Arc<ScrapeTarget>) -> RemFut,
+        RemFut: Future<Output = ControlFlow<()>>,
     {
         let mut targets: Vec<Arc<ScrapeTarget>> =
             initial_targets.into_iter().map(Arc::new).collect();
@@ -638,7 +828,13 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                 cmd = ctrl_rx.recv() => {
                     match cmd {
                         Some(ScrapeCommand::UpdateTargets(new_targets)) => {
+                            let removed = diff_removed_targets(&targets, &new_targets);
                             targets = new_targets.into_iter().map(Arc::new).collect();
+                            for rem in removed {
+                                if on_target_removed(rem).await.is_break() {
+                                    return;
+                                }
+                            }
                         }
                         Some(ScrapeCommand::Shutdown) | None => return,
                     }
@@ -660,14 +856,17 @@ impl<F: TargetFetcher> ScrapeManager<F> {
 
                     let snapshot = targets.clone();
                     for target in snapshot {
+                        let mut pending_removed = Vec::new();
+                        let mut updated = false;
                         tokio::select! {
                             biased;
 
                             cmd = ctrl_rx.recv() => {
                                 match cmd {
                                     Some(ScrapeCommand::UpdateTargets(new_targets)) => {
+                                        pending_removed = diff_removed_targets(&targets, &new_targets);
                                         targets = new_targets.into_iter().map(Arc::new).collect();
-                                        break;
+                                        updated = true;
                                     }
                                     Some(ScrapeCommand::Shutdown) | None => return,
                                 }
@@ -678,6 +877,14 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                                     return;
                                 }
                             }
+                        }
+                        if updated {
+                            for rem in pending_removed {
+                                if on_target_removed(rem).await.is_break() {
+                                    return;
+                                }
+                            }
+                            break;
                         }
                         tokio::task::yield_now().await;
                     }
@@ -701,20 +908,23 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         }
     }
 
-    async fn run_jittered<Exec, Fut>(
+    async fn run_jittered<Exec, Fut, OnRem, RemFut>(
         &self,
         initial_targets: Vec<ScrapeTarget>,
         mut ctrl_rx: mpsc::UnboundedReceiver<ScrapeCommand>,
         max_in_flight: usize,
         exec_one: Exec,
+        on_target_removed: OnRem,
     ) where
         Exec: Fn(Arc<ScrapeTarget>) -> Fut,
         Fut: Future<Output = ControlFlow<()>>,
+        OnRem: Fn(Arc<ScrapeTarget>) -> RemFut,
+        RemFut: Future<Output = ControlFlow<()>>,
     {
         let start_base = Instant::now() + self.config.initial_delay;
         let mut schedule =
             TargetSchedule::new(self.config.scrape_interval, self.config.jitter_seed);
-        schedule.sync_targets(initial_targets, start_base);
+        let _ = schedule.sync_targets(initial_targets, start_base);
 
         let mut in_flight = FuturesUnordered::new();
 
@@ -748,15 +958,25 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                 cmd = ctrl_rx.recv() => {
                     match cmd {
                         Some(ScrapeCommand::UpdateTargets(new_targets)) => {
-                            schedule.sync_targets(new_targets, Instant::now());
+                            let removed_idle = schedule.sync_targets(new_targets, Instant::now());
+                            for rem in removed_idle {
+                                if on_target_removed(rem).await.is_break() {
+                                    return;
+                                }
+                            }
                         }
                         Some(ScrapeCommand::Shutdown) | None => return,
                     }
                 }
 
                 Some((slot_id, generation, out)) = in_flight.next(), if !in_flight.is_empty() => {
-                    schedule.complete(slot_id, generation);
+                    let removed_after = schedule.complete(slot_id, generation);
                     if out.is_break() {
+                        return;
+                    }
+                    if let Some(rem) = removed_after
+                        && on_target_removed(rem).await.is_break()
+                    {
                         return;
                     }
                 }
@@ -770,4 +990,20 @@ impl<F: TargetFetcher> ScrapeManager<F> {
             }
         }
     }
+}
+
+fn diff_removed_targets(
+    old_targets: &[Arc<ScrapeTarget>],
+    new_targets: &[ScrapeTarget],
+) -> Vec<Arc<ScrapeTarget>> {
+    let new_keys: HashSet<TargetKey> = new_targets.iter().map(TargetKey::from_target).collect();
+    let mut seen_removed = HashSet::new();
+    let mut out = Vec::new();
+    for old in old_targets {
+        let key = TargetKey::from_target(old);
+        if !new_keys.contains(&key) && seen_removed.insert(key) {
+            out.push(Arc::clone(old));
+        }
+    }
+    out
 }

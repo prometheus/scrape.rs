@@ -30,11 +30,11 @@ prost-build = "=0.14.4"
 prost-types = { version = "0.14" }
 protox = "0.10"
 regex = { version = "1" }
-reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls-no-provider"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", default-features = false, features = ["io-util", "net", "rt", "sync", "time"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"

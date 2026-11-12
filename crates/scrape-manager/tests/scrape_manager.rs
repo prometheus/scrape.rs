@@ -405,3 +405,244 @@ fn non_send_local_set_compatibility_for_thread_per_core_runtimes() {
         assert!(stats.total_body_buffers_created <= 2);
     });
 }
+
+#[cfg(feature = "arrow")]
+#[tokio::test(start_paused = true)]
+async fn staleness_and_relabeling_lifecycle_across_disappearance_failure_and_target_removal() {
+    use arrow_array::UInt32Array;
+    use prometheus_expfmt::arrow::{DATA_POINT_FLAG_NO_RECORDED_VALUE, OtapMetricRecords};
+    use prometheus_relabel::{Action, Config as RelabelConfig, LabelSet, Regexp};
+    use prometheus_scrape_manager::scrape::{ArrowScrapeSink, ScrapeReport};
+
+    struct SequenceFetcher {
+        steps: Mutex<Vec<Result<&'static [u8], u16>>>,
+        ts_ms: AtomicI64,
+    }
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    impl TargetFetcher for SequenceFetcher {
+        async fn fetch(
+            &self,
+            _target: &ScrapeTarget,
+            pool: &BodyBufferPool,
+        ) -> Result<FetchedScrape, ScrapeError> {
+            let next = self.steps.lock().expect("lock").remove(0);
+            let ts = self.ts_ms.fetch_add(15_000, Ordering::Relaxed);
+            match next {
+                Ok(bytes) => {
+                    let mut body = pool.acquire(bytes.len()).await;
+                    body.extend_from_slice(bytes);
+                    Ok(FetchedScrape {
+                        body,
+                        format: Format::TEXT,
+                        scrape_timestamp_ms: ts,
+                        fetch_duration: Duration::from_millis(1),
+                        wire_bytes: bytes.len(),
+                    })
+                }
+                Err(status) => Err(ScrapeError::UnexpectedStatus { status }),
+            }
+        }
+    }
+
+    struct BatchRecorder {
+        batches: Mutex<Vec<OtapMetricRecords>>,
+        reports: Mutex<Vec<ScrapeReport>>,
+    }
+
+    impl ArrowScrapeSink for BatchRecorder {
+        async fn on_batch(
+            &self,
+            _target: &ScrapeTarget,
+            _ts_ms: i64,
+            records: OtapMetricRecords,
+        ) -> ControlFlow<()> {
+            self.batches.lock().expect("lock").push(records);
+            ControlFlow::Continue(())
+        }
+
+        async fn on_scrape_complete(
+            &self,
+            _target: &ScrapeTarget,
+            report: ScrapeReport,
+        ) -> ControlFlow<()> {
+            self.reports.lock().expect("lock").push(report);
+            ControlFlow::Continue(())
+        }
+    }
+
+    let target_relabel = vec![
+        RelabelConfig {
+            source_labels: vec!["__address__".to_owned()],
+            regex: Regexp::must_new("([^:]+):.*"),
+            target_label: "server.address".to_owned(),
+            replacement: "$1".to_owned(),
+            action: Action::Replace,
+            ..RelabelConfig::default()
+        },
+        RelabelConfig {
+            target_label: "k8s.cluster.name".to_owned(),
+            replacement: "bench-cluster".to_owned(),
+            action: Action::Replace,
+            ..RelabelConfig::default()
+        },
+    ];
+    let metric_relabel = vec![
+        RelabelConfig {
+            source_labels: vec!["instance".to_owned()],
+            target_label: "exported_instance".to_owned(),
+            replacement: "$1".to_owned(),
+            action: Action::Replace,
+            ..RelabelConfig::default()
+        },
+        RelabelConfig {
+            target_label: "container".to_owned(),
+            replacement: "avalanche".to_owned(),
+            action: Action::Replace,
+            ..RelabelConfig::default()
+        },
+    ];
+
+    let cfg = ScrapeConfig::new("avalanche")
+        .with_scrape_interval(Duration::from_secs(15))
+        .with_scrape_timeout(Duration::from_secs(5))
+        .with_scheduling(SchedulingMode::sequential())
+        .with_track_staleness(true)
+        .with_relabel_configs(target_relabel)
+        .with_metric_relabel_configs(metric_relabel);
+
+    let raw = LabelSet::from([("__address__".to_owned(), "10.0.0.9:9001".to_owned())]);
+    let target = cfg
+        .populate_target(&raw, &LabelSet::new())
+        .expect("populate ok")
+        .expect("target kept");
+    assert_eq!(target.url().as_str(), "http://10.0.0.9:9001/metrics");
+    assert_eq!(
+        target.labels().get("server.address").map(String::as_str),
+        Some("10.0.0.9")
+    );
+    assert_eq!(
+        target.labels().get("k8s.cluster.name").map(String::as_str),
+        Some("bench-cluster")
+    );
+
+    let fetcher = SequenceFetcher {
+        steps: Mutex::new(vec![
+            Ok(b"# TYPE req_total counter\nreq_total{route=\"/a\"} 1\nreq_total{route=\"/b\"} 2\n"),
+            Ok(b"# TYPE req_total counter\nreq_total{route=\"/a\"} 3\n"),
+            Err(500),
+            Err(500),
+            Ok(b"# TYPE bare_gauge gauge\nbare_gauge 42\n"),
+        ]),
+        ts_ms: AtomicI64::new(1_700_000_000_000),
+    };
+
+    let manager = ScrapeManager::new(cfg, fetcher).expect("manager");
+    let sink = BatchRecorder {
+        batches: Mutex::new(Vec::new()),
+        reports: Mutex::new(Vec::new()),
+    };
+
+    // Scrape 1: 2 live series, each gets route + exported_instance + container (3 attrs * 2 = 6 rows).
+    let _ = manager.scrape_once_arrow(&target, &sink).await;
+    {
+        let mut b = sink.batches.lock().expect("lock");
+        assert_eq!(b.len(), 1);
+        let rec = b.pop().unwrap();
+        assert_eq!(rec.num_data_points(), 2);
+        assert_eq!(rec.number_dp_attrs().unwrap().num_rows(), 6);
+        assert!(
+            rec.number_data_points()
+                .unwrap()
+                .column_by_name("flags")
+                .is_none()
+        );
+    }
+
+    // Scrape 2: `/b` disappeared -> 1 live + 1 stale (`flags = 1`), both relabeled (6 attr rows).
+    let _ = manager.scrape_once_arrow(&target, &sink).await;
+    {
+        let mut b = sink.batches.lock().expect("lock");
+        assert_eq!(b.len(), 1);
+        let rec = b.pop().unwrap();
+        assert_eq!(rec.num_data_points(), 2);
+        assert_eq!(rec.number_dp_attrs().unwrap().num_rows(), 6);
+        let flags = rec
+            .number_data_points()
+            .unwrap()
+            .column_by_name("flags")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(
+            flags.values().as_ref(),
+            &[0, DATA_POINT_FLAG_NO_RECORDED_VALUE]
+        );
+    }
+
+    // Scrape 3: HTTP 500 -> remaining `/a` series flushed stale with relabeled attributes!
+    let _ = manager.scrape_once_arrow(&target, &sink).await;
+    {
+        let mut b = sink.batches.lock().expect("lock");
+        assert_eq!(b.len(), 1);
+        let rec = b.pop().unwrap();
+        assert_eq!(rec.num_data_points(), 1);
+        assert_eq!(rec.number_dp_attrs().unwrap().num_rows(), 3);
+        let flags = rec
+            .number_data_points()
+            .unwrap()
+            .column_by_name("flags")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(
+            flags.values().as_ref(),
+            &[DATA_POINT_FLAG_NO_RECORDED_VALUE]
+        );
+    }
+
+    // Scrape 4: second consecutive HTTP 500 -> tracker already empty, zero duplicate stale batches.
+    let _ = manager.scrape_once_arrow(&target, &sink).await;
+    assert!(sink.batches.lock().expect("lock").is_empty());
+
+    // Scrape 5 via `run_arrow` + target removal via `UpdateTargets(vec![])` -> flushes `bare_gauge` stale!
+    let (ctrl, ctrl_rx) = ScrapeManager::control_channel();
+    let driver = async {
+        // Let initial tick at t=0 scrape `bare_gauge`.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(ctrl.update_targets(Vec::new()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = ctrl.shutdown();
+    };
+    tokio::join!(manager.run_arrow(vec![target], ctrl_rx, &sink), driver);
+
+    let batches = sink.batches.lock().expect("lock");
+    assert_eq!(
+        batches.len(),
+        2,
+        "expected 1 live batch for bare_gauge + 1 stale flush batch on target removal"
+    );
+    // Label-less `bare_gauge` gained `id` column and 2 synthesized `DpAttrs` (`exported_instance`, `container`).
+    assert!(
+        batches[0]
+            .number_data_points()
+            .unwrap()
+            .column_by_name("id")
+            .is_some()
+    );
+    assert_eq!(batches[0].number_dp_attrs().unwrap().num_rows(), 2);
+    let rem_flags = batches[1]
+        .number_data_points()
+        .unwrap()
+        .column_by_name("flags")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
+    assert_eq!(
+        rem_flags.values().as_ref(),
+        &[DATA_POINT_FLAG_NO_RECORDED_VALUE]
+    );
+}

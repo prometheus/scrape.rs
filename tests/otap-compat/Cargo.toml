@@ -19,6 +19,8 @@ publish = false
 dhat = "0.3"
 otel-arrow-dfe-pdata = { version = "0.62", features = ["testing"] }
 prometheus-expfmt = { path = "../../crates/expfmt", default-features = false, features = ["arrow"] }
+prometheus-relabel = { path = "../../crates/relabel" }
+prometheus-scrape-manager = { path = "../../crates/scrape-manager", default-features = false, features = ["arrow"] }
 tokio = { version = "1.48", default-features = false, features = ["macros", "rt", "sync", "time"] }
 
 [lints.rust]
