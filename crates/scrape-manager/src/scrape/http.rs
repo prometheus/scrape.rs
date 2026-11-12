@@ -35,8 +35,8 @@ pub enum ScrapeError {
     /// Transport or request construction failure from `reqwest`.
     #[error("HTTP scrape request failed: {0}")]
     Http(#[from] reqwest::Error),
-    /// Target returned a non-2xx HTTP status code.
-    #[error("target returned non-2xx HTTP status {status}")]
+    /// Target returned a non-200 HTTP status code.
+    #[error("target returned non-200 HTTP status {status}")]
     UnexpectedStatus {
         /// HTTP status code returned by the target.
         status: u16,
@@ -248,7 +248,7 @@ impl TargetFetcher for ReqwestFetcher {
             .map_err(|_| ScrapeError::TimedOut { timeout })??;
 
         let status = response.status();
-        if !status.is_success() {
+        if status != reqwest::StatusCode::OK {
             return Err(ScrapeError::UnexpectedStatus {
                 status: status.as_u16(),
             });
