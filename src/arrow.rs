@@ -833,21 +833,6 @@ impl ArrowDecoder {
         Ok(batches)
     }
 
-    /// Alias for [`ArrowDecoder::flush_target_stale`]: emits stale data points for all currently
-    /// active series in `tracker` and deactivates them.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DecodeError`] under the same conditions as [`ArrowDecoder::flush_target_stale`].
-    #[inline]
-    pub fn encode_stale_target(
-        &mut self,
-        tracker: &mut StalenessTracker,
-        opts: &DecodeOptions,
-    ) -> Result<OtapMetricRecords, DecodeError> {
-        self.flush_target_stale(tracker, opts)
-    }
-
     fn decode_stream_inner<'dec, 'input>(
         &'dec mut self,
         input: &'input [u8],
