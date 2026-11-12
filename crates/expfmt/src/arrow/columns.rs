@@ -546,15 +546,33 @@ impl SparseFlagsCol {
         self.values.is_empty()
     }
 
+    #[inline(always)]
+    pub(super) fn push_zero(&mut self) {
+        if !self.values.is_empty() {
+            self.push_zero_slow();
+        }
+    }
+
+    #[cold]
+    fn push_zero_slow(&mut self) {
+        self.values.push(0);
+    }
+
+    #[cold]
+    pub(super) fn push_nonzero(&mut self, row_index: usize, flags: u32) {
+        debug_assert_ne!(flags, 0);
+        if row_index > 0 && self.values.is_empty() {
+            self.values.resize(row_index, 0);
+        }
+        self.values.push(flags);
+    }
+
     #[inline]
     pub(super) fn push(&mut self, row_index: usize, flags: u32) {
-        if flags != 0 {
-            if row_index > 0 && self.values.is_empty() {
-                self.values.resize(row_index, 0);
-            }
-            self.values.push(flags);
-        } else if !self.values.is_empty() {
-            self.values.push(0);
+        if flags == 0 {
+            self.push_zero();
+        } else {
+            self.push_nonzero(row_index, flags);
         }
     }
 
@@ -612,6 +630,15 @@ impl DpBaseCols {
     #[inline]
     pub(super) fn has_flags(&self) -> bool {
         !self.flags.is_empty()
+    }
+
+    #[inline]
+    pub(super) fn push(&mut self, parent_id: u16, start_ts_ns: Option<i64>, ts_ns: Option<i64>) {
+        let dp_index = self.parent_ids.len();
+        self.parent_ids.push(parent_id);
+        self.start_time.push(dp_index, start_ts_ns);
+        self.time.push(dp_index, ts_ns);
+        self.flags.push_zero();
     }
 
     #[inline]
@@ -710,22 +737,33 @@ impl<T: Copy + Default> OptionalValueCol<T> {
         !self.valid.is_empty()
     }
 
+    #[inline(always)]
+    pub(super) fn push_value(&mut self, val: T) {
+        self.values.push(val);
+        if !self.valid.is_empty() {
+            self.push_valid_slow();
+        }
+    }
+
+    #[cold]
+    fn push_valid_slow(&mut self) {
+        self.valid.push(true);
+    }
+
+    #[cold]
+    pub(super) fn push_null(&mut self, row_index: usize) {
+        if self.valid.is_empty() {
+            self.valid.resize(row_index, true);
+        }
+        self.values.push(T::default());
+        self.valid.push(false);
+    }
+
     #[inline]
     pub(super) fn push(&mut self, row_index: usize, val: Option<T>) {
         match val {
-            Some(v) => {
-                self.values.push(v);
-                if !self.valid.is_empty() {
-                    self.valid.push(true);
-                }
-            }
-            None => {
-                if self.valid.is_empty() {
-                    self.valid.resize(row_index, true);
-                }
-                self.values.push(T::default());
-                self.valid.push(false);
-            }
+            Some(v) => self.push_value(v),
+            None => self.push_null(row_index),
         }
     }
 

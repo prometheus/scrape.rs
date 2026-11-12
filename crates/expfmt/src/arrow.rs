@@ -421,7 +421,7 @@ impl ArrowDecoder {
         let mut pending_series = false;
         let mut done = false;
         let mut tracker = None;
-        let res = self.ingest_entries::<false, false>(
+        let res = self.ingest_entries::<false, false, false>(
             &mut parser,
             opts,
             default_ts_ns,
@@ -548,7 +548,7 @@ impl ArrowDecoder {
         budget: DecodeBudget,
     ) -> Result<DecodeStep, DecodeError> {
         let mut tracker = None;
-        self.step_cursor::<true>(cursor, input, Some(budget), &mut tracker)
+        self.step_cursor::<true, false>(cursor, input, Some(budget), &mut tracker)
     }
 
     /// Advances `cursor` over `input` by at most `budget` entries, bytes, or duration while
@@ -570,10 +570,10 @@ impl ArrowDecoder {
         tracker: &mut StalenessTracker,
     ) -> Result<DecodeStep, DecodeError> {
         let mut tracker_opt = Some(tracker);
-        self.step_cursor::<true>(cursor, input, Some(budget), &mut tracker_opt)
+        self.step_cursor::<true, true>(cursor, input, Some(budget), &mut tracker_opt)
     }
 
-    fn step_cursor<const BUDGETED: bool>(
+    fn step_cursor<const BUDGETED: bool, const TRACKED: bool>(
         &mut self,
         cursor: &mut DecodeCursor,
         input: &[u8],
@@ -592,7 +592,8 @@ impl ArrowDecoder {
         }
         let expected_len = *cursor.input_len.get_or_insert(input.len());
         if input.len() != expected_len {
-            if cursor.tracker_started
+            if TRACKED
+                && cursor.tracker_started
                 && let Some(tr) = tracker.as_deref_mut()
             {
                 tr.abort_scrape();
@@ -602,7 +603,8 @@ impl ArrowDecoder {
                 "scrape input buffer length changed across decode steps",
             ));
         }
-        if !cursor.tracker_started
+        if TRACKED
+            && !cursor.tracker_started
             && let Some(tr) = tracker.as_deref_mut()
         {
             tr.begin_scrape();
@@ -611,7 +613,7 @@ impl ArrowDecoder {
         let state = std::mem::replace(&mut cursor.parser_state, ActiveParserState::Invalid);
         let mut parser = state.into_parser(input);
         let res = if cursor.chunked {
-            self.ingest_entries::<true, BUDGETED>(
+            self.ingest_entries::<true, BUDGETED, TRACKED>(
                 &mut parser,
                 &cursor.opts,
                 cursor.default_ts_ns,
@@ -622,7 +624,7 @@ impl ArrowDecoder {
                 tracker,
             )
         } else {
-            self.ingest_entries::<false, BUDGETED>(
+            self.ingest_entries::<false, BUDGETED, TRACKED>(
                 &mut parser,
                 &cursor.opts,
                 cursor.default_ts_ns,
@@ -645,7 +647,7 @@ impl ArrowDecoder {
             }
             Err(err) => {
                 cursor.done = true;
-                if let Some(tr) = tracker.as_deref_mut() {
+                if TRACKED && let Some(tr) = tracker.as_deref_mut() {
                     tr.abort_scrape();
                 }
                 parser.take_scratch_into(self);
@@ -714,7 +716,7 @@ impl ArrowDecoder {
         let mut pending_series = false;
         let mut done = false;
         let mut tracker_opt = Some(tracker);
-        let res = self.ingest_entries::<false, false>(
+        let res = self.ingest_entries::<false, false, true>(
             &mut parser,
             opts,
             default_ts_ns,
@@ -960,9 +962,13 @@ impl ArrowDecoder {
         self.hist_dp.clear();
     }
 
-    fn reset_batch_with_tracker(&mut self, tracker: &mut Option<&mut StalenessTracker>) {
+    #[inline]
+    fn reset_batch_for_mode<const TRACKED: bool>(
+        &mut self,
+        tracker: &mut Option<&mut StalenessTracker>,
+    ) {
         self.reset_batch();
-        if let Some(tr) = tracker.as_deref_mut() {
+        if TRACKED && let Some(tr) = tracker.as_deref_mut() {
             tr.reset_batch_ids();
         }
     }
@@ -978,12 +984,17 @@ impl ArrowDecoder {
     }
 
     #[inline]
-    fn flush_pending_family(
+    fn flush_pending_family<const TRACKED: bool>(
         &mut self,
         tracker: &mut Option<&mut StalenessTracker>,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
+        let tr = if TRACKED {
+            tracker.as_deref_mut()
+        } else {
+            None
+        };
         self.assembly.flush(
             &mut self.current_family,
             &mut self.metrics,
@@ -991,14 +1002,14 @@ impl ArrowDecoder {
             &mut self.hist_dp,
             &self.key_interner,
             &self.val_interner,
-            tracker.as_deref_mut(),
+            tr,
             opts,
             default_ts_ns,
         )
     }
 
     #[inline]
-    fn transition_family_for_metadata(
+    fn transition_family_for_metadata<const TRACKED: bool>(
         &mut self,
         raw_name: &[u8],
         name_offset: usize,
@@ -1024,19 +1035,18 @@ impl ArrowDecoder {
 
         self.series_name_buf.clear();
         self.series_name_buf.extend_from_slice(unescaped);
-        self.flush_pending_family(tracker, opts, default_ts_ns)?;
+        self.flush_pending_family::<TRACKED>(tracker, opts, default_ts_ns)?;
         self.current_family
             .start_new(raw_name, &self.series_name_buf);
         Ok(())
     }
 
-    // Monomorphizing on `CHUNKED` and `BUDGETED` shares one entry dispatch loop across
-    // synchronous single-batch `decode` (`false, false`), synchronous `decode_stream`
-    // (`true, false`), cooperative single-batch `decode_cooperative` (`false, true`), and
-    // cooperative streaming `DecodeStream::step` (`true, true`), compiling out unused checks on
+    // Monomorphizing on `CHUNKED`, `BUDGETED`, and `TRACKED` shares one entry dispatch loop across
+    // synchronous single-batch `decode`, streaming `decode_stream`, cooperative decoding, and
+    // their `_with_staleness` counterparts while compiling out unused checks and register state on
     // each path.
     #[allow(clippy::too_many_arguments)]
-    fn ingest_entries<const CHUNKED: bool, const BUDGETED: bool>(
+    fn ingest_entries<const CHUNKED: bool, const BUDGETED: bool, const TRACKED: bool>(
         &mut self,
         parser: &mut ActiveParser<'_>,
         opts: &DecodeOptions,
@@ -1069,35 +1079,40 @@ impl ArrowDecoder {
                 match parser.next_entry().map_err(DecodeError::from_parse)? {
                     Some(entry) => entry,
                     None => {
-                        self.flush_pending_family(tracker, opts, default_ts_ns)?;
-                        let step_budget = budget.filter(|_| BUDGETED).and_then(|b| {
-                            started
-                                .map(|st| (max_entries.saturating_sub(entries), st, b.max_duration))
-                        });
-                        let drain_step = if let Some(tr) = tracker.as_deref_mut() {
-                            tr.finish_scrape_step(
-                                &mut self.metrics,
-                                &mut self.num_dp,
-                                &mut self.sum_dp,
-                                &mut self.hist_dp,
-                                &mut self.key_interner,
-                                &mut self.val_interner,
-                                opts,
-                                default_ts_ns,
-                                CHUNKED.then_some(max_data_points),
-                                MAX_METRICS_PER_BATCH,
-                                step_budget,
-                            )?
+                        self.flush_pending_family::<TRACKED>(tracker, opts, default_ts_ns)?;
+                        let drain_step = if TRACKED {
+                            let step_budget = budget.filter(|_| BUDGETED).and_then(|b| {
+                                started.map(|st| {
+                                    (max_entries.saturating_sub(entries), st, b.max_duration)
+                                })
+                            });
+                            if let Some(tr) = tracker.as_deref_mut() {
+                                tr.finish_scrape_step(
+                                    &mut self.metrics,
+                                    &mut self.num_dp,
+                                    &mut self.sum_dp,
+                                    &mut self.hist_dp,
+                                    &mut self.key_interner,
+                                    &mut self.val_interner,
+                                    opts,
+                                    default_ts_ns,
+                                    CHUNKED.then_some(max_data_points),
+                                    MAX_METRICS_PER_BATCH,
+                                    step_budget,
+                                )?
+                            } else {
+                                StaleDrainStep::Complete
+                            }
                         } else {
                             StaleDrainStep::Complete
                         };
-                        if drain_step == StaleDrainStep::YieldPending {
+                        if TRACKED && drain_step == StaleDrainStep::YieldPending {
                             return Ok(DecodeStep::Pending);
                         }
-                        let has_more_stale = drain_step == StaleDrainStep::ChunkFull;
+                        let has_more_stale = TRACKED && drain_step == StaleDrainStep::ChunkFull;
                         if self.metrics.is_empty() {
                             *done = true;
-                            if let Some(tr) = tracker.as_deref_mut() {
+                            if TRACKED && let Some(tr) = tracker.as_deref_mut() {
                                 tr.commit_scrape();
                             }
                             return Ok(DecodeStep::Done);
@@ -1105,12 +1120,12 @@ impl ArrowDecoder {
                         let batch = self.finish_batches(default_ts_ns.is_some())?;
                         if !has_more_stale {
                             *done = true;
-                            if let Some(tr) = tracker.as_deref_mut() {
+                            if TRACKED && let Some(tr) = tracker.as_deref_mut() {
                                 tr.commit_scrape();
                             }
                         }
                         if CHUNKED {
-                            self.reset_batch_with_tracker(tracker);
+                            self.reset_batch_for_mode::<TRACKED>(tracker);
                         }
                         return Ok(DecodeStep::Batch(batch));
                     }
@@ -1120,9 +1135,15 @@ impl ArrowDecoder {
             match entry {
                 // `Entry::Histogram` arrives with #22.
                 Entry::Comment | Entry::Histogram => {}
-                Entry::Help => self.ingest_help_entry(parser, tracker, opts, default_ts_ns)?,
-                Entry::Type => self.ingest_type_entry(parser, tracker, opts, default_ts_ns)?,
-                Entry::Unit => self.ingest_unit_entry(parser, tracker, opts, default_ts_ns)?,
+                Entry::Help => {
+                    self.ingest_help_entry::<TRACKED>(parser, tracker, opts, default_ts_ns)?
+                }
+                Entry::Type => {
+                    self.ingest_type_entry::<TRACKED>(parser, tracker, opts, default_ts_ns)?
+                }
+                Entry::Unit => {
+                    self.ingest_unit_entry::<TRACKED>(parser, tracker, opts, default_ts_ns)?
+                }
                 Entry::Series => {
                     let (raw_name, name_offset) = {
                         let (rn, _, _, _, _) = parser.raw_series_parts();
@@ -1151,13 +1172,13 @@ impl ArrowDecoder {
                         } else {
                             self.series_name_buf.clear();
                             self.series_name_buf.extend_from_slice(unescaped);
-                            self.flush_pending_family(tracker, opts, default_ts_ns)?;
+                            self.flush_pending_family::<TRACKED>(tracker, opts, default_ts_ns)?;
                             if CHUNKED && self.total_data_points() >= max_data_points {
                                 self.current_family
                                     .start_new(raw_name, &self.series_name_buf);
                                 *pending_series = true;
                                 let batch = self.finish_batches(default_ts_ns.is_some())?;
-                                self.reset_batch_with_tracker(tracker);
+                                self.reset_batch_for_mode::<TRACKED>(tracker);
                                 return Ok(DecodeStep::Batch(batch));
                             }
                             self.current_family
@@ -1176,23 +1197,29 @@ impl ArrowDecoder {
                                     && self.metrics.len() >= MAX_METRICS_PER_BATCH));
                         if split_assembled || split_scalar {
                             if split_assembled {
-                                self.flush_pending_family(tracker, opts, default_ts_ns)?;
+                                self.flush_pending_family::<TRACKED>(tracker, opts, default_ts_ns)?;
                             }
                             *pending_series = true;
                             let batch = self.finish_batches(default_ts_ns.is_some())?;
-                            self.reset_batch_with_tracker(tracker);
+                            self.reset_batch_for_mode::<TRACKED>(tracker);
                             return Ok(DecodeStep::Batch(batch));
                         }
                     }
 
-                    self.ingest_series_entry(parser, role, tracker, opts, default_ts_ns)?;
+                    self.ingest_series_entry::<TRACKED>(
+                        parser,
+                        role,
+                        tracker,
+                        opts,
+                        default_ts_ns,
+                    )?;
 
                     if CHUNKED
                         && self.assembly.is_empty()
                         && self.total_data_points() >= max_data_points
                     {
                         let batch = self.finish_batches(default_ts_ns.is_some())?;
-                        self.reset_batch_with_tracker(tracker);
+                        self.reset_batch_for_mode::<TRACKED>(tracker);
                         return Ok(DecodeStep::Batch(batch));
                     }
                 }
@@ -1212,7 +1239,7 @@ impl ArrowDecoder {
     }
 
     #[inline]
-    fn ingest_help_entry(
+    fn ingest_help_entry<const TRACKED: bool>(
         &mut self,
         parser: &ActiveParser<'_>,
         tracker: &mut Option<&mut StalenessTracker>,
@@ -1231,7 +1258,13 @@ impl ArrowDecoder {
             }
             return Ok(());
         }
-        self.transition_family_for_metadata(raw_name, name_offset, tracker, opts, default_ts_ns)?;
+        self.transition_family_for_metadata::<TRACKED>(
+            raw_name,
+            name_offset,
+            tracker,
+            opts,
+            default_ts_ns,
+        )?;
         if self.current_family.has_help
             || self.current_family.has_samples
             || !self.assembly.is_empty()
@@ -1249,7 +1282,7 @@ impl ArrowDecoder {
     }
 
     #[inline]
-    fn ingest_type_entry(
+    fn ingest_type_entry<const TRACKED: bool>(
         &mut self,
         parser: &ActiveParser<'_>,
         tracker: &mut Option<&mut StalenessTracker>,
@@ -1258,7 +1291,13 @@ impl ArrowDecoder {
     ) -> Result<(), DecodeError> {
         let (raw_name, metric_type) = parser.metric_type();
         let name_offset = parser.name_offset();
-        self.transition_family_for_metadata(raw_name, name_offset, tracker, opts, default_ts_ns)?;
+        self.transition_family_for_metadata::<TRACKED>(
+            raw_name,
+            name_offset,
+            tracker,
+            opts,
+            default_ts_ns,
+        )?;
         if self.current_family.has_type
             || self.current_family.has_samples
             || !self.assembly.is_empty()
@@ -1273,7 +1312,7 @@ impl ArrowDecoder {
     }
 
     #[inline]
-    fn ingest_unit_entry(
+    fn ingest_unit_entry<const TRACKED: bool>(
         &mut self,
         parser: &ActiveParser<'_>,
         tracker: &mut Option<&mut StalenessTracker>,
@@ -1285,7 +1324,13 @@ impl ArrowDecoder {
         if raw_unit.is_empty() {
             return Ok(());
         }
-        self.transition_family_for_metadata(raw_name, name_offset, tracker, opts, default_ts_ns)?;
+        self.transition_family_for_metadata::<TRACKED>(
+            raw_name,
+            name_offset,
+            tracker,
+            opts,
+            default_ts_ns,
+        )?;
         if self.current_family.has_unit
             || self.current_family.has_samples
             || !self.assembly.is_empty()
@@ -1302,7 +1347,7 @@ impl ArrowDecoder {
     }
 
     #[inline]
-    fn ingest_series_entry(
+    fn ingest_series_entry<const TRACKED: bool>(
         &mut self,
         parser: &mut ActiveParser<'_>,
         role: SeriesRole,
@@ -1311,7 +1356,9 @@ impl ArrowDecoder {
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
         match role {
-            SeriesRole::Scalar => self.append_scalar_series(parser, tracker, opts, default_ts_ns),
+            SeriesRole::Scalar => {
+                self.append_scalar_series::<TRACKED>(parser, tracker, opts, default_ts_ns)
+            }
             SeriesRole::HistogramBucket
             | SeriesRole::HistogramSum
             | SeriesRole::HistogramCount
@@ -1322,7 +1369,7 @@ impl ArrowDecoder {
     }
 
     #[inline]
-    fn append_scalar_series(
+    fn append_scalar_series<const TRACKED: bool>(
         &mut self,
         parser: &mut ActiveParser<'_>,
         tracker: &mut Option<&mut StalenessTracker>,
@@ -1378,19 +1425,23 @@ impl ArrowDecoder {
             Some(ms) => Some(ms_to_ns(ms)?),
             None => default_ts_ns,
         };
-        let flags = if is_stale {
-            DATA_POINT_FLAG_NO_RECORDED_VALUE
+        if !is_stale {
+            self.num_dp
+                .base
+                .push(parent_id, start_ts_ns, resolved_ts_ns);
+            self.num_dp.values.push_value(value);
         } else {
-            0
-        };
-        self.num_dp
-            .base
-            .push_with_flags(parent_id, start_ts_ns, resolved_ts_ns, flags);
-        self.num_dp
-            .values
-            .push(dp_index, (!is_stale).then_some(value));
+            self.num_dp.base.push_with_flags(
+                parent_id,
+                start_ts_ns,
+                resolved_ts_ns,
+                DATA_POINT_FLAG_NO_RECORDED_VALUE,
+            );
+            self.num_dp.values.push_null(dp_index);
+        }
 
-        if (sample_ts_ms.is_none() || opts.track_timestamps_staleness)
+        if TRACKED
+            && (sample_ts_ms.is_none() || opts.track_timestamps_staleness)
             && let Some(tr) = tracker.as_deref_mut()
         {
             tr.record_series(
@@ -1953,9 +2004,23 @@ impl DecodeStream<'_, '_> {
             }
             return Err(err);
         }
-        let mut tracker = self.tracker.as_deref_mut();
-        self.decoder
-            .step_cursor::<true>(&mut self.cursor, self.input, Some(budget), &mut tracker)
+        if self.tracker.is_some() {
+            let mut tracker = self.tracker.as_deref_mut();
+            self.decoder.step_cursor::<true, true>(
+                &mut self.cursor,
+                self.input,
+                Some(budget),
+                &mut tracker,
+            )
+        } else {
+            let mut tracker = None;
+            self.decoder.step_cursor::<true, false>(
+                &mut self.cursor,
+                self.input,
+                Some(budget),
+                &mut tracker,
+            )
+        }
     }
 
     /// Cooperatively pulls the next non-empty [`OtapMetricRecords`] chunk from the stream,
@@ -1990,11 +2055,24 @@ impl Iterator for DecodeStream<'_, '_> {
             }
             return Some(Err(err));
         }
-        let mut tracker = self.tracker.as_deref_mut();
-        match self
-            .decoder
-            .step_cursor::<false>(&mut self.cursor, self.input, None, &mut tracker)
-        {
+        let step_res = if self.tracker.is_some() {
+            let mut tracker = self.tracker.as_deref_mut();
+            self.decoder.step_cursor::<false, true>(
+                &mut self.cursor,
+                self.input,
+                None,
+                &mut tracker,
+            )
+        } else {
+            let mut tracker = None;
+            self.decoder.step_cursor::<false, false>(
+                &mut self.cursor,
+                self.input,
+                None,
+                &mut tracker,
+            )
+        };
+        match step_res {
             Ok(DecodeStep::Batch(batch)) => Some(Ok(batch)),
             Ok(DecodeStep::Done) => None,
             Ok(DecodeStep::Pending) => {
