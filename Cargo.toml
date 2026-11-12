@@ -22,14 +22,19 @@ arrow-array = { version = "59", default-features = false }
 arrow-buffer = { version = "59", default-features = false }
 arrow-schema = { version = "59", default-features = false }
 benchfmt = { git = "https://github.com/bwplotka/benchfmt.rs" }
+bytes = { version = "1", default-features = false, features = ["std"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 prost = { version = "0.14" }
 prost-build = "=0.14.4"
 prost-types = { version = "0.14" }
 protox = "0.10"
 regex = { version = "1" }
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["io-util", "net", "rt", "sync", "time"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"

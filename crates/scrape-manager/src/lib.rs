@@ -14,7 +14,9 @@
 //! Prometheus service discovery, HTTP scrape client configuration, and target scrape management.
 //!
 //! Re-exports [`prometheus_expfmt`] and [`prometheus_relabel`] and hosts the async runtime I/O
-//! layers (`http_config`, `discovery`, and `scrape`) for [`prometheus/scrape.rs`](https://github.com/prometheus/scrape.rs).
+//! layers for [`prometheus/scrape.rs`](https://github.com/prometheus/scrape.rs).
 
 pub use prometheus_expfmt as expfmt;
 pub use prometheus_relabel as relabel;
+
+pub mod scrape;

@@ -17,8 +17,18 @@ default = ["arrow"]
 arrow = ["prometheus-expfmt/arrow"]
 
 [dependencies]
+bytes = { workspace = true }
+flate2 = { workspace = true }
+futures-util = { workspace = true }
 prometheus-expfmt = { workspace = true }
 prometheus-relabel = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+benchfmt = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true
