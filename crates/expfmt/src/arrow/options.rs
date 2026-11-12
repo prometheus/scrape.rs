@@ -164,6 +164,10 @@ pub struct DecodeOptions {
     pub unit_suffix_policy: UnitSuffixPolicy,
     /// Projection policy for untyped (`unknown`) metric families.
     pub untyped_policy: UntypedPolicy,
+    /// Whether samples carrying an explicit wire timestamp participate in [`super::StalenessTracker`]
+    /// staleness tracking (`false` by default, matching Go Prometheus's
+    /// `track_timestamps_staleness` scrape option).
+    pub track_timestamps_staleness: bool,
 }
 
 impl Default for DecodeOptions {
@@ -184,6 +188,7 @@ impl DecodeOptions {
             counter_suffix_policy: CounterSuffixPolicy::Keep,
             unit_suffix_policy: UnitSuffixPolicy::Keep,
             untyped_policy: UntypedPolicy::Gauge,
+            track_timestamps_staleness: false,
         }
     }
 
@@ -223,6 +228,14 @@ impl DecodeOptions {
     #[must_use]
     pub const fn with_untyped_policy(mut self, policy: UntypedPolicy) -> Self {
         self.untyped_policy = policy;
+        self
+    }
+
+    /// Sets whether samples carrying an explicit wire timestamp are tracked in
+    /// [`super::StalenessTracker`] (`false` by default, matching Go Prometheus).
+    #[must_use]
+    pub const fn with_track_timestamps_staleness(mut self, track: bool) -> Self {
+        self.track_timestamps_staleness = track;
         self
     }
 }

@@ -519,13 +519,78 @@ impl SparseTimestampCol {
     }
 }
 
-/// Shared leading columns (`id`, `parent_id`, `start_time_unix_nano`, `time_unix_nano`) across
-/// `NumberDataPoints`, `SummaryDataPoints`, and `HistogramDataPoints`.
+/// Staging buffer for an optional `flags` (`UInt32`) column on data point tables that stays
+/// unallocated when every row in the batch has `flags == 0`.
+///
+/// OTAP marks `flags` as `default_values_optional` on `NumberDataPoints`, `SummaryDataPoints`, and
+/// `HistogramDataPoints`, omitting the column whenever all rows carry `0`. Keeping `values`
+/// unallocated until the first non-zero flag arrives avoids per-batch `UInt32` buffer allocations
+/// and preserves identical schemas on non-stale scrapes (>99.9% of batches), while backfilling
+/// leading `0` entries if a stale point appears mid-batch.
+#[derive(Default)]
+pub(super) struct SparseFlagsCol {
+    values: Vec<u32>,
+}
+
+impl SparseFlagsCol {
+    pub(super) fn clear(&mut self) {
+        self.values.clear();
+    }
+
+    pub(super) fn retained_memory_bytes(&self) -> usize {
+        self.values.capacity() * size_of::<u32>()
+    }
+
+    #[inline]
+    pub(super) fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    #[inline(always)]
+    pub(super) fn push_zero(&mut self) {
+        if !self.values.is_empty() {
+            self.push_zero_slow();
+        }
+    }
+
+    #[cold]
+    fn push_zero_slow(&mut self) {
+        self.values.push(0);
+    }
+
+    #[cold]
+    pub(super) fn push_nonzero(&mut self, row_index: usize, flags: u32) {
+        debug_assert_ne!(flags, 0);
+        if row_index > 0 && self.values.is_empty() {
+            self.values.resize(row_index, 0);
+        }
+        self.values.push(flags);
+    }
+
+    #[inline]
+    pub(super) fn push(&mut self, row_index: usize, flags: u32) {
+        if flags == 0 {
+            self.push_zero();
+        } else {
+            self.push_nonzero(row_index, flags);
+        }
+    }
+
+    #[inline]
+    pub(super) fn to_array(&self) -> ArrayRef {
+        Arc::new(UInt32Array::new(scalar_from_slice(&self.values), None))
+    }
+}
+
+/// Shared leading columns (`id`, `parent_id`, `start_time_unix_nano`, `time_unix_nano`) and
+/// optional trailing `flags` column across `NumberDataPoints`, `SummaryDataPoints`, and
+/// `HistogramDataPoints`.
 #[derive(Default)]
 pub(super) struct DpBaseCols {
     pub(super) parent_ids: Vec<u16>,
     pub(super) start_time: SparseTimestampCol,
     pub(super) time: SparseTimestampCol,
+    pub(super) flags: SparseFlagsCol,
 }
 
 impl DpBaseCols {
@@ -534,6 +599,7 @@ impl DpBaseCols {
             parent_ids: Vec::with_capacity(cap),
             start_time: SparseTimestampCol::default(),
             time: SparseTimestampCol::default(),
+            flags: SparseFlagsCol::default(),
         }
     }
 
@@ -541,12 +607,14 @@ impl DpBaseCols {
         self.parent_ids.clear();
         self.start_time.clear();
         self.time.clear();
+        self.flags.clear();
     }
 
     pub(super) fn retained_memory_bytes(&self) -> usize {
         self.parent_ids.capacity() * size_of::<u16>()
             + self.start_time.retained_memory_bytes()
             + self.time.retained_memory_bytes()
+            + self.flags.retained_memory_bytes()
     }
 
     #[inline]
@@ -560,11 +628,32 @@ impl DpBaseCols {
     }
 
     #[inline]
+    pub(super) fn has_flags(&self) -> bool {
+        !self.flags.is_empty()
+    }
+
+    #[inline]
     pub(super) fn push(&mut self, parent_id: u16, start_ts_ns: Option<i64>, ts_ns: Option<i64>) {
         let dp_index = self.parent_ids.len();
         self.parent_ids.push(parent_id);
         self.start_time.push(dp_index, start_ts_ns);
         self.time.push(dp_index, ts_ns);
+        self.flags.push_zero();
+    }
+
+    #[inline]
+    pub(super) fn push_with_flags(
+        &mut self,
+        parent_id: u16,
+        start_ts_ns: Option<i64>,
+        ts_ns: Option<i64>,
+        flags: u32,
+    ) {
+        let dp_index = self.parent_ids.len();
+        self.parent_ids.push(parent_id);
+        self.start_time.push(dp_index, start_ts_ns);
+        self.time.push(dp_index, ts_ns);
+        self.flags.push(dp_index, flags);
     }
 
     #[inline]
@@ -609,6 +698,13 @@ impl DpBaseCols {
             cols.push(self.time.to_array(time_nullable));
         }
     }
+
+    #[inline]
+    pub(super) fn append_flags_column(&self, cols: &mut Vec<ArrayRef>) {
+        if !self.flags.is_empty() {
+            cols.push(self.flags.to_array());
+        }
+    }
 }
 
 /// Staging buffer for a dense column (`count` or `sum` on summaries and histograms) whose validity
@@ -620,6 +716,13 @@ pub(super) struct OptionalValueCol<T> {
 }
 
 impl<T: Copy + Default> OptionalValueCol<T> {
+    pub(super) fn with_capacity(cap: usize) -> Self {
+        Self {
+            values: Vec::with_capacity(cap),
+            valid: Vec::new(),
+        }
+    }
+
     pub(super) fn clear(&mut self) {
         self.values.clear();
         self.valid.clear();
@@ -634,22 +737,33 @@ impl<T: Copy + Default> OptionalValueCol<T> {
         !self.valid.is_empty()
     }
 
+    #[inline(always)]
+    pub(super) fn push_value(&mut self, val: T) {
+        self.values.push(val);
+        if !self.valid.is_empty() {
+            self.push_valid_slow();
+        }
+    }
+
+    #[cold]
+    fn push_valid_slow(&mut self) {
+        self.valid.push(true);
+    }
+
+    #[cold]
+    pub(super) fn push_null(&mut self, row_index: usize) {
+        if self.valid.is_empty() {
+            self.valid.resize(row_index, true);
+        }
+        self.values.push(T::default());
+        self.valid.push(false);
+    }
+
     #[inline]
     pub(super) fn push(&mut self, row_index: usize, val: Option<T>) {
         match val {
-            Some(v) => {
-                self.values.push(v);
-                if !self.valid.is_empty() {
-                    self.valid.push(true);
-                }
-            }
-            None => {
-                if self.valid.is_empty() {
-                    self.valid.resize(row_index, true);
-                }
-                self.values.push(T::default());
-                self.valid.push(false);
-            }
+            Some(v) => self.push_value(v),
+            None => self.push_null(row_index),
         }
     }
 
@@ -926,7 +1040,7 @@ impl ExemplarTable {
 /// `NumberDpExemplarAttrs`.
 pub(super) struct NumberDpTable {
     pub(super) base: DpBaseCols,
-    pub(super) values: Vec<f64>,
+    pub(super) values: OptionalValueCol<f64>,
     pub(super) attrs: AttrTable,
     pub(super) exemplars: ExemplarTable,
 }
@@ -935,7 +1049,7 @@ impl NumberDpTable {
     pub(super) fn with_capacity(data_points: usize, attrs: usize) -> Self {
         Self {
             base: DpBaseCols::with_capacity(data_points),
-            values: Vec::with_capacity(data_points),
+            values: OptionalValueCol::with_capacity(data_points),
             attrs: AttrTable::with_capacity(attrs),
             exemplars: ExemplarTable::default(),
         }
@@ -950,7 +1064,7 @@ impl NumberDpTable {
 
     pub(super) fn retained_memory_bytes(&self) -> usize {
         self.base.retained_memory_bytes()
-            + self.values.capacity() * size_of::<f64>()
+            + self.values.retained_memory_bytes()
             + self.attrs.retained_memory_bytes()
             + self.exemplars.retained_memory_bytes()
     }
@@ -973,14 +1087,14 @@ impl NumberDpTable {
             start_time_nullable,
             has_time,
             time_nullable,
+            self.values.is_nullable(),
+            self.base.has_flags(),
         );
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
         self.base
             .append_columns(&mut cols, has_id, has_default_ts, &mut scratch.u32_buf);
-        cols.push(Arc::new(Float64Array::new(
-            scalar_from_slice(&self.values),
-            None,
-        )));
+        cols.push(self.values.to_f64_array());
+        self.base.append_flags_column(&mut cols);
 
         Ok(Some(RecordBatch::try_new(schema, cols)?))
     }
@@ -1041,6 +1155,7 @@ impl SummaryDpTable {
             time_nullable,
             count_nullable,
             sum_nullable,
+            self.base.has_flags(),
         );
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
         self.base
@@ -1069,6 +1184,7 @@ impl SummaryDpTable {
             None,
         );
         cols.push(Arc::new(q_list));
+        self.base.append_flags_column(&mut cols);
 
         Ok(Some(RecordBatch::try_new(schema, cols)?))
     }
@@ -1136,6 +1252,7 @@ impl HistogramDpTable {
             time_nullable,
             count_nullable,
             sum_nullable,
+            self.base.has_flags(),
         );
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
         self.base
@@ -1164,6 +1281,7 @@ impl HistogramDpTable {
             None,
         );
         cols.push(Arc::new(explicit_bounds_list));
+        self.base.append_flags_column(&mut cols);
 
         Ok(Some(RecordBatch::try_new(schema, cols)?))
     }
