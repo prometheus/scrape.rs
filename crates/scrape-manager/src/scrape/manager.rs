@@ -357,50 +357,43 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         // `self.body_pool` before `on_scrape_complete` awaits downstream work.
         drop(fetched);
 
-        let (exit_early, report) = match decode_outcome {
+        let report = match decode_outcome {
             ControlFlow::Break(()) => return ControlFlow::Break(()),
             ControlFlow::Continue(Ok((points, batches))) => {
                 self.counters.succeeded.fetch_add(1, Ordering::Relaxed);
                 self.counters
                     .points_decoded
                     .fetch_add(points, Ordering::Relaxed);
-                (
-                    false,
-                    ScrapeReport {
-                        up: true,
-                        scrape_timestamp_ms,
-                        duration: started.elapsed(),
-                        wire_bytes,
-                        uncompressed_bytes,
-                        data_points_decoded: points,
-                        batches_emitted: batches,
-                        error: None,
-                    },
-                )
+                ScrapeReport {
+                    up: true,
+                    scrape_timestamp_ms,
+                    duration: started.elapsed(),
+                    wire_bytes,
+                    uncompressed_bytes,
+                    data_points_decoded: points,
+                    batches_emitted: batches,
+                    error: None,
+                }
             }
             ControlFlow::Continue(Err(err)) => {
                 self.counters.failed.fetch_add(1, Ordering::Relaxed);
-                (
-                    false,
-                    ScrapeReport {
-                        up: false,
-                        scrape_timestamp_ms,
-                        duration: started.elapsed(),
-                        wire_bytes,
-                        uncompressed_bytes,
-                        data_points_decoded: 0,
-                        batches_emitted: 0,
-                        error: Some(err.to_string()),
-                    },
-                )
+                ScrapeReport {
+                    up: false,
+                    scrape_timestamp_ms,
+                    duration: started.elapsed(),
+                    wire_bytes,
+                    uncompressed_bytes,
+                    data_points_decoded: 0,
+                    batches_emitted: 0,
+                    error: Some(err.to_string()),
+                }
             }
         };
 
-        if exit_early
-            || sink
-                .on_scrape_complete(target, report.clone())
-                .await
-                .is_break()
+        if sink
+            .on_scrape_complete(target, report.clone())
+            .await
+            .is_break()
         {
             return ControlFlow::Break(());
         }
