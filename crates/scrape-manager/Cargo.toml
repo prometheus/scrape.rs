@@ -9,6 +9,10 @@ description = "Prometheus service discovery, HTTP client configuration, and scra
 readme = "README.md"
 keywords = ["prometheus", "openmetrics", "metrics", "scrape", "service-discovery"]
 categories = ["network-programming", "asynchronous"]
+exclude = [
+    "benches/**",
+    "tests/**",
+]
 # Kept unpublished while initial service discovery, HTTP config, and scrape pool modules land.
 publish = false
 
@@ -29,6 +33,11 @@ tokio = { workspace = true }
 [dev-dependencies]
 benchfmt = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[[bench]]
+name = "scrape"
+harness = false
+required-features = ["arrow"]
 
 [lints]
 workspace = true

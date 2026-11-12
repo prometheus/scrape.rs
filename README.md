@@ -30,7 +30,7 @@ The project serves two main use cases:
 | :--- | :--- | :--- | :--- | :--- |
 | `prometheus-expfmt` | [`crates/expfmt`](./crates/expfmt) | In progress | [specs/SPEC.md](./specs/SPEC.md) | `Content-Type` and `Accept` negotiation, zero-copy streaming parsers for Prometheus Text 0.0.4, OpenMetrics 1.0, OpenMetrics 2.0, and Prometheus Protobuf, primary Apache Arrow / OTAP decoder (`ArrowDecoder`), and [`MetricFamily`](https://github.com/prometheus/prometheus/blob/main/prompb/io/prometheus/client/metrics.proto) protobuf DTO decoder. |
 | `prometheus-relabel` | [`crates/relabel`](./crates/relabel) | In progress | [specs/SPEC.md](./specs/SPEC.md#target-and-metric-relabeling-architecture) | Prometheus-compatible target and metric relabeling (`replace`, `keep`, `drop`, `hashmod`, `labelmap`, `labeldrop`, `labelkeep`, `lowercase`, `uppercase`, `keepequal`, `dropequal`), Stage 1 `__name__` filter pushdown, and Stage 2 dictionary-vectorized relabeling and `honor_labels` resolution. |
-| `prometheus-scrape-manager` | [`crates/scrape-manager`](./crates/scrape-manager) | Planned | TBD | Prometheus HTTP/TLS client configuration (`http_config`), service discovery mechanisms (`discovery`: static, file, HTTP, DNS, Kubernetes), and bounded target scrape pool scheduling (`scrape`). |
+| `prometheus-scrape-manager` | [`crates/scrape-manager`](./crates/scrape-manager) | In progress | [specs/SPEC.md](./specs/SPEC.md#bounded-scrape-scheduling-and-memory-pools) | Bounded concurrent and sequential target scrape scheduling (`scrape`), Prometheus HTTP/TLS client configuration (`http_config`), and service discovery mechanisms (`discovery`: static, file, HTTP, DNS, Kubernetes). |
 
 ## Development and testing
 
@@ -52,9 +52,10 @@ Run the Go differential fixture extractor and tests (requires Go):
 cd tests/go-harness && go test ./...
 ```
 
-Run the decoding and relabeling benchmarks in Go `benchfmt` format for [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat):
+Run the decoding, relabeling, and scrape scheduling benchmarks in Go `benchfmt` format for [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat):
 
 ```sh
 cargo bench -p prometheus-expfmt --bench decode -- -bench '^BenchmarkDecode' -benchtime 1s -count 6 -cpu 2 -benchmem | tee decode.txt
 cargo bench -p prometheus-relabel --bench relabel -- -bench '^BenchmarkRelabel' -benchtime 1s -count 6 -cpu 2 -benchmem | tee relabel.txt
+cargo bench -p prometheus-scrape-manager --bench scrape -- -bench '^BenchmarkScrape' -benchtime 500ms -count 6 -cpu 2 -benchmem | tee scrape.txt
 ```
