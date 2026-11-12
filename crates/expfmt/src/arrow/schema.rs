@@ -184,6 +184,7 @@ fn build_number_dp_schema(
     start_time_nullable: bool,
     has_time: bool,
     time_nullable: bool,
+    double_value_nullable: bool,
     has_flags: bool,
 ) -> SchemaRef {
     let mut fields = Vec::with_capacity(6);
@@ -206,39 +207,47 @@ fn build_number_dp_schema(
             time_nullable,
         ));
     }
-    fields.push(Field::new("double_value", DataType::Float64, false));
+    fields.push(Field::new(
+        "double_value",
+        DataType::Float64,
+        double_value_nullable,
+    ));
     if has_flags {
         fields.push(Field::new("flags", DataType::UInt32, false));
     }
     Arc::new(Schema::new(fields))
 }
 
-static NUMBER_DP_SCHEMAS: LazyLock<[SchemaRef; 64]> = LazyLock::new(|| {
+static NUMBER_DP_SCHEMAS: LazyLock<[SchemaRef; 128]> = LazyLock::new(|| {
     std::array::from_fn(|mask| {
         let has_id = (mask & 1) != 0;
         let has_start_time = (mask & 2) != 0;
         let start_time_nullable = (mask & 4) != 0;
         let has_time = (mask & 8) != 0;
         let time_nullable = (mask & 16) != 0;
-        let has_flags = (mask & 32) != 0;
+        let double_value_nullable = (mask & 32) != 0;
+        let has_flags = (mask & 64) != 0;
         build_number_dp_schema(
             has_id,
             has_start_time,
             start_time_nullable,
             has_time,
             time_nullable,
+            double_value_nullable,
             has_flags,
         )
     })
 });
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn number_dp_schema(
     has_id: bool,
     has_start_time: bool,
     start_time_nullable: bool,
     has_time: bool,
     time_nullable: bool,
+    double_value_nullable: bool,
     has_flags: bool,
 ) -> SchemaRef {
     let mask = usize::from(has_id)
@@ -246,7 +255,8 @@ pub(super) fn number_dp_schema(
         | (usize::from(start_time_nullable) << 2)
         | (usize::from(has_time) << 3)
         | (usize::from(time_nullable) << 4)
-        | (usize::from(has_flags) << 5);
+        | (usize::from(double_value_nullable) << 5)
+        | (usize::from(has_flags) << 6);
     Arc::clone(&NUMBER_DP_SCHEMAS[mask])
 }
 

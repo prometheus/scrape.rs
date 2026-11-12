@@ -1136,7 +1136,7 @@ impl StalenessTracker {
                     default_ts_ns,
                     DATA_POINT_FLAG_NO_RECORDED_VALUE,
                 );
-                num_dp.values.push(STALE_NAN);
+                num_dp.values.push(dp_index, None);
             }
             DpKind::Summary => {
                 if sum_dp.quantile_offsets.is_empty() {
@@ -1157,7 +1157,7 @@ impl StalenessTracker {
                     DATA_POINT_FLAG_NO_RECORDED_VALUE,
                 );
                 sum_dp.counts.push(dp_index, Some(0));
-                sum_dp.sums.push(dp_index, Some(STALE_NAN));
+                sum_dp.sums.push(dp_index, Some(0.0));
                 let q_off = i32::try_from(sum_dp.quantile_bounds.len()).map_err(|_| {
                     DecodeError::CapacityOverflow {
                         table: "SummaryDataPoints.quantile",
@@ -1186,7 +1186,7 @@ impl StalenessTracker {
                     DATA_POINT_FLAG_NO_RECORDED_VALUE,
                 );
                 hist_dp.counts.push(dp_index, Some(0));
-                hist_dp.sums.push(dp_index, Some(STALE_NAN));
+                hist_dp.sums.push(dp_index, None);
                 let bucket_off = i32::try_from(hist_dp.bucket_counts.len()).map_err(|_| {
                     DecodeError::CapacityOverflow {
                         table: "HistogramDataPoints.histogram_bucket_counts",

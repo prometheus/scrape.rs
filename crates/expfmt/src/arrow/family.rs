@@ -670,13 +670,18 @@ impl FamilyAssembly {
                         group.ts_ns.or(default_ts_ns),
                         flags,
                     );
-                    sum_dp.counts.push(dp_index, group.count);
-                    sum_dp.sums.push(dp_index, group.sum);
+                    if group.is_stale {
+                        sum_dp.counts.push(dp_index, Some(0));
+                        sum_dp.sums.push(dp_index, Some(0.0));
+                    } else {
+                        sum_dp.counts.push(dp_index, group.count);
+                        sum_dp.sums.push(dp_index, group.sum);
 
-                    self.collect_sorted_group_points(group.point_head);
-                    for &(q, val) in &self.group_points {
-                        sum_dp.quantile_bounds.push(q);
-                        sum_dp.quantile_vals.push(val);
+                        self.collect_sorted_group_points(group.point_head);
+                        for &(q, val) in &self.group_points {
+                            sum_dp.quantile_bounds.push(q);
+                            sum_dp.quantile_vals.push(val);
+                        }
                     }
                     let q_off = i32::try_from(sum_dp.quantile_bounds.len()).map_err(|_| {
                         DecodeError::CapacityOverflow {
@@ -730,26 +735,53 @@ impl FamilyAssembly {
                         flags,
                     );
 
-                    self.collect_sorted_group_points(group.point_head);
+                    if group.is_stale {
+                        hist_dp.counts.push(dp_index, Some(0));
+                        hist_dp.sums.push(dp_index, None);
+                    } else {
+                        self.collect_sorted_group_points(group.point_head);
 
-                    let mut prev_cum = 0u64;
-                    let mut inf_cum: Option<u64> = None;
-                    for &(bound, cum_f64) in &self.group_points {
-                        let cum = f64_to_u64_count(cum_f64);
-                        if bound == f64::INFINITY {
-                            inf_cum = Some(cum);
-                        } else if bound.is_finite() {
-                            hist_dp.bounds_vals.push(bound);
-                            hist_dp.bucket_counts.push(cum.saturating_sub(prev_cum));
-                            prev_cum = cum;
+                        let mut prev_cum = 0u64;
+                        let mut inf_cum: Option<u64> = None;
+                        for &(bound, cum_f64) in &self.group_points {
+                            let cum = f64_to_u64_count(cum_f64);
+                            if bound == f64::INFINITY {
+                                inf_cum = Some(cum);
+                            } else if bound.is_finite() {
+                                hist_dp.bounds_vals.push(bound);
+                                hist_dp.bucket_counts.push(cum.saturating_sub(prev_cum));
+                                prev_cum = cum;
+                            }
                         }
-                    }
-                    let final_count = group.count.or(inf_cum);
-                    if !self.group_points.is_empty() {
-                        let total_for_inf = inf_cum.or(group.count).unwrap_or(prev_cum);
-                        hist_dp
-                            .bucket_counts
-                            .push(total_for_inf.saturating_sub(prev_cum));
+                        let final_count = group.count.or(inf_cum);
+                        if !self.group_points.is_empty() {
+                            let total_for_inf = inf_cum.or(group.count).unwrap_or(prev_cum);
+                            hist_dp
+                                .bucket_counts
+                                .push(total_for_inf.saturating_sub(prev_cum));
+                        }
+                        hist_dp.counts.push(dp_index, final_count);
+                        hist_dp.sums.push(dp_index, group.sum);
+
+                        let mut ex_cur = group.exemplar_head;
+                        while ex_cur != NONE_IDX {
+                            let ex = self.exemplars[ex_cur as usize];
+                            ex_cur = ex.next;
+                            let hist_ex_id = hist_dp.exemplars.next_id("HistogramDpExemplars")?;
+                            hist_dp.exemplars.push_row(
+                                dp_id,
+                                ex.ts_ns,
+                                ex.value,
+                                ex.span_id,
+                                ex.trace_id,
+                            );
+                            let ex_attr_start = ex.attr_start as usize;
+                            let ex_attr_end = ex_attr_start + ex.attr_len as usize;
+                            hist_dp.exemplars.attrs.extend_for_parent(
+                                hist_ex_id,
+                                &self.exemplar_attrs[ex_attr_start..ex_attr_end],
+                            );
+                        }
                     }
 
                     let bucket_off = i32::try_from(hist_dp.bucket_counts.len()).map_err(|_| {
@@ -766,29 +798,6 @@ impl FamilyAssembly {
                     })?;
                     hist_dp.bucket_offsets.push(bucket_off);
                     hist_dp.bounds_offsets.push(bounds_off);
-
-                    hist_dp.counts.push(dp_index, final_count);
-                    hist_dp.sums.push(dp_index, group.sum);
-
-                    let mut ex_cur = group.exemplar_head;
-                    while ex_cur != NONE_IDX {
-                        let ex = self.exemplars[ex_cur as usize];
-                        ex_cur = ex.next;
-                        let hist_ex_id = hist_dp.exemplars.next_id("HistogramDpExemplars")?;
-                        hist_dp.exemplars.push_row(
-                            dp_id,
-                            ex.ts_ns,
-                            ex.value,
-                            ex.span_id,
-                            ex.trace_id,
-                        );
-                        let ex_attr_start = ex.attr_start as usize;
-                        let ex_attr_end = ex_attr_start + ex.attr_len as usize;
-                        hist_dp.exemplars.attrs.extend_for_parent(
-                            hist_ex_id,
-                            &self.exemplar_attrs[ex_attr_start..ex_attr_end],
-                        );
-                    }
 
                     if let Some(tr) = tracker.as_deref_mut() {
                         tr.record_series(

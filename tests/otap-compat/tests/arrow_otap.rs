@@ -36,8 +36,7 @@ use otel_arrow_dfe_pdata::testing::round_trip::{otap_to_otlp, to_metrics_data};
 use prometheus_expfmt::arrow::{
     ArrowDecoder, CounterSuffixPolicy, DATA_POINT_FLAG_NO_RECORDED_VALUE, DecodeBudget,
     DecodeCursor, DecodeError, DecodeOptions, DecodeStep, MetricPayloadType, OtapMetricRecords,
-    PROMETHEUS_TYPE_METADATA_KEY, STALE_NAN, StalenessTracker, UnitSuffixPolicy, UntypedPolicy,
-    is_stale_nan,
+    PROMETHEUS_TYPE_METADATA_KEY, StalenessTracker, UnitSuffixPolicy, UntypedPolicy,
 };
 use prometheus_expfmt::format::Format;
 
@@ -1277,7 +1276,7 @@ fn staleness_tracker_and_flags_round_trip_through_otap_and_otlp() {
                         time_unix_nano: ts2_ns,
                         exemplars: Vec::new(),
                         flags: DATA_POINT_FLAG_NO_RECORDED_VALUE,
-                        value: Some(number_data_point::Value::AsDouble(STALE_NAN)),
+                        value: None,
                     },
                 ],
             })),
@@ -1293,7 +1292,7 @@ fn staleness_tracker_and_flags_round_trip_through_otap_and_otlp() {
                     start_time_unix_nano: 0,
                     time_unix_nano: ts2_ns,
                     count: 0,
-                    sum: STALE_NAN,
+                    sum: 0.0,
                     quantile_values: Vec::new(),
                     flags: DATA_POINT_FLAG_NO_RECORDED_VALUE,
                 }],
@@ -1311,7 +1310,7 @@ fn staleness_tracker_and_flags_round_trip_through_otap_and_otlp() {
                     start_time_unix_nano: 0,
                     time_unix_nano: ts2_ns,
                     count: 0,
-                    sum: Some(STALE_NAN),
+                    sum: None,
                     bucket_counts: Vec::new(),
                     explicit_bounds: Vec::new(),
                     exemplars: Vec::new(),
@@ -1348,12 +1347,6 @@ fn staleness_tracker_and_flags_round_trip_through_otap_and_otlp() {
         panic!("expected Sum metric");
     };
     assert_eq!(sum3.data_points.len(), 1);
-    assert_eq!(
-        sum3.data_points[0].flags,
-        DATA_POINT_FLAG_NO_RECORDED_VALUE
-    );
-    let Some(number_data_point::Value::AsDouble(v3)) = sum3.data_points[0].value else {
-        panic!("expected double value");
-    };
-    assert!(is_stale_nan(v3));
+    assert_eq!(sum3.data_points[0].flags, DATA_POINT_FLAG_NO_RECORDED_VALUE);
+    assert_eq!(sum3.data_points[0].value, None);
 }
