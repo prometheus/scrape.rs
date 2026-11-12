@@ -121,6 +121,7 @@ pub(crate) struct TargetSchedule {
     slots: Vec<Option<TargetSlot>>,
     free_slots: Vec<usize>,
     index_by_target: HashMap<Arc<ScrapeTarget>, usize>,
+    removed_in_flight: HashMap<Arc<ScrapeTarget>, usize>,
     heap: BinaryHeap<Reverse<HeapEntry>>,
     overruns: u64,
 }
@@ -135,6 +136,7 @@ impl TargetSchedule {
             slots: Vec::new(),
             free_slots: Vec::new(),
             index_by_target: HashMap::new(),
+            removed_in_flight: HashMap::new(),
             heap: BinaryHeap::new(),
             overruns: 0,
         }
@@ -155,6 +157,26 @@ impl TargetSchedule {
                 if let Some(slot) = self.slots.get_mut(slot_id).and_then(Option::as_mut) {
                     slot.seen_epoch = epoch;
                 }
+                continue;
+            }
+
+            // If `target` was removed while an earlier scrape was still in flight and re-added
+            // before that scrape completed, revive the existing in-flight slot so two scrapes of
+            // the same target never overlap.
+            if let Some(slot_id) = self.removed_in_flight.remove(&target)
+                && let Some(slot) = self.slots.get_mut(slot_id).and_then(Option::as_mut)
+            {
+                slot.removed = false;
+                slot.seen_epoch = epoch;
+                let due = slot.next_due;
+                let generation = slot.generation;
+                let target_arc = Arc::clone(&slot.target);
+                self.index_by_target.insert(target_arc, slot_id);
+                self.heap.push(Reverse(HeapEntry {
+                    due,
+                    slot_id,
+                    generation,
+                }));
                 continue;
             }
 
@@ -192,7 +214,8 @@ impl TargetSchedule {
 
         let slots = &mut self.slots;
         let free_slots = &mut self.free_slots;
-        self.index_by_target.retain(|_, &mut slot_id| {
+        let removed_in_flight = &mut self.removed_in_flight;
+        self.index_by_target.retain(|target_key, &mut slot_id| {
             let Some(slot) = slots.get_mut(slot_id).and_then(Option::as_mut) else {
                 return false;
             };
@@ -201,6 +224,7 @@ impl TargetSchedule {
             }
             if slot.in_flight {
                 slot.removed = true;
+                removed_in_flight.insert(Arc::clone(target_key), slot_id);
             } else {
                 slots[slot_id] = None;
                 free_slots.push(slot_id);
@@ -220,7 +244,9 @@ impl TargetSchedule {
                 .slots
                 .get(entry.slot_id)
                 .and_then(Option::as_ref)
-                .is_some_and(|s| !s.removed && s.generation == entry.generation);
+                .is_some_and(|s| {
+                    !s.removed && s.generation == entry.generation && s.next_due == entry.due
+                });
             if valid {
                 return Some(entry.due);
             }
@@ -243,7 +269,7 @@ impl TargetSchedule {
             let Some(slot) = self.slots.get_mut(entry.slot_id).and_then(Option::as_mut) else {
                 continue;
             };
-            if slot.removed || slot.generation != entry.generation {
+            if slot.removed || slot.generation != entry.generation || slot.next_due != entry.due {
                 continue;
             }
 
@@ -286,11 +312,16 @@ impl TargetSchedule {
             && slot.generation == generation
         {
             slot.in_flight = false;
-            slot.removed
+            if slot.removed {
+                Some(Arc::clone(&slot.target))
+            } else {
+                None
+            }
         } else {
-            false
+            None
         };
-        if reclaim {
+        if let Some(target) = reclaim {
+            self.removed_in_flight.remove(&target);
             self.slots[slot_id] = None;
             self.free_slots.push(slot_id);
         }
@@ -365,5 +396,38 @@ mod tests {
             sched.complete(d.slot_id, d.generation);
         }
         assert!(fired_urls.iter().any(|u| u == t1.url().as_str()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn readding_in_flight_target_does_not_overlap() {
+        let interval = Duration::from_secs(10);
+        let base = Instant::now();
+        let t1 = ScrapeTarget::parse("http://127.0.0.1:8090/metrics").expect("t1");
+
+        let mut sched = TargetSchedule::new(interval, 11);
+        sched.sync_targets(vec![t1.clone()], base);
+
+        let first_due = sched.peek_next_due().expect("due");
+        let active = sched.pop_due(first_due).expect("pop first");
+
+        // Flap SD: remove `t1` while in flight, peek (which drops its heap entry), then re-add `t1`.
+        sched.sync_targets(Vec::new(), first_due + Duration::from_secs(1));
+        assert!(sched.is_empty());
+        assert!(sched.peek_next_due().is_none());
+
+        sched.sync_targets(vec![t1.clone()], first_due + Duration::from_secs(2));
+        assert!(!sched.is_empty());
+
+        // At the next grid tick while the first scrape is still running, `pop_due` must skip `t1`
+        // and count 1 overrun rather than starting an overlapping second scrape.
+        assert!(sched.pop_due(first_due + interval).is_none());
+        assert_eq!(sched.take_overruns(), 1);
+
+        // Once the first scrape finishes, `t1` runs on the following tick.
+        sched.complete(active.slot_id, active.generation);
+        let next = sched
+            .pop_due(first_due + interval * 2)
+            .expect("fires after completion");
+        assert_eq!(next.target.url(), t1.url());
     }
 }
