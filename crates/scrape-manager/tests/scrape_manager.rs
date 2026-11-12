@@ -514,3 +514,173 @@ fn non_send_local_set_compatibility_for_thread_per_core_runtimes() {
         assert!(stats.total_body_buffers_created <= 2);
     });
 }
+
+#[cfg(feature = "arrow")]
+#[tokio::test(start_paused = true)]
+async fn cooperative_arrow_decode_reports_partial_errors_reclaims_pools_on_break_and_runs_loop() {
+    use prometheus_expfmt::arrow::{DecodeBudget, OtapMetricRecords};
+    use prometheus_scrape_manager::scrape::{ArrowScrapeSink, ScrapeReport};
+
+    enum StubMode {
+        OkText(Vec<u8>),
+        MissingEofOpenMetrics(Vec<u8>),
+        Http503,
+    }
+
+    struct StubFetcher {
+        by_url: HashMap<String, StubMode>,
+    }
+
+    impl TargetFetcher for StubFetcher {
+        async fn fetch(
+            &self,
+            target: &ScrapeTarget,
+            pool: &BodyBufferPool,
+        ) -> Result<FetchedScrape, ScrapeError> {
+            match self.by_url.get(target.url().as_str()).expect("stub url") {
+                StubMode::OkText(bytes) => {
+                    let mut body = pool.acquire(bytes.len()).await;
+                    body.extend_from_slice(bytes);
+                    Ok(FetchedScrape {
+                        body,
+                        format: Format::TEXT,
+                        scrape_timestamp_ms: 1_700_000_000_000,
+                        fetch_duration: Duration::from_millis(1),
+                        wire_bytes: bytes.len(),
+                    })
+                }
+                StubMode::MissingEofOpenMetrics(bytes) => {
+                    let mut body = pool.acquire(bytes.len()).await;
+                    body.extend_from_slice(bytes);
+                    Ok(FetchedScrape {
+                        body,
+                        format: Format::OPEN_METRICS_1_0_0,
+                        scrape_timestamp_ms: 1_700_000_000_000,
+                        fetch_duration: Duration::from_millis(1),
+                        wire_bytes: bytes.len(),
+                    })
+                }
+                StubMode::Http503 => Err(ScrapeError::UnexpectedStatus { status: 503 }),
+            }
+        }
+    }
+
+    struct InspectSink {
+        break_on_first_batch: bool,
+        batches: Mutex<usize>,
+        reports: Mutex<Vec<ScrapeReport>>,
+    }
+
+    impl ArrowScrapeSink for InspectSink {
+        async fn on_batch(
+            &self,
+            _target: &ScrapeTarget,
+            _ts_ms: i64,
+            _records: OtapMetricRecords,
+        ) -> ControlFlow<()> {
+            *self.batches.lock().unwrap() += 1;
+            if self.break_on_first_batch {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+
+        async fn on_scrape_complete(
+            &self,
+            _target: &ScrapeTarget,
+            report: ScrapeReport,
+        ) -> ControlFlow<()> {
+            self.reports.lock().unwrap().push(report);
+            ControlFlow::Continue(())
+        }
+    }
+
+    let ok_target = ScrapeTarget::parse("http://10.9.0.1:9100/metrics").unwrap();
+    let bad_om_target = ScrapeTarget::parse("http://10.9.0.2:9100/metrics").unwrap();
+    let down_target = ScrapeTarget::parse("http://10.9.0.3:9100/metrics").unwrap();
+
+    let mut ok_payload = String::from("# TYPE coop_metric gauge\n");
+    for i in 0..25 {
+        ok_payload.push_str(&format!("coop_metric{{idx=\"{i}\"}} {i}\n"));
+    }
+    let mut missing_eof = String::from("# TYPE om_metric gauge\n");
+    for i in 0..8 {
+        missing_eof.push_str(&format!("om_metric{{idx=\"{i}\"}} {i}\n"));
+    }
+
+    let mut by_url = HashMap::new();
+    by_url.insert(
+        ok_target.url().as_str().to_owned(),
+        StubMode::OkText(ok_payload.into_bytes()),
+    );
+    by_url.insert(
+        bad_om_target.url().as_str().to_owned(),
+        StubMode::MissingEofOpenMetrics(missing_eof.into_bytes()),
+    );
+    by_url.insert(down_target.url().as_str().to_owned(), StubMode::Http503);
+
+    // Tight `DecodeBudget` (2 entries / 32 bytes) forces `DecodeStep::Pending` cooperative yields
+    // and sub-slice budget clamping on a single-buffer, single-decoder sequential manager.
+    let cfg = ScrapeConfig::new("coop-arrow")
+        .with_scrape_interval(Duration::from_secs(10))
+        .with_scrape_timeout(Duration::from_secs(5))
+        .with_max_data_points_per_batch(4)
+        .with_decode_budget(DecodeBudget::new(2, 32, Duration::from_millis(1)))
+        .with_scheduling(SchedulingMode::sequential());
+    let manager = ScrapeManager::new(cfg, StubFetcher { by_url }).expect("manager");
+
+    // 1. Break on chunk 1 of a multi-chunk scrape must reclaim both single-slot pools cleanly.
+    let break_sink = InspectSink {
+        break_on_first_batch: true,
+        batches: Mutex::new(0),
+        reports: Mutex::new(Vec::new()),
+    };
+    let brk = manager.scrape_once_arrow(&ok_target, &break_sink).await;
+    assert!(brk.is_break());
+
+    // 2. Subsequent scrapes succeed without deadlocking on the 1-slot body/decoder pools, and
+    // mid-stream OpenMetrics decode failure reports the 2 tentative chunks emitted before EOF.
+    let sink = InspectSink {
+        break_on_first_batch: false,
+        batches: Mutex::new(0),
+        reports: Mutex::new(Vec::new()),
+    };
+    let ok_rep = match manager.scrape_once_arrow(&ok_target, &sink).await {
+        ControlFlow::Continue(r) => r,
+        ControlFlow::Break(()) => panic!("unexpected break"),
+    };
+    assert!(ok_rep.up);
+    assert_eq!(ok_rep.data_points_decoded, 25);
+    assert_eq!(ok_rep.batches_emitted, 7);
+
+    let om_rep = match manager.scrape_once_arrow(&bad_om_target, &sink).await {
+        ControlFlow::Continue(r) => r,
+        ControlFlow::Break(()) => panic!("unexpected break"),
+    };
+    assert!(!om_rep.up);
+    assert_eq!(om_rep.data_points_decoded, 8);
+    assert_eq!(om_rep.batches_emitted, 2);
+    assert!(om_rep.error.is_some());
+
+    let down_rep = match manager.scrape_once_arrow(&down_target, &sink).await {
+        ControlFlow::Continue(r) => r,
+        ControlFlow::Break(()) => panic!("unexpected break"),
+    };
+    assert!(!down_rep.up);
+    assert_eq!(down_rep.batches_emitted, 0);
+
+    // 3. Drive continuous `run_arrow` across one interval tick and shut down cleanly.
+    let (ctrl, ctrl_rx) = ScrapeManager::control_channel();
+    let driver = async move {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let _ = ctrl.shutdown();
+    };
+    tokio::join!(manager.run_arrow(vec![ok_target], ctrl_rx, &sink), driver);
+
+    let stats = manager.stats();
+    assert_eq!(stats.total_body_buffers_created, 1);
+    assert_eq!(stats.total_decoders_created, 1);
+    assert_eq!(stats.scrapes_succeeded, 2);
+    assert_eq!(stats.scrapes_failed, 2);
+}
