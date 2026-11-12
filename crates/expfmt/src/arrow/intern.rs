@@ -75,7 +75,18 @@ pub(super) struct StringInterner {
 }
 
 impl StringInterner {
+    pub(super) const fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            offsets: Vec::new(),
+            buckets: Vec::new(),
+        }
+    }
+
     pub(super) fn with_capacity(strings: usize, byte_cap: usize) -> Self {
+        if strings == 0 && byte_cap == 0 {
+            return Self::new();
+        }
         let bucket_cap = (strings.saturating_mul(2)).next_power_of_two().max(16);
         let mut offsets = Vec::with_capacity(strings + 1);
         offsets.push(0);
@@ -89,14 +100,16 @@ impl StringInterner {
     /// Resets the interner for the next scrape while preserving backing capacities.
     pub(super) fn clear(&mut self) {
         self.bytes.clear();
-        self.offsets.clear();
-        self.offsets.push(0);
+        if !self.offsets.is_empty() {
+            self.offsets.clear();
+            self.offsets.push(0);
+        }
         self.buckets.fill(Bucket::EMPTY);
     }
 
     #[inline]
     pub(super) fn len(&self) -> usize {
-        self.offsets.len() - 1
+        self.offsets.len().saturating_sub(1)
     }
 
     pub(super) fn retained_memory_bytes(&self) -> usize {
@@ -125,6 +138,9 @@ impl StringInterner {
     /// Looks up a previously interned byte slice without inserting it.
     #[inline]
     pub(super) fn lookup(&self, raw: &[u8]) -> Option<u32> {
+        if self.buckets.is_empty() {
+            return None;
+        }
         let hash = fx_hash(raw);
         let mask = self.buckets.len() - 1;
         let mut slot = (hash as usize) & mask;
@@ -145,6 +161,10 @@ impl StringInterner {
     /// arena exceeds `i32::MAX`.
     #[inline]
     pub(super) fn intern(&mut self, raw: &[u8]) -> Option<u32> {
+        if self.buckets.is_empty() {
+            self.offsets.push(0);
+            self.buckets.resize(16, Bucket::EMPTY);
+        }
         let hash = fx_hash(raw);
         let mask = self.buckets.len() - 1;
         let mut slot = (hash as usize) & mask;
@@ -198,9 +218,17 @@ impl StringInterner {
 
     /// Materializes all interned strings in insertion order (`0..len()`) as an Arrow `StringArray`.
     pub(super) fn to_string_array(&self) -> StringArray {
-        let offsets_buf = Buffer::from_slice_ref(&self.offsets);
-        let offsets =
-            OffsetBuffer::new(ScalarBuffer::<i32>::new(offsets_buf, 0, self.offsets.len()));
+        let offsets_slice = if self.offsets.is_empty() {
+            &[0i32][..]
+        } else {
+            &self.offsets[..]
+        };
+        let offsets_buf = Buffer::from_slice_ref(offsets_slice);
+        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::new(
+            offsets_buf,
+            0,
+            offsets_slice.len(),
+        ));
         let values = Buffer::from_slice_ref(&self.bytes);
         // SAFETY-FREE invariant: every interned entry came from a valid `&str`, and `self.offsets`
         // is monotonically non-decreasing starting at `0` and ending at `self.bytes.len()`.
