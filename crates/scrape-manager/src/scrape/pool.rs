@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex};
 use prometheus_expfmt::arrow::ArrowDecoder;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::scrape::http::PooledGzipDecoder;
+
 /// Bounded pool of reusable HTTP response body buffers.
 ///
 /// Concurrent scrapes acquire a [`PooledBodyBuffer`] only after HTTP response headers arrive, and
@@ -31,9 +33,15 @@ pub struct BodyBufferPool {
 }
 
 #[derive(Debug)]
+struct IdleBodySlot {
+    buf: Vec<u8>,
+    gzip: Option<Box<PooledGzipDecoder>>,
+}
+
+#[derive(Debug)]
 struct BodyPoolInner {
     semaphore: Arc<Semaphore>,
-    idle: Mutex<Vec<Vec<u8>>>,
+    idle: Mutex<Vec<IdleBodySlot>>,
     max_retained_bytes: usize,
     active_leases: AtomicUsize,
     peak_leases: AtomicUsize,
@@ -69,7 +77,7 @@ impl BodyBufferPool {
         let active = self.inner.active_leases.fetch_add(1, Ordering::Relaxed) + 1;
         self.inner.peak_leases.fetch_max(active, Ordering::Relaxed);
 
-        let mut buf = {
+        let mut slot = {
             let mut idle = self
                 .inner
                 .idle
@@ -79,12 +87,16 @@ impl BodyBufferPool {
         }
         .unwrap_or_else(|| {
             self.inner.total_created.fetch_add(1, Ordering::Relaxed);
-            Vec::new()
+            IdleBodySlot {
+                buf: Vec::new(),
+                gzip: None,
+            }
         });
 
-        buf.clear();
+        slot.buf.clear();
         let mut leased = PooledBodyBuffer {
-            buf,
+            buf: slot.buf,
+            gzip: slot.gzip,
             pool: Arc::clone(&self.inner),
             _permit: permit,
         };
@@ -120,7 +132,7 @@ impl BodyBufferPool {
             .idle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        idle.iter().map(Vec::capacity).sum()
+        idle.iter().map(|slot| slot.buf.capacity()).sum()
     }
 }
 
@@ -128,6 +140,7 @@ impl BodyBufferPool {
 #[derive(Debug)]
 pub struct PooledBodyBuffer {
     buf: Vec<u8>,
+    gzip: Option<Box<PooledGzipDecoder>>,
     pool: Arc<BodyPoolInner>,
     // Field drop order guarantees `buf` is pushed back to `pool.idle` in `Drop` before `_permit`
     // releases its semaphore slot to a waiting task.
@@ -139,6 +152,10 @@ impl PooledBodyBuffer {
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         self.buf.as_slice()
+    }
+
+    pub(crate) fn parts_mut(&mut self) -> (&mut Vec<u8>, &mut Option<Box<PooledGzipDecoder>>) {
+        (&mut self.buf, &mut self.gzip)
     }
 }
 
@@ -169,13 +186,19 @@ impl Drop for PooledBodyBuffer {
         if buf.capacity() > self.pool.max_retained_bytes {
             buf.shrink_to(self.pool.max_retained_bytes);
         }
+        let mut gzip = self.gzip.take();
+        if self.pool.max_retained_bytes == 0 {
+            gzip = None;
+        } else if let Some(dec) = gzip.as_mut() {
+            dec.shrink_retained(self.pool.max_retained_bytes);
+        }
         self.pool.active_leases.fetch_sub(1, Ordering::Relaxed);
         let mut idle = self
             .pool
             .idle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        idle.push(buf);
+        idle.push(IdleBodySlot { buf, gzip });
     }
 }
 

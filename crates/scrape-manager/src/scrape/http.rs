@@ -12,10 +12,10 @@
 // limitations under the License.
 
 use std::future::Future;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Read};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use flate2::write::GzDecoder;
+use flate2::bufread::GzDecoder;
 #[cfg(feature = "arrow")]
 use prometheus_expfmt::arrow::DecodeError;
 use prometheus_expfmt::format::{EscapingScheme, FMT_TEXT, Format, FormatType, response_format};
@@ -351,23 +351,19 @@ impl TargetFetcher for ReqwestFetcher {
                     }
                 }
                 BodyEncoding::Gzip => {
-                    let mut decoder = GzDecoder::new(BoundedVecWriter {
-                        buf: &mut body,
-                        limit: self.max_body_bytes,
-                    });
+                    let (out_buf, gzip_slot) = body.parts_mut();
+                    let decoder =
+                        gzip_slot.get_or_insert_with(|| Box::new(PooledGzipDecoder::new()));
+                    decoder.reset_for_scrape();
                     while let Some(chunk) = response
                         .chunk()
                         .await
                         .map_err(|err| map_reqwest_error(err, timeout))?
                     {
                         wire_bytes = wire_bytes.saturating_add(chunk.len());
-                        decoder
-                            .write_all(&chunk)
-                            .map_err(|err| map_gzip_io_error(err, self.max_body_bytes))?;
+                        decoder.push_chunk(&chunk, out_buf, self.max_body_bytes)?;
                     }
-                    decoder
-                        .finish()
-                        .map_err(|err| map_gzip_io_error(err, self.max_body_bytes))?;
+                    decoder.finish(out_buf, self.max_body_bytes)?;
                 }
             }
 
@@ -433,44 +429,151 @@ fn classify_content_encoding(
     Ok(resolved)
 }
 
-struct BoundedVecWriter<'a> {
-    buf: &'a mut Vec<u8>,
-    limit: usize,
+#[derive(Debug, Default)]
+struct ChunkFeed {
+    buf: Vec<u8>,
+    pos: usize,
+    eof: bool,
 }
 
-#[derive(Debug)]
-struct BodyLimitExceededError;
-
-impl std::fmt::Display for BodyLimitExceededError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("body limit exceeded")
+impl ChunkFeed {
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.pos = 0;
+        self.eof = false;
     }
-}
 
-impl std::error::Error for BodyLimitExceededError {}
-
-impl Write for BoundedVecWriter<'_> {
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        if self.buf.len().saturating_add(data.len()) > self.limit {
-            return Err(io::Error::other(BodyLimitExceededError));
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        if self.pos >= self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+        } else if self.pos > 0 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
         }
-        self.buf.extend_from_slice(data);
-        Ok(data.len())
+        self.buf.extend_from_slice(bytes);
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+    fn is_empty(&self) -> bool {
+        self.pos >= self.buf.len()
     }
 }
 
-fn map_gzip_io_error(err: io::Error, limit_bytes: usize) -> ScrapeError {
-    if err
-        .get_ref()
-        .is_some_and(|inner| inner.is::<BodyLimitExceededError>())
-    {
-        ScrapeError::BodyTooLarge { limit_bytes }
-    } else {
-        ScrapeError::Decompress(err.to_string())
+impl Read for ChunkFeed {
+    fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+        let avail = self.fill_buf()?;
+        let n = avail.len().min(dst.len());
+        dst[..n].copy_from_slice(&avail[..n]);
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+impl BufRead for ChunkFeed {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.pos < self.buf.len() {
+            Ok(&self.buf[self.pos..])
+        } else if self.eof {
+            Ok(&[])
+        } else {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos = (self.pos + amt).min(self.buf.len());
+        if self.pos == self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+        }
+    }
+}
+
+/// Reusable streaming gzip inflate state parked alongside a [`PooledBodyBuffer`] so repeated
+/// compressed scrapes avoid reallocating `miniz_oxide`'s ~40 KiB dictionary and 32 KiB buffer.
+#[derive(Debug)]
+pub(crate) struct PooledGzipDecoder {
+    decoder: GzDecoder<ChunkFeed>,
+    member_started: bool,
+    member_finished: bool,
+}
+
+impl PooledGzipDecoder {
+    pub(crate) fn new() -> Self {
+        Self {
+            decoder: GzDecoder::new(ChunkFeed::default()),
+            member_started: false,
+            member_finished: false,
+        }
+    }
+
+    pub(crate) fn reset_for_scrape(&mut self) {
+        let mut feed = self.decoder.reset(ChunkFeed::default());
+        feed.clear();
+        let _ = self.decoder.reset(feed);
+        self.member_started = false;
+        self.member_finished = false;
+    }
+
+    pub(crate) fn shrink_retained(&mut self, max_retained_bytes: usize) {
+        let cap = max_retained_bytes.min(64 * 1024);
+        let feed = self.decoder.get_mut();
+        feed.clear();
+        if feed.buf.capacity() > cap {
+            feed.buf.shrink_to(cap);
+        }
+    }
+
+    fn push_chunk(
+        &mut self,
+        chunk: &[u8],
+        out: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<(), ScrapeError> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        if self.member_finished {
+            return Err(ScrapeError::Decompress(
+                "unexpected trailing bytes after gzip stream".to_owned(),
+            ));
+        }
+        self.member_started = true;
+        self.decoder.get_mut().push_bytes(chunk);
+        self.drain_into(out, limit)
+    }
+
+    fn finish(&mut self, out: &mut Vec<u8>, limit: usize) -> Result<(), ScrapeError> {
+        self.decoder.get_mut().eof = true;
+        if self.member_finished && self.decoder.get_ref().is_empty() {
+            return Ok(());
+        }
+        self.drain_into(out, limit)
+    }
+
+    fn drain_into(&mut self, out: &mut Vec<u8>, limit: usize) -> Result<(), ScrapeError> {
+        let mut scratch = [0_u8; 8_192];
+        loop {
+            match self.decoder.read(&mut scratch) {
+                Ok(0) => {
+                    self.member_finished = true;
+                    if !self.decoder.get_ref().is_empty() {
+                        return Err(ScrapeError::Decompress(
+                            "unexpected trailing bytes after gzip stream".to_owned(),
+                        ));
+                    }
+                    return Ok(());
+                }
+                Ok(n) => {
+                    if out.len().saturating_add(n) > limit {
+                        return Err(ScrapeError::BodyTooLarge { limit_bytes: limit });
+                    }
+                    out.extend_from_slice(&scratch[..n]);
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) => return Err(ScrapeError::Decompress(err.to_string())),
+            }
+        }
     }
 }
 
@@ -484,6 +587,7 @@ pub(crate) fn current_timestamp_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::num::NonZeroUsize;
     use std::time::Duration;
 
