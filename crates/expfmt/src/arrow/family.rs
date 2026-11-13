@@ -159,13 +159,18 @@ impl CurrentFamily {
             }
             MetricType::Counter => {
                 if series_name == fam {
-                    if series_name.len() > 6 && series_name.ends_with(b"_total") {
+                    if !self.has_samples
+                        && series_name.len() > 6
+                        && series_name.ends_with(b"_total")
+                    {
                         self.saw_total_suffix = true;
                     }
                     return Some(SeriesRole::Scalar);
                 }
                 if series_name.strip_prefix(fam) == Some(b"_total") {
-                    self.saw_total_suffix = true;
+                    if !self.has_samples {
+                        self.saw_total_suffix = true;
+                    }
                     return Some(SeriesRole::Scalar);
                 }
                 None
@@ -179,6 +184,19 @@ impl CurrentFamily {
         }
     }
 
+    /// Returns the canonical family key `(name, metric_type, saw_total_suffix)` where an explicit
+    /// `MetricType::Counter` family whose header name ends with `_total` has that single trailing
+    /// `_total` stripped into `saw_total_suffix = true`.
+    #[inline]
+    pub(super) fn canonical_key(&self) -> (&[u8], MetricType, bool) {
+        let raw = self.unescaped_name.as_slice();
+        if self.metric_type == MetricType::Counter && raw.len() > 6 && raw.ends_with(b"_total") {
+            (&raw[..raw.len() - 6], MetricType::Counter, true)
+        } else {
+            (raw, self.metric_type, self.saw_total_suffix)
+        }
+    }
+
     #[inline]
     pub(super) fn emit_into_batch(
         &mut self,
@@ -189,10 +207,11 @@ impl CurrentFamily {
             return Ok(id);
         }
 
+        let (fam_name, metric_type, saw_total_suffix) = self.canonical_key();
         let id = emit_family_row(
-            &self.unescaped_name,
-            self.metric_type,
-            self.saw_total_suffix,
+            fam_name,
+            metric_type,
+            saw_total_suffix,
             self.has_help,
             &self.help,
             self.has_unit,
@@ -234,7 +253,7 @@ pub(super) fn emit_family_row(
         && fam_name.ends_with(b"_total");
     let is_counter = metric_type == MetricType::Counter || inferred_counter;
 
-    let mut base_name = if is_counter && fam_name.len() > 6 && fam_name.ends_with(b"_total") {
+    let mut base_name = if inferred_counter {
         &fam_name[..fam_name.len() - 6]
     } else {
         fam_name
@@ -250,8 +269,9 @@ pub(super) fn emit_family_row(
         base_name = &base_name[..base_name.len() - unit.len() - 1];
     }
 
-    let append_total =
-        is_counter && opts.counter_suffix_policy == CounterSuffixPolicy::Keep && saw_total_suffix;
+    let append_total = is_counter
+        && opts.counter_suffix_policy == CounterSuffixPolicy::Keep
+        && (saw_total_suffix || inferred_counter);
     let emitted_name_len = base_name.len() + if append_total { 6 } else { 0 };
 
     let next_name_len = metrics.name_bytes.len().saturating_add(emitted_name_len);
@@ -691,17 +711,19 @@ impl FamilyAssembly {
                     })?;
                     sum_dp.quantile_offsets.push(q_off);
 
-                    if (group.ts_ns.is_none() || opts.track_timestamps_staleness)
-                        && let Some(tr) = tracker.as_deref_mut()
-                    {
-                        tr.record_series(
-                            current_family,
-                            DpKind::Summary,
-                            &self.group_attrs[attr_start..attr_end],
-                            key_interner,
-                            val_interner,
-                            group.is_stale,
-                        )?;
+                    if let Some(tr) = tracker.as_deref_mut() {
+                        if group.ts_ns.is_none() || opts.track_timestamps_staleness {
+                            tr.record_series(
+                                current_family,
+                                DpKind::Summary,
+                                &self.group_attrs[attr_start..attr_end],
+                                key_interner,
+                                val_interner,
+                                group.is_stale,
+                            )?;
+                        } else {
+                            tr.sync_existing_family(current_family)?;
+                        }
                     }
                 }
             }
@@ -801,17 +823,19 @@ impl FamilyAssembly {
                     hist_dp.bucket_offsets.push(bucket_off);
                     hist_dp.bounds_offsets.push(bounds_off);
 
-                    if (group.ts_ns.is_none() || opts.track_timestamps_staleness)
-                        && let Some(tr) = tracker.as_deref_mut()
-                    {
-                        tr.record_series(
-                            current_family,
-                            DpKind::Histogram,
-                            &self.group_attrs[attr_start..attr_end],
-                            key_interner,
-                            val_interner,
-                            group.is_stale,
-                        )?;
+                    if let Some(tr) = tracker.as_deref_mut() {
+                        if group.ts_ns.is_none() || opts.track_timestamps_staleness {
+                            tr.record_series(
+                                current_family,
+                                DpKind::Histogram,
+                                &self.group_attrs[attr_start..attr_end],
+                                key_interner,
+                                val_interner,
+                                group.is_stale,
+                            )?;
+                        } else {
+                            tr.sync_existing_family(current_family)?;
+                        }
                     }
                 }
             }

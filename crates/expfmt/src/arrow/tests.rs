@@ -1562,25 +1562,134 @@ fn staleness_rehashing_compaction_exemplar_isolation_and_key_reordering() {
     assert_eq!(tracker.active_series_len(), 80);
 
     // 2. Reverse label key order (`z` interned before `a` on both batch and tracker) to exercise
-    //    `!sorted` attribute re-sorting in `record_series` and `emit_single_stale_series`.
-    let reversed_live = "# TYPE fam_0 gauge\nfam_0{z=\"v0_0\",a=\"1\"} 99\n";
-    let rec2 = dec
+    //    `!sorted` attribute re-sorting in `record_series` and `emit_single_stale_series`, while
+    //    updating `# HELP` and `# UNIT` on `fam_0` (`update_existing_family`) and then compacting
+    //    surviving series whose remapped key IDs invert order (`!sorted` in `compact()`).
+    let mut om_initial = String::from(
+        "# TYPE fam_0_seconds gauge\n\
+         # UNIT fam_0_seconds seconds\n\
+         # HELP fam_0_seconds Initial help.\n\
+         fam_0_seconds{a=\"1\",b=\"1\"} 1\n\
+         fam_0_seconds{b=\"1\",c=\"1\"} 2\n\
+         fam_0_seconds{a=\"1\",c=\"1\"} 3\n",
+    );
+    for f in 1..40 {
+        om_initial.push_str(&format!(
+            "# HELP fam_{f} Help {f}.\n# TYPE fam_{f} gauge\n\
+             fam_{f}{{a=\"1\",z=\"v{f}_0\"}} {f}\n\
+             fam_{f}{{a=\"2\",z=\"v{f}_1\"}} {f}\n"
+        ));
+    }
+    om_initial.push_str("# EOF\n");
+    tracker.clear();
+    let rec1 = dec
         .decode_with_staleness(
-            reversed_live.as_bytes(),
-            &Format::TEXT,
-            &opts.with_timestamp_ms(2_000),
+            om_initial.as_bytes(),
+            &Format::OPEN_METRICS_1_0_0,
+            &opts.with_unit_suffix_policy(UnitSuffixPolicy::Keep),
             &mut tracker,
         )
         .unwrap();
-    assert_eq!(rec2.num_data_points(), 80); // 1 live + 79 stale
-    assert_eq!(tracker.active_series_len(), 1);
+    assert_eq!(rec1.num_data_points(), 81);
+    assert_eq!(tracker.active_series_len(), 81);
 
-    // 3. `clear()` resets active tracking while preserving capacity.
+    // Failed scrape after updating `# HELP` on `fam_0_seconds` must roll back pending metadata.
+    let bad_meta_update = concat!(
+        "# TYPE fam_0_seconds gauge\n",
+        "# UNIT fam_0_seconds seconds\n",
+        "# HELP fam_0_seconds Corrupted help.\n",
+        "fam_0_seconds{b=\"1\",c=\"1\"} 20\n",
+        "fam_0_seconds{dup=\"1\",dup=\"2\"} 30\n",
+        "# EOF\n",
+    );
+    assert!(
+        dec.decode_with_staleness(
+            bad_meta_update.as_bytes(),
+            &Format::OPEN_METRICS_1_0_0,
+            &opts.with_unit_suffix_policy(UnitSuffixPolicy::Keep),
+            &mut tracker,
+        )
+        .is_err()
+    );
+    assert_eq!(tracker.active_series_len(), 81);
+
+    // Keep `{b="1",c="1"}` and `{a="1",c="1"}` (dropping `{a="1",b="1"}` and all `fam_1..39`),
+    // which triggers `compact()` where `b` and `c` get new key IDs `0, 1` and `a` gets `2`,
+    // exercising the `!sorted` key remap sort inside `compact()` as well as `# UNIT` preservation.
+    let om_update = concat!(
+        "# TYPE fam_0_seconds gauge\n",
+        "# UNIT fam_0_seconds seconds\n",
+        "# HELP fam_0_seconds Updated help.\n",
+        "fam_0_seconds{c=\"1\",b=\"1\"} 20\n",
+        "fam_0_seconds{a=\"1\",c=\"1\"} 30\n",
+        "# EOF\n",
+    );
+    let rec2 = dec
+        .decode_with_staleness(
+            om_update.as_bytes(),
+            &Format::OPEN_METRICS_1_0_0,
+            &opts
+                .with_timestamp_ms(2_000)
+                .with_unit_suffix_policy(UnitSuffixPolicy::Keep),
+            &mut tracker,
+        )
+        .unwrap();
+    assert_eq!(rec2.num_data_points(), 81); // 2 live + 79 stale
+    assert_eq!(tracker.active_series_len(), 2);
+
+    // Subsequent empty scrape emits the 2 surviving series with updated `# HELP` and `# UNIT`,
+    // and releases excess capacity once `active_series_len()` drops to 0.
+    let rec3 = dec
+        .decode_with_staleness(
+            b"# EOF\n",
+            &Format::OPEN_METRICS_1_0_0,
+            &opts
+                .with_timestamp_ms(2_500)
+                .with_unit_suffix_policy(UnitSuffixPolicy::Keep),
+            &mut tracker,
+        )
+        .unwrap();
+    assert_eq!(rec3.num_data_points(), 2);
+    assert!(tracker.is_empty());
+    let m_batch = rec3.univariate_metrics().unwrap();
+    let desc_col = m_batch
+        .column_by_name("description")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .unwrap();
+    let unit_col = m_batch
+        .column_by_name("unit")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .unwrap();
+    assert_eq!(desc_col.value(0), "Updated help.");
+    assert_eq!(unit_col.value(0), "seconds");
+
+    // 3. `clear()` on a small tracker resets active tracking while preserving small capacity,
+    //    whereas draining a large (>64 series) tracker to 0 active series releases excess capacity.
+    dec.decode_with_staleness(b"small_g 1\n", &Format::TEXT, &opts, &mut tracker)
+        .unwrap();
     let cap_before_clear = tracker.retained_memory_bytes();
     assert!(cap_before_clear > 0);
     tracker.clear();
     assert!(tracker.is_empty());
     assert_eq!(tracker.retained_memory_bytes(), cap_before_clear);
+
+    dec.decode_with_staleness(initial.as_bytes(), &Format::TEXT, &opts, &mut tracker)
+        .unwrap();
+    assert_eq!(tracker.active_series_len(), 80);
+    assert!(tracker.retained_memory_bytes() > 0);
+    dec.decode_with_staleness(
+        b"",
+        &Format::TEXT,
+        &opts.with_timestamp_ms(2_800),
+        &mut tracker,
+    )
+    .unwrap();
+    assert!(tracker.is_empty());
+    assert_eq!(tracker.retained_memory_bytes(), 0);
 
     // 4. Ephemeral OpenMetrics exemplar attributes must never enter `StalenessTracker` interners.
     let mut ex_tracker = StalenessTracker::new();
@@ -1677,7 +1786,8 @@ fn staleness_wire_nans_type_transitions_policies_and_cooperative_cursor() {
     assert_eq!(nan_rec2.num_data_points(), 3);
 
     // 2. Direct check of `SparseFlagsCol` trailing-zero backfill (`flags != 0` at row 0 followed by
-    //    `flags == 0` at row 1) and `SeenState::SeenStale` on incoming `STALE_NAN` values.
+    //    `flags == 0` at row 1), `OptionalValueCol` null-then-valid transition, and
+    //    `SeenState::SeenStale` on incoming `STALE_NAN` values.
     let mut sparse_flags = super::columns::SparseFlagsCol::default();
     sparse_flags.push(0, DATA_POINT_FLAG_NO_RECORDED_VALUE);
     sparse_flags.push(1, 0);
@@ -1691,8 +1801,66 @@ fn staleness_wire_nans_type_transitions_policies_and_cooperative_cursor() {
         &[DATA_POINT_FLAG_NO_RECORDED_VALUE, 0]
     );
 
-    // 3. `# TYPE` transitions (`histogram` -> `gauge`) and counter `_total` naming (`# TYPE req_total counter`
-    //    -> `# TYPE req counter` with `req_total` samples).
+    let mut opt_vals = super::columns::OptionalValueCol::with_capacity(2);
+    opt_vals.push_null(0);
+    opt_vals.push_value(42.5);
+    let val_arr = opt_vals.to_f64_array();
+    let val_f64 = val_arr
+        .as_any()
+        .downcast_ref::<arrow_array::Float64Array>()
+        .unwrap();
+    assert!(val_f64.is_null(0));
+    assert!(!val_f64.is_null(1));
+    assert_eq!(val_f64.value(1), 42.5);
+
+    // Exercise `SeenState::SeenStale` directly via `record_series(..., is_stale = true)`:
+    // an active series observed with `STALE_NAN` is deactivated on commit without emitting a
+    // second synthetic stale marker at end-of-scrape, and a new series first observed with
+    // `STALE_NAN` is not activated.
+    let mut direct_tracker = StalenessTracker::new();
+    dec.decode_with_staleness(
+        b"# TYPE g_direct gauge\ng_direct{k=\"1\"} 10\n",
+        &Format::TEXT,
+        &opts,
+        &mut direct_tracker,
+    )
+    .unwrap();
+    assert_eq!(direct_tracker.active_series_len(), 1);
+    direct_tracker.begin_scrape(999_999);
+    let mut fam = super::family::CurrentFamily::with_capacity(16, 16);
+    fam.start_new(b"g_direct", b"g_direct");
+    fam.metric_type = crate::parse::MetricType::Gauge;
+    let mut keys = super::intern::StringInterner::new();
+    let mut vals = super::intern::StringInterner::new();
+    let k_id = keys.intern(b"k").unwrap();
+    let v1_id = vals.intern(b"1").unwrap();
+    let v2_id = vals.intern(b"2").unwrap();
+    direct_tracker
+        .record_series(
+            &mut fam,
+            super::staleness::DpKind::Number,
+            &[(k_id, v1_id)],
+            &keys,
+            &vals,
+            true,
+        )
+        .unwrap();
+    direct_tracker
+        .record_series(
+            &mut fam,
+            super::staleness::DpKind::Number,
+            &[(k_id, v2_id)],
+            &keys,
+            &vals,
+            true,
+        )
+        .unwrap();
+    direct_tracker.commit_scrape();
+    assert!(direct_tracker.is_empty());
+
+    // 3. `# TYPE` transitions (`histogram` -> `gauge`), counter `_total` naming (`# TYPE req_total counter`
+    //    -> `# TYPE req counter` with `req_total` samples), `_total_total` counter stale emission,
+    //    and mixed `req` + `req_total` samples within one counter family.
     let mut type_tracker = StalenessTracker::new();
     dec.decode_with_staleness(
         b"# TYPE m histogram\nm_bucket{id=\"1\",le=\"+Inf\"} 2\nm_sum{id=\"1\"} 1.0\nm_count{id=\"1\"} 2\n\
@@ -1724,8 +1892,66 @@ fn staleness_wire_nans_type_transitions_policies_and_cooperative_cursor() {
     );
     assert_eq!(trans_rec.histogram_data_points().unwrap().num_rows(), 1);
 
+    // Counter ending in `_total_total` must strip at most one `_total` on stale emission.
+    for (policy, expected_name) in [
+        (CounterSuffixPolicy::Keep, "events_total_total"),
+        (CounterSuffixPolicy::Strip, "events_total"),
+    ] {
+        let mut tt_tracker = StalenessTracker::new();
+        let policy_opts = opts.with_counter_suffix_policy(policy);
+        let live_tt = dec
+            .decode_with_staleness(
+                b"# TYPE events_total_total counter\nevents_total_total 5\n",
+                &Format::TEXT,
+                &policy_opts,
+                &mut tt_tracker,
+            )
+            .unwrap();
+        let stale_tt = dec
+            .decode_with_staleness(
+                b"",
+                &Format::TEXT,
+                &policy_opts.with_timestamp_ms(2_000),
+                &mut tt_tracker,
+            )
+            .unwrap();
+        for rec in [&live_tt, &stale_tt] {
+            let names = rec
+                .univariate_metrics()
+                .unwrap()
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            assert_eq!(names.value(0), expected_name);
+        }
+    }
+
+    // Counter family mixing suffixless `mix_c` and suffixed `mix_c_total` keeps a single family key.
+    let mut mix_c_tracker = StalenessTracker::new();
+    dec.decode_with_staleness(
+        b"# TYPE mix_c counter\nmix_c{id=\"1\"} 1\nmix_c_total{id=\"2\"} 2\n",
+        &Format::TEXT,
+        &opts,
+        &mut mix_c_tracker,
+    )
+    .unwrap();
+    assert_eq!(mix_c_tracker.active_series_len(), 2);
+    let mix_c_stale = dec
+        .decode_with_staleness(
+            b"",
+            &Format::TEXT,
+            &opts.with_timestamp_ms(2_000),
+            &mut mix_c_tracker,
+        )
+        .unwrap();
+    assert_eq!(mix_c_stale.num_metrics(), 1);
+    assert_eq!(mix_c_stale.num_data_points(), 2);
+
     // 4. `UntypedPolicy::Drop` suppresses stale emission for previously tracked untyped series, and
-    //    `track_timestamps_staleness` skips explicit wire timestamps unless enabled.
+    //    `track_timestamps_staleness` skips explicit wire timestamps unless enabled while still
+    //    sharing the family's `UnivariateMetrics` row when a family mixes explicit-ts and stale series.
     let mut pol_tracker = StalenessTracker::new();
     dec.decode_with_staleness(
         b"untyped_m 1\nts_m 2 1700000000000\n",
@@ -1768,6 +1994,34 @@ fn staleness_wire_nans_type_transitions_policies_and_cooperative_cursor() {
         .unwrap();
     assert_eq!(ts_stale.num_data_points(), 1);
 
+    // Mixed family (untimestamped series + explicit-timestamp series with `track_timestamps_staleness == false`):
+    // when the untimestamped series disappears while the explicit-timestamp series remains, both must share
+    // a single `UnivariateMetrics` row per family (for gauge, summary, and histogram).
+    let mut mixed_ts_tracker = StalenessTracker::new();
+    dec.decode_with_staleness(
+        b"# TYPE mg gauge\nmg{k=\"no_ts\"} 1\nmg{k=\"with_ts\"} 2 1700000000000\n\
+          # TYPE ms summary\nms_sum{k=\"no_ts\"} 1\nms_count{k=\"no_ts\"} 1\nms_sum{k=\"with_ts\"} 2 1700000000000\nms_count{k=\"with_ts\"} 2 1700000000000\n\
+          # TYPE mh histogram\nmh_bucket{k=\"no_ts\",le=\"+Inf\"} 1\nmh_sum{k=\"no_ts\"} 1\nmh_count{k=\"no_ts\"} 1\nmh_bucket{k=\"with_ts\",le=\"+Inf\"} 2 1700000000000\nmh_sum{k=\"with_ts\"} 2 1700000000000\nmh_count{k=\"with_ts\"} 2 1700000000000\n",
+        &Format::TEXT,
+        &opts,
+        &mut mixed_ts_tracker,
+    )
+    .unwrap();
+    assert_eq!(mixed_ts_tracker.active_series_len(), 3);
+    let mixed_ts_rec2 = dec
+        .decode_with_staleness(
+            b"# TYPE mg gauge\nmg{k=\"with_ts\"} 20 1700000001000\n\
+              # TYPE ms summary\nms_sum{k=\"with_ts\"} 20 1700000001000\nms_count{k=\"with_ts\"} 20 1700000001000\n\
+              # TYPE mh histogram\nmh_bucket{k=\"with_ts\",le=\"+Inf\"} 20 1700000001000\nmh_sum{k=\"with_ts\"} 20 1700000001000\nmh_count{k=\"with_ts\"} 20 1700000001000\n",
+            &Format::TEXT,
+            &opts.with_timestamp_ms(2_000),
+            &mut mixed_ts_tracker,
+        )
+        .unwrap();
+    assert_eq!(mixed_ts_rec2.num_metrics(), 3);
+    assert_eq!(mixed_ts_rec2.num_data_points(), 6);
+    assert!(mixed_ts_tracker.is_empty());
+
     // 5. Cooperative `step_decode_with_staleness`, `finish_decode_with_staleness`, and budgeted
     //    `DecodeStream::next_cooperative` yielding `Pending` during EOF stale draining.
     let mut coop_tracker = StalenessTracker::new();
@@ -1795,7 +2049,9 @@ fn staleness_wire_nans_type_transitions_policies_and_cooperative_cursor() {
     drop(bad_init_stream);
     assert_eq!(coop_tracker.active_series_len(), 4);
 
-    // Aborting `step_decode_with_staleness` via `finish_decode_with_staleness` rolls back.
+    // Aborting `step_decode_with_staleness` via `finish_decode_with_staleness` rolls back,
+    // including when another scrape has already started on `dec`, and mixing trackers or
+    // tracked/untracked step calls on the same cursor is rejected with `InvalidCursor`.
     let budget_1 = DecodeBudget::default().with_max_entries(1);
     let mut aborted_cur = dec.start_decode(&Format::TEXT, &opts).unwrap();
     assert_eq!(
@@ -1808,7 +2064,38 @@ fn staleness_wire_nans_type_transitions_policies_and_cooperative_cursor() {
         .unwrap(),
         DecodeStep::Pending
     );
+    let mut other_tracker = StalenessTracker::new();
+    assert!(matches!(
+        dec.step_decode_with_staleness(
+            &mut aborted_cur,
+            b"# TYPE g gauge\ng{k=\"new\"} 9\n",
+            budget_1,
+            &mut other_tracker
+        ),
+        Err(DecodeError::InvalidCursor(_))
+    ));
     dec.finish_decode_with_staleness(&mut aborted_cur, &mut coop_tracker);
+    assert_eq!(coop_tracker.active_series_len(), 4);
+
+    let mut mix_cur = dec.start_decode(&Format::TEXT, &opts).unwrap();
+    assert_eq!(
+        dec.step_decode_with_staleness(
+            &mut mix_cur,
+            b"# TYPE g gauge\ng{k=\"new\"} 9\n",
+            budget_1,
+            &mut coop_tracker
+        )
+        .unwrap(),
+        DecodeStep::Pending
+    );
+    assert!(matches!(
+        dec.step_decode(&mut mix_cur, b"# TYPE g gauge\ng{k=\"new\"} 9\n", budget_1),
+        Err(DecodeError::InvalidCursor(_))
+    ));
+    // Starting another decode advances `dec.scrape_id`; `finish_decode_with_staleness` still
+    // rolls back `coop_tracker` via `active_scrape_id`.
+    dec.decode(b"g 1\n", &Format::TEXT, &opts).unwrap();
+    dec.finish_decode_with_staleness(&mut mix_cur, &mut coop_tracker);
     assert_eq!(coop_tracker.active_series_len(), 4);
 
     // Drive `step_decode_with_staleness` on `b""` with `max_entries = 1` so EOF stale draining
@@ -1887,4 +2174,85 @@ fn staleness_wire_nans_type_transitions_policies_and_cooperative_cursor() {
     assert!(yields >= 2);
     assert_eq!(chunks.len(), 2);
     assert!(coop_tracker.is_empty());
+}
+
+#[test]
+fn staleness_label_set_deduplication_and_single_rotation_compaction() {
+    let mut dec = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    let opts = DecodeOptions::new().with_timestamp_ms(1_000);
+
+    // 1. 10 metric families sharing 100 identical 12-label sets (1,000 active series total).
+    //    Per-target label-set deduplication stores only 100 unique label sets in `series_attrs`
+    //    instead of 1,000 copies, keeping total tracker memory well under 48 KiB.
+    let build_shared_scrape = |cycle_id: u32| -> String {
+        let mut s = String::new();
+        for f in 0..10 {
+            s.push_str(&format!(
+                "# HELP metric_family_{f} Family {f}.\n# TYPE metric_family_{f} gauge\n"
+            ));
+            for series_id in 0..100 {
+                s.push_str(&format!(
+                    "metric_family_{f}{{cycle_id=\"{cycle_id}\",series_id=\"{series_id}\",\
+                     l0=\"val_0\",l1=\"val_1\",l2=\"val_2\",l3=\"val_3\",l4=\"val_4\",\
+                     l5=\"val_5\",l6=\"val_6\",l7=\"val_7\",l8=\"val_8\",l9=\"val_9\"}} {series_id}\n"
+                ));
+            }
+        }
+        s
+    };
+
+    let scrape_cycle_0 = build_shared_scrape(0);
+    let rec0 = dec
+        .decode_with_staleness(
+            scrape_cycle_0.as_bytes(),
+            &Format::TEXT,
+            &opts,
+            &mut tracker,
+        )
+        .unwrap();
+    assert_eq!(rec0.num_data_points(), 1_000);
+    assert_eq!(tracker.active_series_len(), 1_000);
+    let mem_cycle_0 = tracker.retained_memory_bytes();
+    // Without label-set deduplication and 8-byte bucket/entry packing, 1,000 series x 12 labels
+    // took >140 KiB; with deduplication and shrink-to-fit it takes ~33 KiB (< 48 KiB).
+    assert!(
+        mem_cycle_0 < 48 * 1024,
+        "expected deduplicated tracker memory < 48 KiB, got {mem_cycle_0} B"
+    );
+
+    // 2. A mid-scrape error after introducing new label sets rolls back `attr_sets` and
+    //    `series_attrs` cleanly.
+    let bad_scrape =
+        b"# TYPE metric_family_0 gauge\nmetric_family_0{new_k=\"new_v\"} 1\nbad_syntax_line\n";
+    assert!(
+        dec.decode_with_staleness(
+            bad_scrape,
+            &Format::TEXT,
+            &opts.with_timestamp_ms(1_500),
+            &mut tracker
+        )
+        .is_err()
+    );
+    assert_eq!(tracker.active_series_len(), 1_000);
+
+    // 3. A single 100% label rotation (`cycle_id="0"` -> `cycle_id="1"`) emits 1,000 live + 1,000
+    //    stale data points and immediately compacts the 1,000 deactivated series at the end of the
+    //    scrape instead of retaining 2x dead series until a second rotation.
+    let scrape_cycle_1 = build_shared_scrape(1);
+    let rec1 = dec
+        .decode_with_staleness(
+            scrape_cycle_1.as_bytes(),
+            &Format::TEXT,
+            &opts.with_timestamp_ms(2_000),
+            &mut tracker,
+        )
+        .unwrap();
+    assert_eq!(rec1.num_data_points(), 2_000);
+    assert_eq!(tracker.active_series_len(), 1_000);
+    let mem_cycle_1 = tracker.retained_memory_bytes();
+    assert_eq!(
+        mem_cycle_1, mem_cycle_0,
+        "single 100% churn rotation must compact dead series immediately ({mem_cycle_1} vs {mem_cycle_0})"
+    );
 }

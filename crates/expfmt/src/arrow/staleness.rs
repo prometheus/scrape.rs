@@ -29,7 +29,7 @@ use crate::parse::MetricType;
 
 use super::columns::{HistogramDpTable, MetricTable, NumberDpTable, SummaryDpTable};
 use super::family::{CurrentFamily, emit_family_row, hash_attrs};
-use super::intern::StringInterner;
+use super::intern::{StringInterner, bucket_capacity_for_len};
 use super::options::{
     DECODE_BUDGET_DURATION_CHECK_INTERVAL, DecodeError, DecodeOptions, UntypedPolicy,
 };
@@ -86,24 +86,7 @@ const fn metric_type_tag(mt: MetricType) -> u8 {
 }
 
 #[inline]
-fn canonical_family_key(current_family: &CurrentFamily) -> (&[u8], MetricType, bool) {
-    let raw = current_family.unescaped_name.as_slice();
-    if current_family.metric_type == MetricType::Counter
-        && raw.len() > 6
-        && raw.ends_with(b"_total")
-    {
-        (&raw[..raw.len() - 6], MetricType::Counter, true)
-    } else {
-        (
-            raw,
-            current_family.metric_type,
-            current_family.saw_total_suffix,
-        )
-    }
-}
-
-#[inline]
-fn hash_family_key(name: &[u8], metric_type: MetricType, saw_total_suffix: bool) -> u64 {
+fn hash_family_key(name: &[u8], metric_type: MetricType, saw_total_suffix: bool) -> u32 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     let (chunks, remainder) = name.as_chunks::<8>();
     for chunk in chunks {
@@ -117,17 +100,21 @@ fn hash_family_key(name: &[u8], metric_type: MetricType, saw_total_suffix: bool)
     hash = (hash.rotate_left(5) ^ tag).wrapping_mul(FX_SEED);
     hash ^= hash >> 32;
     hash = hash.wrapping_mul(FX_SEED);
-    hash ^ (hash >> 32)
+    (hash ^ (hash >> 32)) as u32
 }
 
 #[inline]
-fn hash_series(family_idx: u32, kind: DpKind, attrs: &[(u32, u32)]) -> u64 {
-    let mut hash = hash_attrs(attrs);
-    let word = (u64::from(family_idx) << 8) | u64::from(kind as u8);
-    hash = (hash.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
+const fn hash_series_with_attr_hash(family_idx: u32, kind: DpKind, attr_hash: u64) -> u32 {
+    let word = ((family_idx as u64) << 8) | (kind as u64);
+    let mut hash = (attr_hash.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
     hash ^= hash >> 32;
     hash = hash.wrapping_mul(FX_SEED);
-    hash ^ (hash >> 32)
+    (hash ^ (hash >> 32)) as u32
+}
+
+#[inline]
+const fn fold_u64_hash(hash: u64) -> u32 {
+    (hash ^ (hash >> 32)) as u32
 }
 
 /// Outcome of a bounded EOF stale-series drain step in [`StalenessTracker::finish_scrape_step`].
@@ -152,6 +139,17 @@ pub(super) enum DpKind {
     Histogram = 2,
 }
 
+impl DpKind {
+    #[inline]
+    const fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Number,
+            1 => Self::Summary,
+            _ => Self::Histogram,
+        }
+    }
+}
+
 /// Per-scrape observation status of a [`TrackedSeries`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -161,11 +159,24 @@ enum SeenState {
     SeenStale = 2,
 }
 
+impl SeenState {
+    #[inline]
+    const fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Unseen,
+            1 => Self::SeenLive,
+            _ => Self::SeenStale,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct FamilyBucket {
-    hash: u64,
+    hash: u32,
     family_idx: u32,
 }
+
+const _: () = assert!(size_of::<FamilyBucket>() == 8);
 
 impl FamilyBucket {
     const EMPTY: Self = Self {
@@ -174,11 +185,42 @@ impl FamilyBucket {
     };
 }
 
+/// Slice descriptor into [`StalenessTracker::series_attrs`] for a deduplicated label set.
+///
+/// Many metric families exposed by the same target share identical label sets (for example
+/// container, pod, filesystem, or synthetic benchmark series labels). Interning sorted `(tk, tv)`
+/// slices once per unique label set avoids repeating identical attribute pairs across every metric
+/// family while keeping each [`TrackedSeries`] entry down to 8 bytes.
+#[derive(Clone, Copy)]
+struct AttrSetEntry {
+    start: u32,
+    len: u32,
+}
+
+const _: () = assert!(size_of::<AttrSetEntry>() == 8);
+
+#[derive(Clone, Copy)]
+struct AttrSetBucket {
+    hash: u32,
+    attr_set_id: u32,
+}
+
+const _: () = assert!(size_of::<AttrSetBucket>() == 8);
+
+impl AttrSetBucket {
+    const EMPTY: Self = Self {
+        hash: 0,
+        attr_set_id: NONE_IDX,
+    };
+}
+
 #[derive(Clone, Copy)]
 struct SeriesBucket {
-    hash: u64,
+    hash: u32,
     series_idx: u32,
 }
+
+const _: () = assert!(size_of::<SeriesBucket>() == 8);
 
 impl SeriesBucket {
     const EMPTY: Self = Self {
@@ -209,16 +251,87 @@ struct TrackedFamily {
     current_batch_id: Option<u16>,
 }
 
+const MAX_FAMILY_IDX: u32 = (1 << 27) - 1;
+const KIND_SHIFT: u32 = 27;
+const KIND_MASK: u32 = 0b11;
+const ACTIVE_BIT: u32 = 1 << 29;
+const SEEN_SHIFT: u32 = 30;
+const SEEN_MASK: u32 = 0b11;
+
+/// Compact 8-byte descriptor for a tracked time series.
 #[derive(Clone, Copy)]
 struct TrackedSeries {
-    family_idx: u32,
-    attr_start: u32,
-    attr_len: u32,
-    kind: DpKind,
-    /// Committed active status from the end of the previous successful scrape.
-    active: bool,
-    /// Observation state during the current in-progress scrape.
-    seen: SeenState,
+    /// Bit-packed metadata:
+    /// - bits `0..27`: `family_idx` (`0..=MAX_FAMILY_IDX`)
+    /// - bits `27..29`: [`DpKind`] (`0..=2`)
+    /// - bit `29`: committed `active` status from the previous successful scrape
+    /// - bits `30..32`: [`SeenState`] (`0..=2`) during the current in-progress scrape
+    packed: u32,
+    /// Index into [`StalenessTracker::attr_sets`].
+    attr_set_id: u32,
+}
+
+const _: () = assert!(size_of::<TrackedSeries>() == 8);
+
+impl TrackedSeries {
+    #[inline]
+    const fn new(
+        family_idx: u32,
+        kind: DpKind,
+        attr_set_id: u32,
+        active: bool,
+        seen: SeenState,
+    ) -> Self {
+        let active_bits = if active { ACTIVE_BIT } else { 0 };
+        let packed = (family_idx & MAX_FAMILY_IDX)
+            | ((kind as u32) << KIND_SHIFT)
+            | active_bits
+            | ((seen as u32) << SEEN_SHIFT);
+        Self {
+            packed,
+            attr_set_id,
+        }
+    }
+
+    #[inline]
+    const fn family_idx(self) -> u32 {
+        self.packed & MAX_FAMILY_IDX
+    }
+
+    #[inline]
+    const fn kind(self) -> DpKind {
+        DpKind::from_u8(((self.packed >> KIND_SHIFT) & KIND_MASK) as u8)
+    }
+
+    #[inline]
+    const fn active(self) -> bool {
+        (self.packed & ACTIVE_BIT) != 0
+    }
+
+    #[inline]
+    const fn seen(self) -> SeenState {
+        SeenState::from_u8(((self.packed >> SEEN_SHIFT) & SEEN_MASK) as u8)
+    }
+
+    #[inline]
+    fn set_seen(&mut self, seen: SeenState) {
+        self.packed = (self.packed & !(SEEN_MASK << SEEN_SHIFT)) | ((seen as u32) << SEEN_SHIFT);
+    }
+
+    #[inline]
+    fn clear_seen(&mut self) {
+        self.packed &= !(SEEN_MASK << SEEN_SHIFT);
+    }
+
+    /// Sets `active = (seen == SeenLive)`, resets `seen = Unseen`, and returns the new `active`
+    /// flag.
+    #[inline]
+    fn commit_seen(&mut self) -> bool {
+        let live = self.seen() == SeenState::SeenLive;
+        let active_mask = if live { ACTIVE_BIT } else { 0 };
+        self.packed = (self.packed & !(ACTIVE_BIT | (SEEN_MASK << SEEN_SHIFT))) | active_mask;
+        live
+    }
 }
 
 /// Reusable per-target series staleness tracker for [`super::ArrowDecoder`].
@@ -254,8 +367,11 @@ pub struct StalenessTracker {
     key_interner: StringInterner,
     val_interner: StringInterner,
 
-    series: Vec<TrackedSeries>,
+    attr_sets: Vec<AttrSetEntry>,
+    attr_set_buckets: Vec<AttrSetBucket>,
     series_attrs: Vec<(u32, u32)>,
+
+    series: Vec<TrackedSeries>,
     series_buckets: Vec<SeriesBucket>,
 
     batch_key_to_tracker: Vec<u32>,
@@ -264,7 +380,7 @@ pub struct StalenessTracker {
 
     active_count: usize,
     stale_cursor: usize,
-    scrape_in_progress: bool,
+    active_scrape_id: u64,
 }
 
 impl Default for StalenessTracker {
@@ -295,8 +411,11 @@ impl StalenessTracker {
             key_interner: StringInterner::new(),
             val_interner: StringInterner::new(),
 
-            series: Vec::new(),
+            attr_sets: Vec::new(),
+            attr_set_buckets: Vec::new(),
             series_attrs: Vec::new(),
+
+            series: Vec::new(),
             series_buckets: Vec::new(),
 
             batch_key_to_tracker: Vec::new(),
@@ -305,7 +424,7 @@ impl StalenessTracker {
 
             active_count: 0,
             stale_cursor: 0,
-            scrape_in_progress: false,
+            active_scrape_id: 0,
         }
     }
 
@@ -316,8 +435,10 @@ impl StalenessTracker {
         if families == 0 && series == 0 && attrs == 0 {
             return Self::new();
         }
-        let fam_bucket_cap = (families.saturating_mul(2)).next_power_of_two().max(16);
-        let ser_bucket_cap = (series.saturating_mul(2)).next_power_of_two().max(16);
+        let fam_bucket_cap = bucket_capacity_for_len(families).max(16);
+        let ser_bucket_cap = bucket_capacity_for_len(series).max(16);
+        let attr_set_cap = series.min(attrs.max(1));
+        let attr_set_bucket_cap = bucket_capacity_for_len(attr_set_cap).max(16);
         Self {
             families: Vec::with_capacity(families),
             family_bytes: Vec::with_capacity(families.saturating_mul(32)),
@@ -326,8 +447,11 @@ impl StalenessTracker {
             key_interner: StringInterner::with_capacity(families.min(64), families * 8),
             val_interner: StringInterner::with_capacity(series.min(256), attrs * 8),
 
-            series: Vec::with_capacity(series),
+            attr_sets: Vec::with_capacity(attr_set_cap),
+            attr_set_buckets: vec![AttrSetBucket::EMPTY; attr_set_bucket_cap],
             series_attrs: Vec::with_capacity(attrs),
+
+            series: Vec::with_capacity(series),
             series_buckets: vec![SeriesBucket::EMPTY; ser_bucket_cap],
 
             batch_key_to_tracker: Vec::with_capacity(families.min(64)),
@@ -336,7 +460,7 @@ impl StalenessTracker {
 
             active_count: 0,
             stale_cursor: 0,
-            scrape_in_progress: false,
+            active_scrape_id: 0,
         }
     }
 
@@ -362,15 +486,17 @@ impl StalenessTracker {
         self.family_buckets.fill(FamilyBucket::EMPTY);
         self.key_interner.clear();
         self.val_interner.clear();
-        self.series.clear();
+        self.attr_sets.clear();
+        self.attr_set_buckets.fill(AttrSetBucket::EMPTY);
         self.series_attrs.clear();
+        self.series.clear();
         self.series_buckets.fill(SeriesBucket::EMPTY);
         self.batch_key_to_tracker.clear();
         self.batch_val_to_tracker.clear();
         self.temp_tracker_attrs.clear();
         self.active_count = 0;
         self.stale_cursor = 0;
-        self.scrape_in_progress = false;
+        self.active_scrape_id = 0;
     }
 
     /// Returns the total heap buffer capacity in bytes currently retained by this tracker.
@@ -381,20 +507,27 @@ impl StalenessTracker {
             + self.family_buckets.capacity() * size_of::<FamilyBucket>()
             + self.key_interner.retained_memory_bytes()
             + self.val_interner.retained_memory_bytes()
-            + self.series.capacity() * size_of::<TrackedSeries>()
+            + self.attr_sets.capacity() * size_of::<AttrSetEntry>()
+            + self.attr_set_buckets.capacity() * size_of::<AttrSetBucket>()
             + self.series_attrs.capacity() * size_of::<(u32, u32)>()
+            + self.series.capacity() * size_of::<TrackedSeries>()
             + self.series_buckets.capacity() * size_of::<SeriesBucket>()
             + self.batch_key_to_tracker.capacity() * size_of::<u32>()
             + self.batch_val_to_tracker.capacity() * size_of::<u32>()
             + self.temp_tracker_attrs.capacity() * size_of::<(u32, u32)>()
     }
 
-    /// Prepares the tracker for a new scrape.
+    #[inline]
+    pub(super) const fn active_scrape_id(&self) -> u64 {
+        self.active_scrape_id
+    }
+
+    /// Prepares the tracker for a new scrape identified by `scrape_id`.
     ///
     /// If a previous streaming scrape was dropped before completion, any uncommitted per-scrape
     /// observation flags are rolled back first.
-    pub(super) fn begin_scrape(&mut self) {
-        if self.scrape_in_progress {
+    pub(super) fn begin_scrape(&mut self, scrape_id: u64) {
+        if self.active_scrape_id != 0 {
             self.abort_scrape();
         }
         for fam in &mut self.families {
@@ -402,12 +535,12 @@ impl StalenessTracker {
             fam.has_pending_meta = false;
         }
         for s in &mut self.series {
-            s.seen = SeenState::Unseen;
+            s.clear_seen();
         }
         self.batch_key_to_tracker.clear();
         self.batch_val_to_tracker.clear();
         self.stale_cursor = 0;
-        self.scrape_in_progress = true;
+        self.active_scrape_id = scrape_id;
     }
 
     /// Clears per-batch metric IDs and interner translation caches across streaming chunk flushes.
@@ -423,7 +556,7 @@ impl StalenessTracker {
     /// early-dropped scrape so the committed active series set from the previous successful scrape
     /// remains intact.
     pub(super) fn abort_scrape(&mut self) {
-        if !self.scrape_in_progress {
+        if self.active_scrape_id == 0 {
             return;
         }
         for fam in &mut self.families {
@@ -431,12 +564,13 @@ impl StalenessTracker {
             fam.has_pending_meta = false;
         }
         for s in &mut self.series {
-            s.seen = SeenState::Unseen;
+            s.clear_seen();
         }
         self.batch_key_to_tracker.clear();
         self.batch_val_to_tracker.clear();
         self.stale_cursor = 0;
-        self.scrape_in_progress = false;
+        self.active_scrape_id = 0;
+        self.reclaim_or_compact_inactive();
     }
 
     /// Commits staged family metadata and updates the active series set once all chunks and
@@ -444,12 +578,9 @@ impl StalenessTracker {
     pub(super) fn commit_scrape(&mut self) {
         let mut active_count = 0usize;
         for s in &mut self.series {
-            let live = s.seen == SeenState::SeenLive;
-            s.active = live;
-            if live {
+            if s.commit_seen() {
                 active_count += 1;
             }
-            s.seen = SeenState::Unseen;
         }
         for fam in &mut self.families {
             if fam.has_pending_meta {
@@ -467,47 +598,93 @@ impl StalenessTracker {
         self.batch_val_to_tracker.clear();
         self.active_count = active_count;
         self.stale_cursor = 0;
-        self.scrape_in_progress = false;
+        self.active_scrape_id = 0;
+        self.reclaim_or_compact_inactive();
+    }
 
+    /// Releases excess capacity or compacts inactive entries when `self.series` or `self.families`
+    /// have grown beyond the committed `self.active_count`.
+    #[inline]
+    fn reclaim_or_compact_inactive(&mut self) {
+        let active_count = self.active_count;
         if active_count == 0 {
-            self.clear();
-        } else if self.series.len() > active_count.saturating_mul(2).max(64)
-            || self.families.len() > active_count.saturating_mul(2).max(64)
-        {
-            self.compact();
+            if self.series.capacity() > 64 || self.families.capacity() > 64 {
+                *self = Self::new();
+            } else {
+                self.clear();
+            }
+        } else {
+            let inactive_series = self.series.len().saturating_sub(active_count);
+            // Any deactivated series has already emitted its stale marker during
+            // `finish_scrape_step` and is never needed again. Compact as soon as deactivated
+            // series exceed 12.5% of active series (minimum 32), avoiding 2x dead-series retention
+            // after label churn or hourly rotations while keeping steady-state scrapes free of
+            // compaction work.
+            let churn_threshold = (active_count >> 3).max(32);
+            if inactive_series >= churn_threshold
+                || self.families.len() > active_count.saturating_mul(2).max(64)
+                || self.attr_sets.len() > active_count.saturating_add(churn_threshold)
+            {
+                self.compact();
+            } else if self.series.capacity() > self.series.len() + (self.series.len() >> 3).max(32)
+                || self.series_attrs.capacity()
+                    > self.series_attrs.len() + (self.series_attrs.len() >> 3).max(64)
+            {
+                self.shrink_arenas_to_fit();
+            }
         }
     }
 
-    /// Rebuilds the tracker's family, interner, and series arenas containing only currently
-    /// `active` series so deactivated series under label churn do not accumulate unbounded memory
-    /// or linear-scan overhead.
+    /// Trims unused `Vec` doubling tail capacity in place after the initial scrape population
+    /// without rebuilding hash tables when no series were deactivated.
+    #[cold]
+    fn shrink_arenas_to_fit(&mut self) {
+        self.families.shrink_to_fit();
+        self.family_bytes.shrink_to_fit();
+        self.key_interner.shrink_to_fit();
+        self.val_interner.shrink_to_fit();
+        self.attr_sets.shrink_to_fit();
+        self.series_attrs.shrink_to_fit();
+        self.series.shrink_to_fit();
+    }
+
+    /// Rebuilds the tracker's family, interner, label-set, and series arenas containing only
+    /// currently `active` series so deactivated series under label churn do not accumulate
+    /// unbounded memory or linear-scan overhead.
     #[cold]
     fn compact(&mut self) {
         let active_count = self.active_count;
         let mut fam_remap = vec![NONE_IDX; self.families.len()];
+        let mut attr_set_remap = vec![NONE_IDX; self.attr_sets.len()];
         let mut key_remap = vec![NONE_IDX; self.key_interner.len()];
         let mut val_remap = vec![NONE_IDX; self.val_interner.len()];
 
         let mut next_families: Vec<TrackedFamily> =
             Vec::with_capacity(self.families.len().min(active_count));
         let mut next_family_bytes: Vec<u8> = Vec::new();
-        let mut next_keys = StringInterner::with_capacity(self.key_interner.len(), 0);
+        let mut next_keys = StringInterner::with_capacity(
+            self.key_interner.len().min(active_count.saturating_mul(4)),
+            0,
+        );
         let mut next_vals =
             StringInterner::with_capacity(active_count.min(self.val_interner.len()), 0);
 
-        let ser_bucket_cap = (active_count.saturating_mul(2)).next_power_of_two().max(16);
+        let mut next_attr_sets: Vec<AttrSetEntry> =
+            Vec::with_capacity(self.attr_sets.len().min(active_count));
+        let mut next_series_attrs: Vec<(u32, u32)> = Vec::new();
+
+        let ser_bucket_cap = bucket_capacity_for_len(active_count).max(16);
         let mut next_series = Vec::with_capacity(active_count);
-        let mut next_series_attrs = Vec::with_capacity(active_count.saturating_mul(4));
         let mut next_series_buckets = vec![SeriesBucket::EMPTY; ser_bucket_cap];
         let ser_mask = ser_bucket_cap - 1;
 
         for idx in 0..self.series.len() {
             let s = self.series[idx];
-            if !s.active {
+            if !s.active() {
                 continue;
             }
 
-            let old_fam_idx = s.family_idx as usize;
+            let old_fam_idx = s.family_idx() as usize;
             let new_fam_idx = if fam_remap[old_fam_idx] != NONE_IDX {
                 fam_remap[old_fam_idx]
             } else {
@@ -560,63 +737,82 @@ impl StalenessTracker {
                 new_idx
             };
 
-            let attr_start = s.attr_start as usize;
-            let attr_end = attr_start + s.attr_len as usize;
-            self.temp_tracker_attrs.clear();
-            let mut prev_nk: Option<u32> = None;
-            let mut sorted = true;
+            let old_attr_set_id = s.attr_set_id as usize;
+            let new_attr_set_id = if attr_set_remap[old_attr_set_id] != NONE_IDX {
+                attr_set_remap[old_attr_set_id]
+            } else {
+                let old_entry = self.attr_sets[old_attr_set_id];
+                let attr_start = old_entry.start as usize;
+                let attr_end = attr_start + old_entry.len as usize;
+                self.temp_tracker_attrs.clear();
+                let mut prev_nk: Option<u32> = None;
+                let mut sorted = true;
 
-            for &(tk, tv) in &self.series_attrs[attr_start..attr_end] {
-                let tk_idx = tk as usize;
-                let nk = if key_remap[tk_idx] != NONE_IDX {
-                    key_remap[tk_idx]
-                } else {
-                    let id = next_keys
-                        .intern(self.key_interner.get_bytes(tk))
-                        .expect("compacted key bytes <= existing interner bytes");
-                    key_remap[tk_idx] = id;
-                    id
-                };
+                for &(tk, tv) in &self.series_attrs[attr_start..attr_end] {
+                    let tk_idx = tk as usize;
+                    let nk = if key_remap[tk_idx] != NONE_IDX {
+                        key_remap[tk_idx]
+                    } else {
+                        let id = next_keys
+                            .intern(self.key_interner.get_bytes(tk))
+                            .expect("compacted key bytes <= existing interner bytes");
+                        key_remap[tk_idx] = id;
+                        id
+                    };
 
-                let tv_idx = tv as usize;
-                let nv = if val_remap[tv_idx] != NONE_IDX {
-                    val_remap[tv_idx]
-                } else {
-                    let id = next_vals
-                        .intern(self.val_interner.get_bytes(tv))
-                        .expect("compacted val bytes <= existing interner bytes");
-                    val_remap[tv_idx] = id;
-                    id
-                };
+                    let tv_idx = tv as usize;
+                    let nv = if val_remap[tv_idx] != NONE_IDX {
+                        val_remap[tv_idx]
+                    } else {
+                        let id = next_vals
+                            .intern(self.val_interner.get_bytes(tv))
+                            .expect("compacted val bytes <= existing interner bytes");
+                        val_remap[tv_idx] = id;
+                        id
+                    };
 
-                if let Some(prev) = prev_nk
-                    && nk < prev
-                {
-                    sorted = false;
+                    if let Some(prev) = prev_nk
+                        && nk < prev
+                    {
+                        sorted = false;
+                    }
+                    prev_nk = Some(nk);
+                    self.temp_tracker_attrs.push((nk, nv));
                 }
-                prev_nk = Some(nk);
-                self.temp_tracker_attrs.push((nk, nv));
-            }
 
-            if !sorted {
-                self.temp_tracker_attrs.sort_unstable_by_key(|&(k, _)| k);
-            }
+                if !sorted {
+                    self.temp_tracker_attrs.sort_unstable_by_key(|&(k, _)| k);
+                }
 
-            let new_attr_start = next_series_attrs.len() as u32;
-            let new_attr_len = self.temp_tracker_attrs.len() as u32;
-            next_series_attrs.extend_from_slice(&self.temp_tracker_attrs);
+                let new_attr_start = next_series_attrs.len() as u32;
+                let new_attr_len = self.temp_tracker_attrs.len() as u32;
+                next_series_attrs.extend_from_slice(&self.temp_tracker_attrs);
+
+                let id = next_attr_sets.len() as u32;
+                next_attr_sets.push(AttrSetEntry {
+                    start: new_attr_start,
+                    len: new_attr_len,
+                });
+                attr_set_remap[old_attr_set_id] = id;
+                id
+            };
+
+            let new_entry = next_attr_sets[new_attr_set_id as usize];
+            let attr_slice = &next_series_attrs
+                [new_entry.start as usize..(new_entry.start + new_entry.len) as usize];
+            let attr_hash64 = hash_attrs(attr_slice);
+            let kind = s.kind();
 
             let new_series_idx = next_series.len() as u32;
-            next_series.push(TrackedSeries {
-                family_idx: new_fam_idx,
-                attr_start: new_attr_start,
-                attr_len: new_attr_len,
-                kind: s.kind,
-                active: true,
-                seen: SeenState::Unseen,
-            });
+            next_series.push(TrackedSeries::new(
+                new_fam_idx,
+                kind,
+                new_attr_set_id,
+                true,
+                SeenState::Unseen,
+            ));
 
-            let hash = hash_series(new_fam_idx, s.kind, &self.temp_tracker_attrs);
+            let hash = hash_series_with_attr_hash(new_fam_idx, kind, attr_hash64);
             let mut slot = (hash as usize) & ser_mask;
             while next_series_buckets[slot].series_idx != NONE_IDX {
                 slot = (slot + 1) & ser_mask;
@@ -627,9 +823,24 @@ impl StalenessTracker {
             };
         }
 
-        let fam_bucket_cap = (next_families.len().saturating_mul(2))
-            .next_power_of_two()
-            .max(16);
+        let attr_set_bucket_cap = bucket_capacity_for_len(next_attr_sets.len()).max(16);
+        let attr_set_mask = attr_set_bucket_cap - 1;
+        let mut next_attr_set_buckets = vec![AttrSetBucket::EMPTY; attr_set_bucket_cap];
+        for (idx, entry) in next_attr_sets.iter().enumerate() {
+            let slice =
+                &next_series_attrs[entry.start as usize..(entry.start + entry.len) as usize];
+            let hash = fold_u64_hash(hash_attrs(slice));
+            let mut slot = (hash as usize) & attr_set_mask;
+            while next_attr_set_buckets[slot].attr_set_id != NONE_IDX {
+                slot = (slot + 1) & attr_set_mask;
+            }
+            next_attr_set_buckets[slot] = AttrSetBucket {
+                hash,
+                attr_set_id: idx as u32,
+            };
+        }
+
+        let fam_bucket_cap = bucket_capacity_for_len(next_families.len()).max(16);
         let fam_mask = fam_bucket_cap - 1;
         let mut next_family_buckets = vec![FamilyBucket::EMPTY; fam_bucket_cap];
         for (idx, fam) in next_families.iter().enumerate() {
@@ -645,13 +856,23 @@ impl StalenessTracker {
             };
         }
 
+        next_families.shrink_to_fit();
+        next_family_bytes.shrink_to_fit();
+        next_keys.shrink_to_fit();
+        next_vals.shrink_to_fit();
+        next_attr_sets.shrink_to_fit();
+        next_series_attrs.shrink_to_fit();
+        next_series.shrink_to_fit();
+
         self.families = next_families;
         self.family_bytes = next_family_bytes;
         self.family_buckets = next_family_buckets;
         self.key_interner = next_keys;
         self.val_interner = next_vals;
-        self.series = next_series;
+        self.attr_sets = next_attr_sets;
+        self.attr_set_buckets = next_attr_set_buckets;
         self.series_attrs = next_series_attrs;
+        self.series = next_series;
         self.series_buckets = next_series_buckets;
         if self.batch_key_to_tracker.capacity() > self.key_interner.len().saturating_mul(4).max(64)
         {
@@ -732,7 +953,8 @@ impl StalenessTracker {
         if self.series_buckets.is_empty() {
             self.series_buckets.resize(16, SeriesBucket::EMPTY);
         }
-        let hash = hash_series(fam_idx, kind, &self.temp_tracker_attrs);
+        let attr_hash64 = hash_attrs(&self.temp_tracker_attrs);
+        let hash = hash_series_with_attr_hash(fam_idx, kind, attr_hash64);
         let mask = self.series_buckets.len() - 1;
         let mut slot = (hash as usize) & mask;
 
@@ -749,14 +971,68 @@ impl StalenessTracker {
             }
             if bucket.hash == hash {
                 let idx = bucket.series_idx as usize;
-                let s = &self.series[idx];
-                if s.family_idx == fam_idx && s.kind == kind {
-                    let start = s.attr_start as usize;
-                    let end = start + s.attr_len as usize;
+                let s = self.series[idx];
+                if s.family_idx() == fam_idx && s.kind() == kind {
+                    let entry = self.attr_sets[s.attr_set_id as usize];
+                    let start = entry.start as usize;
+                    let end = start + entry.len as usize;
                     if self.series_attrs[start..end] == self.temp_tracker_attrs[..] {
-                        self.series[idx].seen = seen_state;
+                        self.series[idx].set_seen(seen_state);
                         return Ok(());
                     }
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
+
+        let attr_set_id = self.find_or_insert_attr_set(fold_u64_hash(attr_hash64))?;
+
+        let series_idx =
+            u32::try_from(self.series.len()).map_err(|_| DecodeError::CapacityOverflow {
+                table: "StalenessTracker.series",
+                count: self.series.len() + 1,
+            })?;
+        if series_idx == NONE_IDX {
+            return Err(DecodeError::CapacityOverflow {
+                table: "StalenessTracker.series",
+                count: self.series.len() + 1,
+            });
+        }
+
+        self.series.push(TrackedSeries::new(
+            fam_idx,
+            kind,
+            attr_set_id,
+            false,
+            seen_state,
+        ));
+        self.series_buckets[slot] = SeriesBucket { hash, series_idx };
+
+        if self.series.len() * 10 >= self.series_buckets.len() * 7 {
+            self.rehash_series();
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn find_or_insert_attr_set(&mut self, hash: u32) -> Result<u32, DecodeError> {
+        if self.attr_set_buckets.is_empty() {
+            self.attr_set_buckets.resize(16, AttrSetBucket::EMPTY);
+        }
+        let mask = self.attr_set_buckets.len() - 1;
+        let mut slot = (hash as usize) & mask;
+
+        loop {
+            let bucket = self.attr_set_buckets[slot];
+            if bucket.attr_set_id == NONE_IDX {
+                break;
+            }
+            if bucket.hash == hash {
+                let entry = self.attr_sets[bucket.attr_set_id as usize];
+                let start = entry.start as usize;
+                let end = start + entry.len as usize;
+                if self.series_attrs[start..end] == self.temp_tracker_attrs[..] {
+                    return Ok(bucket.attr_set_id);
                 }
             }
             slot = (slot + 1) & mask;
@@ -773,34 +1049,78 @@ impl StalenessTracker {
                 count: self.temp_tracker_attrs.len(),
             }
         })?;
-        let series_idx =
-            u32::try_from(self.series.len()).map_err(|_| DecodeError::CapacityOverflow {
-                table: "StalenessTracker.series",
-                count: self.series.len() + 1,
+        let attr_set_id =
+            u32::try_from(self.attr_sets.len()).map_err(|_| DecodeError::CapacityOverflow {
+                table: "StalenessTracker.series_attrs",
+                count: self.attr_sets.len() + 1,
             })?;
-        if series_idx == NONE_IDX {
+        if attr_set_id == NONE_IDX {
             return Err(DecodeError::CapacityOverflow {
-                table: "StalenessTracker.series",
-                count: self.series.len() + 1,
+                table: "StalenessTracker.series_attrs",
+                count: self.attr_sets.len() + 1,
             });
         }
 
         self.series_attrs
             .extend_from_slice(&self.temp_tracker_attrs);
-        self.series.push(TrackedSeries {
-            family_idx: fam_idx,
-            kind,
-            attr_start,
-            attr_len,
-            active: false,
-            seen: seen_state,
+        self.attr_sets.push(AttrSetEntry {
+            start: attr_start,
+            len: attr_len,
         });
-        self.series_buckets[slot] = SeriesBucket { hash, series_idx };
+        self.attr_set_buckets[slot] = AttrSetBucket { hash, attr_set_id };
 
-        if self.series.len() * 10 >= self.series_buckets.len() * 7 {
-            self.rehash_series();
+        if self.attr_sets.len() * 10 >= self.attr_set_buckets.len() * 7 {
+            self.rehash_attr_sets();
         }
-        Ok(())
+        Ok(attr_set_id)
+    }
+
+    /// Synchronizes an existing tracked family's active batch row ID and pending `# HELP` /
+    /// `# UNIT` metadata when a family emits a sample in the current batch that is not itself
+    /// recorded in the tracker (e.g. an explicit-timestamp sample when
+    /// `!opts.track_timestamps_staleness`). Does not insert a new family if it is not already
+    /// tracked.
+    #[inline]
+    pub(super) fn sync_existing_family(
+        &mut self,
+        current_family: &mut CurrentFamily,
+    ) -> Result<(), DecodeError> {
+        let (name, metric_type, saw_total_suffix) = current_family.canonical_key();
+        if let Some(idx) = current_family.tracker_family_idx
+            && let Some(fam) = self.families.get_mut(idx as usize)
+            && fam.metric_type == metric_type
+            && fam.saw_total_suffix == saw_total_suffix
+        {
+            fam.current_batch_id = current_family.batch_id;
+            return Ok(());
+        }
+
+        if self.family_buckets.is_empty() {
+            return Ok(());
+        }
+        let hash = hash_family_key(name, metric_type, saw_total_suffix);
+        let mask = self.family_buckets.len() - 1;
+        let mut slot = (hash as usize) & mask;
+
+        loop {
+            let bucket = self.family_buckets[slot];
+            if bucket.family_idx == NONE_IDX {
+                return Ok(());
+            }
+            if bucket.hash == hash {
+                let idx = bucket.family_idx as usize;
+                let fam = self.families[idx];
+                if fam.metric_type == metric_type
+                    && fam.saw_total_suffix == saw_total_suffix
+                    && &self.family_bytes[fam.name_start as usize..fam.name_end as usize] == name
+                {
+                    self.update_existing_family(idx, current_family)?;
+                    current_family.tracker_family_idx = Some(bucket.family_idx);
+                    return Ok(());
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
     }
 
     #[inline]
@@ -808,13 +1128,14 @@ impl StalenessTracker {
         &mut self,
         current_family: &mut CurrentFamily,
     ) -> Result<u32, DecodeError> {
-        let (name, metric_type, saw_total_suffix) = canonical_family_key(current_family);
-        if let Some(idx) = current_family.tracker_family_idx {
-            let fam = &mut self.families[idx as usize];
-            if fam.metric_type == metric_type && fam.saw_total_suffix == saw_total_suffix {
-                fam.current_batch_id = current_family.batch_id;
-                return Ok(idx);
-            }
+        let (name, metric_type, saw_total_suffix) = current_family.canonical_key();
+        if let Some(idx) = current_family.tracker_family_idx
+            && let Some(fam) = self.families.get_mut(idx as usize)
+            && fam.metric_type == metric_type
+            && fam.saw_total_suffix == saw_total_suffix
+        {
+            fam.current_batch_id = current_family.batch_id;
+            return Ok(idx);
         }
 
         if self.family_buckets.is_empty() {
@@ -861,7 +1182,7 @@ impl StalenessTracker {
                 table: "StalenessTracker.families",
                 count: self.families.len() + 1,
             })?;
-        if family_idx == NONE_IDX {
+        if family_idx > MAX_FAMILY_IDX {
             return Err(DecodeError::CapacityOverflow {
                 table: "StalenessTracker.families",
                 count: self.families.len() + 1,
@@ -975,6 +1296,24 @@ impl StalenessTracker {
     }
 
     #[cold]
+    fn rehash_attr_sets(&mut self) {
+        let new_cap = (self.attr_set_buckets.len() * 2).max(16);
+        let mask = new_cap - 1;
+        let mut next_buckets = vec![AttrSetBucket::EMPTY; new_cap];
+        for &bucket in &self.attr_set_buckets {
+            if bucket.attr_set_id == NONE_IDX {
+                continue;
+            }
+            let mut slot = (bucket.hash as usize) & mask;
+            while next_buckets[slot].attr_set_id != NONE_IDX {
+                slot = (slot + 1) & mask;
+            }
+            next_buckets[slot] = bucket;
+        }
+        self.attr_set_buckets = next_buckets;
+    }
+
+    #[cold]
     fn rehash_series(&mut self) {
         let new_cap = (self.series_buckets.len() * 2).max(16);
         let mask = new_cap - 1;
@@ -1021,10 +1360,10 @@ impl StalenessTracker {
 
             let idx = self.stale_cursor;
             let s = self.series[idx];
-            if !s.active || s.seen != SeenState::Unseen {
+            if !s.active() || s.seen() != SeenState::Unseen {
                 self.stale_cursor += 1;
             } else {
-                let fam = self.families[s.family_idx as usize];
+                let fam = self.families[s.family_idx() as usize];
                 if fam.metric_type == MetricType::Unknown
                     && opts.untyped_policy == UntypedPolicy::Drop
                 {
@@ -1085,7 +1424,7 @@ impl StalenessTracker {
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
-        let fam_idx = s.family_idx as usize;
+        let fam_idx = s.family_idx() as usize;
         let parent_id = if let Some(id) = self.families[fam_idx].current_batch_id {
             id
         } else {
@@ -1125,8 +1464,9 @@ impl StalenessTracker {
             id
         };
 
-        let attr_start = s.attr_start as usize;
-        let attr_end = attr_start + s.attr_len as usize;
+        let attr_entry = self.attr_sets[s.attr_set_id as usize];
+        let attr_start = attr_entry.start as usize;
+        let attr_end = attr_start + attr_entry.len as usize;
         self.temp_tracker_attrs.clear();
         let mut prev_bk: Option<u32> = None;
         let mut sorted = true;
@@ -1157,7 +1497,7 @@ impl StalenessTracker {
             self.temp_tracker_attrs.sort_unstable_by_key(|&(k, _)| k);
         }
 
-        match s.kind {
+        match s.kind() {
             DpKind::Number => {
                 let dp_index = num_dp.base.len();
                 let dp_id = u32::try_from(dp_index).map_err(|_| DecodeError::CapacityOverflow {
