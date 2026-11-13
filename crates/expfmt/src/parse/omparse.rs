@@ -1282,6 +1282,7 @@ mod tests {
             assert_eq!(parser.pos(), prev_pos);
             let Some(entry) = parser.next_entry().unwrap() else {
                 assert_eq!(parser.pos(), bytes.len());
+                state = parser.into_state();
                 break;
             };
             let next_pos = parser.pos();
@@ -1343,5 +1344,13 @@ mod tests {
         }
 
         assert_eq!(got, want);
+
+        let retained = state.retained_memory_bytes();
+        assert!(retained > 0);
+        state.reset();
+        assert_eq!(state.retained_memory_bytes(), retained);
+        let mut reused = OpenMetricsParser::from_state(bytes, state);
+        assert_eq!(reused.pos(), 0);
+        assert_eq!(reused.next_entry().unwrap(), Some(Entry::Help));
     }
 }
