@@ -1190,5 +1190,108 @@ mod tests {
             vec!["a.b.c.", "a.b.c.svc.cluster.local."]
         );
         assert_eq!(candidate_query_names("rooted.", &conf), vec!["rooted."]);
+
+        // Decode AAAA, MX, NS, non-IN class (skipped), unknown RR type (skipped), and EDNS0 OPT=0.
+        let mut multi_pkt = Vec::new();
+        multi_pkt.extend_from_slice(&0x5052u16.to_be_bytes());
+        multi_pkt.extend_from_slice(&0x8180u16.to_be_bytes());
+        multi_pkt.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+        multi_pkt.extend_from_slice(&5u16.to_be_bytes()); // ANCOUNT=5 (AAAA, MX, NS, CH-class A, TXT)
+        multi_pkt.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT=0
+        multi_pkt.extend_from_slice(&1u16.to_be_bytes()); // ARCOUNT=1 (EDNS0 OPT)
+        multi_pkt.push(0); // question: root "."
+        multi_pkt.extend_from_slice(&QTYPE_AAAA.to_be_bytes());
+        multi_pkt.extend_from_slice(&QCLASS_IN.to_be_bytes());
+
+        // Answer 1: AAAA 2001:db8::1
+        multi_pkt.push(0);
+        multi_pkt.extend_from_slice(&QTYPE_AAAA.to_be_bytes());
+        multi_pkt.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        multi_pkt.extend_from_slice(&60u32.to_be_bytes());
+        multi_pkt.extend_from_slice(&16u16.to_be_bytes());
+        multi_pkt.extend_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+
+        // Answer 2: MX 10 mx.local.
+        multi_pkt.push(0);
+        multi_pkt.extend_from_slice(&QTYPE_MX.to_be_bytes());
+        multi_pkt.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        multi_pkt.extend_from_slice(&60u32.to_be_bytes());
+        let mx_rdata = b"\x00\x0a\x02mx\x05local\x00";
+        multi_pkt.extend_from_slice(&(mx_rdata.len() as u16).to_be_bytes());
+        multi_pkt.extend_from_slice(mx_rdata);
+
+        // Answer 3: NS ns.local.
+        multi_pkt.push(0);
+        multi_pkt.extend_from_slice(&QTYPE_NS.to_be_bytes());
+        multi_pkt.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        multi_pkt.extend_from_slice(&60u32.to_be_bytes());
+        let ns_rdata = b"\x02ns\x05local\x00";
+        multi_pkt.extend_from_slice(&(ns_rdata.len() as u16).to_be_bytes());
+        multi_pkt.extend_from_slice(ns_rdata);
+
+        // Answer 4: non-IN class (CH = 3) A record -> skipped
+        multi_pkt.push(0);
+        multi_pkt.extend_from_slice(&QTYPE_A.to_be_bytes());
+        multi_pkt.extend_from_slice(&3u16.to_be_bytes());
+        multi_pkt.extend_from_slice(&60u32.to_be_bytes());
+        multi_pkt.extend_from_slice(&4u16.to_be_bytes());
+        multi_pkt.extend_from_slice(&[127, 0, 0, 1]);
+
+        // Answer 5: TXT (16) -> skipped
+        multi_pkt.push(0);
+        multi_pkt.extend_from_slice(&16u16.to_be_bytes());
+        multi_pkt.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        multi_pkt.extend_from_slice(&60u32.to_be_bytes());
+        multi_pkt.extend_from_slice(&1u16.to_be_bytes());
+        multi_pkt.push(0);
+
+        // Additional 1: EDNS0 OPT with extended RCODE = 0
+        multi_pkt.push(0);
+        multi_pkt.extend_from_slice(&QTYPE_OPT.to_be_bytes());
+        multi_pkt.extend_from_slice(&4096u16.to_be_bytes());
+        multi_pkt.extend_from_slice(&0u32.to_be_bytes());
+        multi_pkt.extend_from_slice(&0u16.to_be_bytes());
+
+        let DecodedDnsMessage::Records(multi_records) =
+            decode_dns_response(0x5052, ".", QTYPE_AAAA, &multi_pkt).unwrap()
+        else {
+            panic!("expected decoded multi records");
+        };
+        assert_eq!(
+            multi_records,
+            vec![
+                DnsRecord::Aaaa("2001:db8::1".parse().unwrap()),
+                DnsRecord::Mx {
+                    preference: 10,
+                    target: "mx.local.".to_owned(),
+                },
+                DnsRecord::Ns {
+                    target: "ns.local.".to_owned(),
+                },
+            ]
+        );
+
+        // EDNS0 extended RCODE (e.g. BADVERS = 16 -> upper 8 bits = 1) in OPT record is rejected.
+        let opt_ttl_offset = multi_pkt.len() - 6;
+        multi_pkt[opt_ttl_offset] = 1;
+        assert!(decode_dns_response(0x5052, ".", QTYPE_AAAA, &multi_pkt).is_err());
+
+        // Header pointer (< 12) and wire label containing embedded '.' are rejected.
+        let mut hdr_ptr_pkt = loop_pkt.clone();
+        hdr_ptr_pkt[12] = 0xC0;
+        hdr_ptr_pkt[13] = 0x04;
+        assert!(decode_dns_response(0x5052, "example.com.", QTYPE_A, &hdr_ptr_pkt).is_err());
+
+        let mut dot_label_pkt = Vec::new();
+        dot_label_pkt.extend_from_slice(&0x5052u16.to_be_bytes());
+        dot_label_pkt.extend_from_slice(&0x8180u16.to_be_bytes());
+        dot_label_pkt.extend_from_slice(&1u16.to_be_bytes());
+        dot_label_pkt.extend_from_slice(&0u16.to_be_bytes());
+        dot_label_pkt.extend_from_slice(&0u16.to_be_bytes());
+        dot_label_pkt.extend_from_slice(&0u16.to_be_bytes());
+        dot_label_pkt.extend_from_slice(b"\x07foo.bar\x03com\x00");
+        dot_label_pkt.extend_from_slice(&QTYPE_A.to_be_bytes());
+        dot_label_pkt.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        assert!(decode_dns_response(0x5052, "foo.bar.com.", QTYPE_A, &dot_label_pkt).is_err());
     }
 }

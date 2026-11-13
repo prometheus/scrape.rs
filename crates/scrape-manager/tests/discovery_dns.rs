@@ -77,12 +77,44 @@ fn dns_sd_config_validation_matches_prometheus() {
             r#"{"names": ["example.com"], "type": "PTR", "port": 80}"#,
             "invalid DNS-SD records type PTR",
         ),
+        (
+            r#"{"names": ["example.com"], "type": ""}"#,
+            "invalid DNS-SD records type ",
+        ),
+        (
+            r#"{"names": null}"#,
+            "DNS-SD config must contain at least one SRV record name",
+        ),
     ];
     for (case, expected_err) in invalid_cases {
         let mut cfg: DnsSdConfig = serde_json::from_str(case).expect(case);
         let err = cfg.validate().expect_err(case).to_string();
         assert_eq!(err, expected_err, "case: {case}");
     }
+
+    // Null fields deserialize to their Prometheus defaults, and serde round-trips preserve fields.
+    let mut null_fields_cfg: DnsSdConfig = serde_json::from_str(
+        r#"{"names": ["example.com"], "refresh_interval": null, "type": null, "port": null}"#,
+    )
+    .unwrap();
+    null_fields_cfg.validate().unwrap();
+    assert_eq!(null_fields_cfg.refresh_interval, Duration::from_secs(30));
+    assert_eq!(null_fields_cfg.record_type, "SRV");
+    assert_eq!(null_fields_cfg.port, 0);
+    let serialized = serde_json::to_string(&null_fields_cfg).unwrap();
+    assert!(!serialized.contains("\"port\""));
+    let roundtrip: DnsSdConfig = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(roundtrip, null_fields_cfg);
+
+    let mut null_top: DiscoveryConfigs =
+        serde_json::from_str(r#"{"dns_sd_configs": null}"#).unwrap();
+    assert!(null_top.dns_sd_configs.is_empty());
+    assert!(null_top.validate().is_ok());
+
+    let mut invalid_top: DiscoveryConfigs =
+        serde_json::from_str(r#"{"dns_sd_configs": [{"names": ["example.com"], "type": "A"}]}"#)
+            .unwrap();
+    assert!(invalid_top.validate().is_err());
 
     // Unitless integers, overflowing duration strings, and unknown fields are rejected.
     assert!(
@@ -303,6 +335,34 @@ fn dns_discovery_records_match_prometheus_dns_test() {
     );
     assert_eq!(groups[1].source, "nxdomain.example.com.");
     assert!(groups[1].targets.is_empty());
+    assert_eq!(sd.config().port, 53);
+
+    // Unsafe domain targets and mismatched record types are skipped.
+    let filtered = sd
+        .refresh_with(|name, _| {
+            if name == "example.com." {
+                Ok(vec![
+                    DnsRecord::Ns {
+                        target: "bad/path.example.com.".to_owned(),
+                    },
+                    DnsRecord::Ns {
+                        target: "a..b.example.com.".to_owned(),
+                    },
+                    DnsRecord::A(Ipv4Addr::LOCALHOST),
+                    DnsRecord::Ns {
+                        target: "good.example.com.".to_owned(),
+                    },
+                ])
+            } else {
+                Ok(vec![])
+            }
+        })
+        .unwrap();
+    assert_eq!(filtered[1].targets.len(), 1);
+    assert_eq!(
+        filtered[1].targets[0].get(ADDRESS_LABEL),
+        Some(&"good.example.com:53".to_owned())
+    );
 
     assert!(ResolvConf::from_file(std::path::Path::new("/nonexistent/resolv.conf")).is_err());
 }
@@ -460,6 +520,12 @@ fn dns_multi_server_fallback_search_path_and_localset() {
     assert_eq!(clamped.ndots, 15);
     assert_eq!(clamped.timeout, Duration::from_secs(30));
 
+    let min_and_override =
+        ResolvConf::parse("search a.local. .\ndomain b.local.\ndomain .\noptions timeout:0\n");
+    assert_eq!(min_and_override.servers, ResolvConf::default().servers);
+    assert!(min_and_override.search.is_empty());
+    assert_eq!(min_and_override.timeout, Duration::from_secs(1));
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -488,9 +554,10 @@ fn dns_multi_server_fallback_search_path_and_localset() {
             while let Ok((len, peer)) = udp1.recv_from(&mut buf).await {
                 let (qname, qend) = decode_qname_from_query(&buf[..len]);
                 let rcode: u16 = match qname.as_str() {
-                    "hit.two.local." | "flaky.one.local." => 2, // SERVFAIL
-                    "nodata.one.local." => 0,                   // NODATA (ANCOUNT=0)
-                    _ => 3,                                     // NXDOMAIN
+                    "hit.two.local." | "flaky.one.local." | "recover.one.local."
+                    | "recover.two.local." => 2, // SERVFAIL
+                    "nodata.one.local." => 0, // NODATA (ANCOUNT=0)
+                    _ => 3,                   // NXDOMAIN
                 };
                 let mut resp = Vec::new();
                 resp.extend_from_slice(&buf[0..2]);
@@ -511,7 +578,7 @@ fn dns_multi_server_fallback_search_path_and_localset() {
                 srv2_queries_clone.borrow_mut().push(qname.clone());
                 let mut resp = Vec::new();
                 resp.extend_from_slice(&buf[0..2]);
-                if qname == "hit.two.local." {
+                if qname == "hit.two.local." || qname == "recover.two.local." {
                     resp.extend_from_slice(&0x8180u16.to_be_bytes());
                     resp.extend_from_slice(&1u16.to_be_bytes());
                     resp.extend_from_slice(&1u16.to_be_bytes());
@@ -546,6 +613,7 @@ fn dns_multi_server_fallback_search_path_and_localset() {
             DnsSdConfig {
                 names: vec![
                     "hit".to_owned(),
+                    "recover".to_owned(),
                     "gone".to_owned(),
                     "flaky".to_owned(),
                     "nodata".to_owned(),
@@ -562,20 +630,30 @@ fn dns_multi_server_fallback_search_path_and_localset() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(groups.len(), 3);
+        assert_eq!(groups.len(), 4);
         assert_eq!(groups[0].source, "hit");
         assert_eq!(
             groups[0].targets[0].get(ADDRESS_LABEL),
             Some(&"10.1.2.3:9100".to_owned())
         );
-        assert_eq!(groups[1].source, "gone");
-        assert!(groups[1].targets.is_empty());
-        assert_eq!(groups[2].source, "nodata");
+        assert_eq!(groups[1].source, "recover");
+        assert_eq!(
+            groups[1].targets[0].get(ADDRESS_LABEL),
+            Some(&"10.1.2.3:9100".to_owned())
+        );
+        assert_eq!(groups[2].source, "gone");
         assert!(groups[2].targets.is_empty());
+        assert_eq!(groups[3].source, "nodata");
+        assert!(groups[3].targets.is_empty());
 
         assert_eq!(
             *srv2_queries.borrow(),
-            vec!["hit.two.local.".to_owned(), "flaky.one.local.".to_owned()]
+            vec![
+                "hit.two.local.".to_owned(),
+                "recover.one.local.".to_owned(),
+                "recover.two.local.".to_owned(),
+                "flaky.one.local.".to_owned(),
+            ]
         );
     });
 }
