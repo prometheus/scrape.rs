@@ -42,7 +42,7 @@ pub enum DiscoveryError {
     Json(#[from] serde_json::Error),
 }
 
-fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub(crate) fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: Default + Deserialize<'de>,
@@ -184,7 +184,11 @@ pub struct DiscoveryConfigs {
     )]
     pub static_configs: Vec<StaticConfig>,
     /// DNS service discovery configurations (`dns_sd_configs`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub dns_sd_configs: Vec<DnsSdConfig>,
 }
 
@@ -263,8 +267,13 @@ pub(crate) mod serde_duration {
         serializer.serialize_str(&format_duration(*duration))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        parse_duration(&s).map_err(serde::de::Error::custom)
+    pub fn deserialize_or<'de, D: Deserializer<'de>>(
+        deserializer: D,
+        default: Duration,
+    ) -> Result<Duration, D::Error> {
+        match Option::<String>::deserialize(deserializer)? {
+            Some(s) => parse_duration(&s).map_err(serde::de::Error::custom),
+            None => Ok(default),
+        }
     }
 }
