@@ -425,6 +425,7 @@ impl StalenessTracker {
         self.batch_val_to_tracker.clear();
         self.stale_cursor = 0;
         self.active_scrape_id = 0;
+        self.reclaim_or_compact_inactive();
     }
 
     /// Commits staged family metadata and updates the active series set once all chunks and
@@ -456,9 +457,20 @@ impl StalenessTracker {
         self.active_count = active_count;
         self.stale_cursor = 0;
         self.active_scrape_id = 0;
+        self.reclaim_or_compact_inactive();
+    }
 
+    /// Releases excess capacity or compacts inactive entries when `self.series` or `self.families`
+    /// have grown beyond the committed `self.active_count`.
+    #[inline]
+    fn reclaim_or_compact_inactive(&mut self) {
+        let active_count = self.active_count;
         if active_count == 0 {
-            self.clear();
+            if self.series.capacity() > 64 || self.families.capacity() > 64 {
+                *self = Self::new();
+            } else {
+                self.clear();
+            }
         } else if self.series.len() > active_count.saturating_mul(2).max(64)
             || self.families.len() > active_count.saturating_mul(2).max(64)
         {
@@ -479,7 +491,10 @@ impl StalenessTracker {
         let mut next_families: Vec<TrackedFamily> =
             Vec::with_capacity(self.families.len().min(active_count));
         let mut next_family_bytes: Vec<u8> = Vec::new();
-        let mut next_keys = StringInterner::with_capacity(self.key_interner.len(), 0);
+        let mut next_keys = StringInterner::with_capacity(
+            self.key_interner.len().min(active_count.saturating_mul(4)),
+            0,
+        );
         let mut next_vals =
             StringInterner::with_capacity(active_count.min(self.val_interner.len()), 0);
 
