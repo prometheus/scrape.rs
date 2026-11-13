@@ -94,7 +94,7 @@ impl DnsRecordType {
     }
 
     /// Returns the DNS wire protocol QTYPE code for this record type.
-    pub(crate) const fn qtype(self) -> u16 {
+    const fn qtype(self) -> u16 {
         match self {
             Self::A => QTYPE_A,
             Self::Ns => QTYPE_NS,
@@ -470,7 +470,7 @@ impl DnsDiscovery {
 
 /// Converts a slice of resolved [`DnsRecord`]s for `name` into a Prometheus [`TargetGroup`],
 /// matching `discovery/dns.Discovery.refreshOne`.
-pub(crate) fn records_to_target_group(
+fn records_to_target_group(
     name: &str,
     record_type: DnsRecordType,
     default_port: u16,
@@ -666,7 +666,7 @@ async fn query_dns_server(
 
 /// Encodes an RFC 1035 DNS wire query message, optionally including an EDNS0 OPT pseudo-record
 /// (4096-byte UDP payload).
-pub(crate) fn encode_dns_query(
+fn encode_dns_query(
     id: u16,
     fqdn: &str,
     qtype: u16,
