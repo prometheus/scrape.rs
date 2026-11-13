@@ -14,6 +14,7 @@
 //! Prometheus-compatible target discovery configuration and target group types.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -95,6 +96,12 @@ pub struct TargetGroup {
     pub source: String,
 }
 
+impl fmt::Display for TargetGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.source)
+    }
+}
+
 impl Serialize for TargetGroup {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
@@ -107,7 +114,7 @@ impl Serialize for TargetGroup {
         let targets: Vec<&str> = self
             .targets
             .iter()
-            .filter_map(|t| t.get(ADDRESS_LABEL).map(String::as_str))
+            .map(|t| t.get(ADDRESS_LABEL).map_or("", String::as_str))
             .collect();
         let raw = TargetGroupWire {
             targets,
