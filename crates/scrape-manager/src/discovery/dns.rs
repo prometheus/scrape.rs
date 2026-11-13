@@ -552,6 +552,8 @@ fn candidate_query_names(name: &str, conf: &ResolvConf) -> Vec<String> {
     let mut search_names: Vec<String> = conf
         .search
         .iter()
+        .map(|domain| domain.trim_end_matches('.'))
+        .filter(|domain| !domain.is_empty())
         .map(|domain| format!("{name}.{domain}."))
         .filter(|cand| wire_qname_len(cand).is_some_and(|n| n <= 255))
         .collect();
@@ -569,13 +571,13 @@ fn candidate_query_names(name: &str, conf: &ResolvConf) -> Vec<String> {
 }
 
 fn wire_qname_len(fqdn: &str) -> Option<usize> {
-    let trimmed = fqdn.trim_end_matches('.');
+    let trimmed = fqdn.strip_suffix('.').unwrap_or(fqdn);
     if trimmed.is_empty() {
         return Some(1);
     }
     let mut len = 1usize;
     for label in trimmed.split('.') {
-        if label.is_empty() || label.len() > 63 {
+        if !is_safe_dns_label(label) {
             return None;
         }
         len += 1 + label.len();
@@ -584,15 +586,20 @@ fn wire_qname_len(fqdn: &str) -> Option<usize> {
 }
 
 fn is_safe_dns_label(label: &str) -> bool {
-    !label.bytes().any(|b| {
-        b.is_ascii_control()
-            || b.is_ascii_whitespace()
-            || matches!(b, b'@' | b'/' | b'\\' | b'?' | b'#' | b':' | b'[' | b']')
-    })
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.bytes().any(|b| {
+            b.is_ascii_control()
+                || b.is_ascii_whitespace()
+                || matches!(
+                    b,
+                    b'.' | b'@' | b'/' | b'\\' | b'?' | b'#' | b':' | b'[' | b']'
+                )
+        })
 }
 
 fn is_safe_domain_target(target: &str) -> bool {
-    let trimmed = target.trim_end_matches('.');
+    let trimmed = target.strip_suffix('.').unwrap_or(target);
     trimmed.is_empty() || trimmed.split('.').all(is_safe_dns_label)
 }
 
@@ -683,11 +690,11 @@ fn encode_dns_query(
     pkt.extend_from_slice(&0u16.to_be_bytes());
     pkt.extend_from_slice(&arcount.to_be_bytes());
 
-    let trimmed = fqdn.trim_end_matches('.');
+    let trimmed = fqdn.strip_suffix('.').unwrap_or(fqdn);
     let mut wire_qname_len = 1usize;
     if !trimmed.is_empty() {
         for label in trimmed.split('.') {
-            if label.is_empty() || label.len() > 63 || !is_safe_dns_label(label) {
+            if !is_safe_dns_label(label) {
                 return Err(DiscoveryError::Dns(format!(
                     "invalid DNS label in query name {fqdn:?}"
                 )));
@@ -726,7 +733,7 @@ enum DecodedDnsMessage {
 }
 
 fn canonical_fqdn(fqdn: &str) -> String {
-    let trimmed = fqdn.trim_end_matches('.');
+    let trimmed = fqdn.strip_suffix('.').unwrap_or(fqdn);
     if trimmed.is_empty() {
         ".".to_owned()
     } else {
