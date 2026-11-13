@@ -31,15 +31,15 @@ use super::{
     serde_duration,
 };
 
-/// Meta label storing the queried record name.
+/// Meta label storing the queried record name, matching `dnsNameLabel` in Prometheus `discovery/dns`.
 pub const DNS_NAME_LABEL: &str = "__meta_dns_name";
-/// Meta label storing the target field of an SRV record.
+/// Meta label storing the target field of an SRV record, matching `dnsSrvRecordTargetLabel` in Prometheus `discovery/dns`.
 pub const DNS_SRV_RECORD_TARGET_LABEL: &str = "__meta_dns_srv_record_target";
-/// Meta label storing the port field of an SRV record.
+/// Meta label storing the port field of an SRV record, matching `dnsSrvRecordPortLabel` in Prometheus `discovery/dns`.
 pub const DNS_SRV_RECORD_PORT_LABEL: &str = "__meta_dns_srv_record_port";
-/// Meta label storing the target field of an MX record.
+/// Meta label storing the target field of an MX record, matching `dnsMxRecordTargetLabel` in Prometheus `discovery/dns`.
 pub const DNS_MX_RECORD_TARGET_LABEL: &str = "__meta_dns_mx_record_target";
-/// Meta label storing the target field of an NS record.
+/// Meta label storing the target field of an NS record, matching `dnsNsRecordTargetLabel` in Prometheus `discovery/dns`.
 pub const DNS_NS_RECORD_TARGET_LABEL: &str = "__meta_dns_ns_record_target";
 
 const QTYPE_A: u16 = 1;
