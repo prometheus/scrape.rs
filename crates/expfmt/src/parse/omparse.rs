@@ -32,33 +32,18 @@ const CREATED_SUFFIX: &[u8] = b"_created";
 /// scrapes without lifetime coupling.
 #[derive(Default)]
 pub(crate) struct OmScratch {
-    pub(crate) labels: Vec<LabelSpan>,
-    pub(crate) exemplar_labels: Vec<LabelSpan>,
-    pub(crate) peek_labels: Vec<LabelSpan>,
-    pub(crate) start_timestamp_key: Vec<u8>,
+    labels: Vec<LabelSpan>,
+    exemplar_labels: Vec<LabelSpan>,
+    peek_labels: Vec<LabelSpan>,
+    start_timestamp_key: Vec<u8>,
 }
 
 impl OmScratch {
-    pub(crate) fn with_capacity(label_cap: usize) -> Self {
-        Self {
-            labels: Vec::with_capacity(label_cap),
-            exemplar_labels: Vec::with_capacity(4),
-            peek_labels: Vec::with_capacity(label_cap),
-            start_timestamp_key: Vec::with_capacity(64),
-        }
-    }
-
-    pub(crate) fn clear(&mut self) {
+    fn clear(&mut self) {
         self.labels.clear();
         self.exemplar_labels.clear();
         self.peek_labels.clear();
         self.start_timestamp_key.clear();
-    }
-
-    pub(crate) fn retained_memory_bytes(&self) -> usize {
-        (self.labels.capacity() + self.exemplar_labels.capacity() + self.peek_labels.capacity())
-            * size_of::<LabelSpan>()
-            + self.start_timestamp_key.capacity()
     }
 }
 
@@ -246,11 +231,6 @@ impl<'a> OpenMetricsParser<'a> {
             start_timestamp_key: state.start_timestamp_key,
             start_timestamp: state.start_timestamp,
         }
-    }
-
-    /// Returns the reusable scratch buffers so callers can preserve capacity across scrapes.
-    pub(crate) fn into_scratch(mut self) -> OmScratch {
-        self.take_scratch()
     }
 
     /// Takes the reusable scratch buffers in place for `Drop` handlers.

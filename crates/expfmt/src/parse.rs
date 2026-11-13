@@ -28,7 +28,7 @@ mod protobufparse;
 
 pub(crate) use float::parse_go_float;
 pub use omparse::OpenMetricsParser;
-pub(crate) use omparse::{OmScratch, OpenMetricsParserState};
+pub(crate) use omparse::OpenMetricsParserState;
 pub use promparse::PromParser;
 pub(crate) use promparse::{ByteSpan, LabelSpan, PromParserState, unescape_bytes_into};
 #[cfg(feature = "dto")]

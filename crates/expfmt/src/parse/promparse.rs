@@ -183,12 +183,6 @@ impl<'a> PromParser<'a> {
         }
     }
 
-    /// Returns the reusable label span buffer so callers can preserve capacity across scrapes.
-    pub(crate) fn into_scratch(mut self) -> Vec<LabelSpan> {
-        self.labels.clear();
-        self.labels
-    }
-
     /// Takes the reusable label span buffer in place for `Drop` handlers.
     #[inline]
     pub(crate) fn take_scratch(&mut self) -> Vec<LabelSpan> {
