@@ -1551,10 +1551,12 @@ impl ArrowDecoder {
             SeriesRole::Scalar => {}
         }
 
-        if matches!(
-            self.current_family.metric_type,
-            MetricType::Histogram | MetricType::GaugeHistogram
-        ) && let Some((ex_val, ex_ts_ms, ex_spans)) = parser.raw_exemplar_parts()
+        if !self.assembly.groups[group_idx].is_stale
+            && matches!(
+                self.current_family.metric_type,
+                MetricType::Histogram | MetricType::GaugeHistogram
+            )
+            && let Some((ex_val, ex_ts_ms, ex_spans)) = parser.raw_exemplar_parts()
         {
             let full_input = parser.raw_series_parts().2;
             self.stage_pending_histogram_exemplar(

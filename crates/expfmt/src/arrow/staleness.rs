@@ -86,23 +86,6 @@ const fn metric_type_tag(mt: MetricType) -> u8 {
 }
 
 #[inline]
-fn canonical_family_key(current_family: &CurrentFamily) -> (&[u8], MetricType, bool) {
-    let raw = current_family.unescaped_name.as_slice();
-    if current_family.metric_type == MetricType::Counter
-        && raw.len() > 6
-        && raw.ends_with(b"_total")
-    {
-        (&raw[..raw.len() - 6], MetricType::Counter, true)
-    } else {
-        (
-            raw,
-            current_family.metric_type,
-            current_family.saw_total_suffix,
-        )
-    }
-}
-
-#[inline]
 fn hash_family_key(name: &[u8], metric_type: MetricType, saw_total_suffix: bool) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     let (chunks, remainder) = name.as_chunks::<8>();
@@ -818,7 +801,7 @@ impl StalenessTracker {
         &mut self,
         current_family: &mut CurrentFamily,
     ) -> Result<(), DecodeError> {
-        let (name, metric_type, saw_total_suffix) = canonical_family_key(current_family);
+        let (name, metric_type, saw_total_suffix) = current_family.canonical_key();
         if let Some(idx) = current_family.tracker_family_idx
             && let Some(fam) = self.families.get_mut(idx as usize)
             && fam.metric_type == metric_type
@@ -861,7 +844,7 @@ impl StalenessTracker {
         &mut self,
         current_family: &mut CurrentFamily,
     ) -> Result<u32, DecodeError> {
-        let (name, metric_type, saw_total_suffix) = canonical_family_key(current_family);
+        let (name, metric_type, saw_total_suffix) = current_family.canonical_key();
         if let Some(idx) = current_family.tracker_family_idx
             && let Some(fam) = self.families.get_mut(idx as usize)
             && fam.metric_type == metric_type
