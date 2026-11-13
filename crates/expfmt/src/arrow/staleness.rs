@@ -264,7 +264,7 @@ pub struct StalenessTracker {
 
     active_count: usize,
     stale_cursor: usize,
-    scrape_in_progress: bool,
+    active_scrape_id: u64,
 }
 
 impl Default for StalenessTracker {
@@ -305,7 +305,7 @@ impl StalenessTracker {
 
             active_count: 0,
             stale_cursor: 0,
-            scrape_in_progress: false,
+            active_scrape_id: 0,
         }
     }
 
@@ -336,7 +336,7 @@ impl StalenessTracker {
 
             active_count: 0,
             stale_cursor: 0,
-            scrape_in_progress: false,
+            active_scrape_id: 0,
         }
     }
 
@@ -370,7 +370,7 @@ impl StalenessTracker {
         self.temp_tracker_attrs.clear();
         self.active_count = 0;
         self.stale_cursor = 0;
-        self.scrape_in_progress = false;
+        self.active_scrape_id = 0;
     }
 
     /// Returns the total heap buffer capacity in bytes currently retained by this tracker.
@@ -389,12 +389,17 @@ impl StalenessTracker {
             + self.temp_tracker_attrs.capacity() * size_of::<(u32, u32)>()
     }
 
-    /// Prepares the tracker for a new scrape.
+    #[inline]
+    pub(super) const fn active_scrape_id(&self) -> u64 {
+        self.active_scrape_id
+    }
+
+    /// Prepares the tracker for a new scrape identified by `scrape_id`.
     ///
     /// If a previous streaming scrape was dropped before completion, any uncommitted per-scrape
     /// observation flags are rolled back first.
-    pub(super) fn begin_scrape(&mut self) {
-        if self.scrape_in_progress {
+    pub(super) fn begin_scrape(&mut self, scrape_id: u64) {
+        if self.active_scrape_id != 0 {
             self.abort_scrape();
         }
         for fam in &mut self.families {
@@ -407,7 +412,7 @@ impl StalenessTracker {
         self.batch_key_to_tracker.clear();
         self.batch_val_to_tracker.clear();
         self.stale_cursor = 0;
-        self.scrape_in_progress = true;
+        self.active_scrape_id = scrape_id;
     }
 
     /// Clears per-batch metric IDs and interner translation caches across streaming chunk flushes.
@@ -423,7 +428,7 @@ impl StalenessTracker {
     /// early-dropped scrape so the committed active series set from the previous successful scrape
     /// remains intact.
     pub(super) fn abort_scrape(&mut self) {
-        if !self.scrape_in_progress {
+        if self.active_scrape_id == 0 {
             return;
         }
         for fam in &mut self.families {
@@ -436,7 +441,7 @@ impl StalenessTracker {
         self.batch_key_to_tracker.clear();
         self.batch_val_to_tracker.clear();
         self.stale_cursor = 0;
-        self.scrape_in_progress = false;
+        self.active_scrape_id = 0;
     }
 
     /// Commits staged family metadata and updates the active series set once all chunks and
@@ -467,7 +472,7 @@ impl StalenessTracker {
         self.batch_val_to_tracker.clear();
         self.active_count = active_count;
         self.stale_cursor = 0;
-        self.scrape_in_progress = false;
+        self.active_scrape_id = 0;
 
         if active_count == 0 {
             self.clear();
@@ -814,12 +819,13 @@ impl StalenessTracker {
         current_family: &mut CurrentFamily,
     ) -> Result<(), DecodeError> {
         let (name, metric_type, saw_total_suffix) = canonical_family_key(current_family);
-        if let Some(idx) = current_family.tracker_family_idx {
-            let fam = &mut self.families[idx as usize];
-            if fam.metric_type == metric_type && fam.saw_total_suffix == saw_total_suffix {
-                fam.current_batch_id = current_family.batch_id;
-                return Ok(());
-            }
+        if let Some(idx) = current_family.tracker_family_idx
+            && let Some(fam) = self.families.get_mut(idx as usize)
+            && fam.metric_type == metric_type
+            && fam.saw_total_suffix == saw_total_suffix
+        {
+            fam.current_batch_id = current_family.batch_id;
+            return Ok(());
         }
 
         if self.family_buckets.is_empty() {
@@ -856,12 +862,13 @@ impl StalenessTracker {
         current_family: &mut CurrentFamily,
     ) -> Result<u32, DecodeError> {
         let (name, metric_type, saw_total_suffix) = canonical_family_key(current_family);
-        if let Some(idx) = current_family.tracker_family_idx {
-            let fam = &mut self.families[idx as usize];
-            if fam.metric_type == metric_type && fam.saw_total_suffix == saw_total_suffix {
-                fam.current_batch_id = current_family.batch_id;
-                return Ok(idx);
-            }
+        if let Some(idx) = current_family.tracker_family_idx
+            && let Some(fam) = self.families.get_mut(idx as usize)
+            && fam.metric_type == metric_type
+            && fam.saw_total_suffix == saw_total_suffix
+        {
+            fam.current_batch_id = current_family.batch_id;
+            return Ok(idx);
         }
 
         if self.family_buckets.is_empty() {
