@@ -129,6 +129,12 @@ scrape bytes
   2. **Stage 2 (dictionary-vectorized relabeling and `honor_labels`)**: Once kept series have been assembled into metric families (collapsing classic histogram `_bucket`, `_sum`, and `_count` lines into a single `HistogramDataPoints` row) and their label keys and values have been deduplicated in `key_interner` and `val_interner`, attribute-level `honor_labels` collision resolution, `labeldrop` / `labelkeep`, and single-label `keep` / `drop` / value transformations (`replace`, `lowercase`, `uppercase`, `hashmod`) will execute across unique dictionary entries (memoized per `source_labels[0]` value ID) instead of $O(N_{\text{samples}})$.
 - The metric family assembler groups classic histogram `_bucket`, `_sum`, and `_count` lines and summary `quantile`, `_sum`, and `_count` lines (plus OpenMetrics `_created` start timestamps) into complete metric families.
 - Configurable translation policies control counter `_total` and unit suffix handling and untyped series handling.
+- `DecodeOptions::honor_timestamps` mirrors Prometheus's `honor_timestamps` scrape config. It defaults to `true`,
+  where a sample's wire timestamp wins and `DecodeOptions::timestamp_ms` only fills in samples that carry none. When
+  cleared, wire sample timestamps are ignored and every data point is stamped with `timestamp_ms`; the wire value is
+  then not converted, so an out-of-range wire timestamp is not an error, matching Prometheus's scrape loop, which
+  clears parsed sample timestamps before validation. Start timestamps (`_created`, `st@`) and exemplar timestamps are
+  unaffected either way. When `timestamp_ms` is `None` and the flag is cleared, data points carry no timestamp.
 - `ArrowDecoder` owns its scratch buffers and Arrow builders without internal locks or global state, so a per-core `!Send` receiver can reuse allocations across scrapes with bounded memory.
 
 ### Target and metric relabeling architecture
