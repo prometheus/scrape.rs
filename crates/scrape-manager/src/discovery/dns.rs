@@ -646,21 +646,20 @@ async fn query_dns_server(
     let tcp_query_pkt = encode_dns_query(tcp_id, fqdn, qtype, false)?;
     let tcp_query_len = u16::try_from(tcp_query_pkt.len())
         .map_err(|_| DiscoveryError::Dns("DNS TCP query packet exceeds u16 length".to_owned()))?;
-    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(server))
-        .await
-        .map_err(|_| DiscoveryError::Dns(format!("DNS TCP connect timeout to {server}")))??;
-    stream.write_all(&tcp_query_len.to_be_bytes()).await?;
-    stream.write_all(&tcp_query_pkt).await?;
+    let resp_buf = tokio::time::timeout(timeout, async {
+        let mut stream = TcpStream::connect(server).await?;
+        stream.write_all(&tcp_query_len.to_be_bytes()).await?;
+        stream.write_all(&tcp_query_pkt).await?;
 
-    let mut resp_len_buf = [0u8; 2];
-    tokio::time::timeout(timeout, stream.read_exact(&mut resp_len_buf))
-        .await
-        .map_err(|_| DiscoveryError::Dns(format!("DNS TCP read timeout from {server}")))??;
-    let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
-    let mut resp_buf = vec![0u8; resp_len];
-    tokio::time::timeout(timeout, stream.read_exact(&mut resp_buf))
-        .await
-        .map_err(|_| DiscoveryError::Dns(format!("DNS TCP body timeout from {server}")))??;
+        let mut resp_len_buf = [0u8; 2];
+        stream.read_exact(&mut resp_len_buf).await?;
+        let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
+        let mut resp_buf = vec![0u8; resp_len];
+        stream.read_exact(&mut resp_buf).await?;
+        Ok::<Vec<u8>, std::io::Error>(resp_buf)
+    })
+    .await
+    .map_err(|_| DiscoveryError::Dns(format!("DNS TCP exchange timeout with {server}")))??;
 
     match decode_dns_response(tcp_id, fqdn, qtype, &resp_buf)? {
         DecodedDnsMessage::Truncated => Err(DiscoveryError::Dns(
