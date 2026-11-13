@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use arrow_schema::ArrowError;
 
+use super::columns::ms_to_ns;
 use crate::parse::ParseError;
 
 /// Default upper bound on data points emitted per [`super::OtapMetricRecords`] chunk in
@@ -154,6 +155,15 @@ pub struct DecodeOptions {
     /// Default timestamp in milliseconds since the Unix epoch applied to samples that omit an
     /// explicit wire timestamp. When `None`, untimestamped samples leave `time_unix_nano` unset.
     pub timestamp_ms: Option<i64>,
+    /// Whether sample timestamps carried by the exposition payload are preserved.
+    ///
+    /// When `true` (the default), a sample's wire timestamp wins, falling back to
+    /// [`Self::timestamp_ms`] when the sample carries none. When `false`, wire sample timestamps are
+    /// ignored and every data point receives [`Self::timestamp_ms`], matching Go's
+    /// `honor_timestamps: false`. Out-of-range wire timestamps are then not an error, because they
+    /// are never converted. Start timestamps and exemplar timestamps are unaffected either way. If
+    /// [`Self::timestamp_ms`] is `None`, a cleared flag leaves data points without a timestamp.
+    pub honor_timestamps: bool,
     /// Maximum number of data points materialized per [`super::OtapMetricRecords`] chunk yielded by
     /// [`super::ArrowDecoder::decode_stream`]. Values of `0` are clamped to `1`. Single-batch
     /// [`super::ArrowDecoder::decode`] ignores this limit.
@@ -180,6 +190,7 @@ impl DecodeOptions {
     pub const fn new() -> Self {
         Self {
             timestamp_ms: None,
+            honor_timestamps: true,
             max_data_points_per_batch: DEFAULT_MAX_DATA_POINTS_PER_BATCH,
             counter_suffix_policy: CounterSuffixPolicy::Keep,
             unit_suffix_policy: UnitSuffixPolicy::Keep,
@@ -191,6 +202,13 @@ impl DecodeOptions {
     #[must_use]
     pub const fn with_timestamp_ms(mut self, timestamp_ms: i64) -> Self {
         self.timestamp_ms = Some(timestamp_ms);
+        self
+    }
+
+    /// Ignores wire sample timestamps and stamps data points with [`Self::timestamp_ms`] instead.
+    #[must_use]
+    pub const fn with_honor_timestamps(mut self, honor_timestamps: bool) -> Self {
+        self.honor_timestamps = honor_timestamps;
         self
     }
 
@@ -224,6 +242,26 @@ impl DecodeOptions {
     pub const fn with_untyped_policy(mut self, policy: UntypedPolicy) -> Self {
         self.untyped_policy = policy;
         self
+    }
+
+    /// Resolves the timestamp written for a data point.
+    ///
+    /// With [`Self::honor_timestamps`] set, a wire timestamp wins and out-of-range values are an
+    /// error. With it cleared, the wire timestamp is ignored without being converted and
+    /// `fallback_ts_ns` (the scrape timestamp) is used instead.
+    #[inline]
+    pub(super) fn resolve_sample_ts_ns(
+        &self,
+        wire_ts_ms: Option<i64>,
+        fallback_ts_ns: Option<i64>,
+    ) -> Result<Option<i64>, DecodeError> {
+        if !self.honor_timestamps {
+            return Ok(fallback_ts_ns);
+        }
+        match wire_ts_ms {
+            Some(ms) => Ok(Some(ms_to_ns(ms)?)),
+            None => Ok(fallback_ts_ns),
+        }
     }
 }
 

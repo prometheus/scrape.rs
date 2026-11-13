@@ -1049,7 +1049,9 @@ impl ArrowDecoder {
             | SeriesRole::HistogramCount
             | SeriesRole::SummaryQuantile
             | SeriesRole::SummarySum
-            | SeriesRole::SummaryCount => self.append_assembled_series(parser, role, default_ts_ns),
+            | SeriesRole::SummaryCount => {
+                self.append_assembled_series(parser, role, opts, default_ts_ns)
+            }
         }
     }
 
@@ -1104,10 +1106,7 @@ impl ArrowDecoder {
             .current_family
             .emit_into_batch(&mut self.metrics, opts)?;
         let start_ts_ns = start_ts_ms.and_then(|ms| ms.checked_mul(1_000_000));
-        let resolved_ts_ns = match sample_ts_ms {
-            Some(ms) => Some(ms_to_ns(ms)?),
-            None => default_ts_ns,
-        };
+        let resolved_ts_ns = opts.resolve_sample_ts_ns(sample_ts_ms, default_ts_ns)?;
         self.num_dp
             .base
             .push(parent_id, start_ts_ns, resolved_ts_ns);
@@ -1119,6 +1118,7 @@ impl ArrowDecoder {
         &mut self,
         parser: &mut ActiveParser<'_>,
         role: SeriesRole,
+        opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
         let special_label = match role {
@@ -1134,10 +1134,9 @@ impl ArrowDecoder {
         };
 
         let group_idx = self.assembly.find_or_create_group(&self.temp_attrs);
-        let sample_ts_ns = match sample_ts_ms {
-            Some(ms) => Some(ms_to_ns(ms)?),
-            None => None,
-        };
+        // The scrape timestamp is applied per data point when the family is flushed, through
+        // `group.ts_ns.or(default_ts_ns)`, so no fallback is resolved here.
+        let sample_ts_ns = opts.resolve_sample_ts_ns(sample_ts_ms, None)?;
         let om_start_ts_ns = if !self.assembly.groups[group_idx].start_ts_checked {
             self.assembly.groups[group_idx].start_ts_checked = true;
             if parser.is_openmetrics() {

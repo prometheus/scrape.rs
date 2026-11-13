@@ -1194,3 +1194,284 @@ fn cooperative_async_helpers_respect_fast_path_and_yield_budgets() {
     assert!(stream_err_res.1.is_none());
     assert_eq!(stream_err_polls, 1);
 }
+
+#[test]
+fn honor_timestamps_defaults_to_true() {
+    assert!(DecodeOptions::new().honor_timestamps);
+    assert!(DecodeOptions::default().honor_timestamps);
+    assert!(
+        !DecodeOptions::new()
+            .with_honor_timestamps(false)
+            .honor_timestamps
+    );
+}
+
+#[test]
+fn resolve_sample_ts_ns_truth_table() {
+    let honoring = DecodeOptions::new().with_timestamp_ms(1_000);
+    let ignoring = honoring.with_honor_timestamps(false);
+
+    // Honouring: the wire timestamp wins, and the fallback covers the absent case.
+    assert_eq!(
+        honoring
+            .resolve_sample_ts_ns(Some(2_000), Some(1_000_000_000))
+            .unwrap(),
+        Some(2_000_000_000)
+    );
+    assert_eq!(
+        honoring
+            .resolve_sample_ts_ns(None, Some(1_000_000_000))
+            .unwrap(),
+        Some(1_000_000_000)
+    );
+    assert_eq!(
+        DecodeOptions::new()
+            .resolve_sample_ts_ns(None, None)
+            .unwrap(),
+        None
+    );
+
+    // Ignoring: the fallback wins and the wire timestamp is never converted.
+    assert_eq!(
+        ignoring
+            .resolve_sample_ts_ns(Some(2_000), Some(1_000_000_000))
+            .unwrap(),
+        Some(1_000_000_000)
+    );
+    assert_eq!(
+        ignoring
+            .resolve_sample_ts_ns(Some(9_300_000_000_000), Some(1_000_000_000))
+            .unwrap(),
+        Some(1_000_000_000)
+    );
+    assert_eq!(
+        DecodeOptions::new()
+            .with_honor_timestamps(false)
+            .resolve_sample_ts_ns(Some(2_000), None)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn resolve_sample_ts_ns_rejects_out_of_range_wire_timestamp() {
+    let err = DecodeOptions::new()
+        .resolve_sample_ts_ns(Some(9_300_000_000_000), None)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DecodeError::TimestampOverflow {
+            timestamp_ms: 9_300_000_000_000
+        }
+    ));
+}
+
+#[test]
+fn honor_timestamps_overrides_wire_sample_timestamp() {
+    let payload = b"# HELP req_total Total requests.\n\
+                    # TYPE req_total counter\n\
+                    req_total 12 1700000000500\n";
+    let opts = DecodeOptions::new().with_timestamp_ms(1_700_000_100_000);
+
+    let mut dec = ArrowDecoder::new();
+    let honored = dec.decode(payload, &Format::TEXT, &opts).unwrap();
+    let honored_dps = honored.number_data_points().unwrap();
+    let honored_ts = honored_dps
+        .column_by_name("time_unix_nano")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    assert_eq!(honored_ts.value(0), 1_700_000_000_500_000_000);
+
+    let mut dec = ArrowDecoder::new();
+    let ignored = dec
+        .decode(payload, &Format::TEXT, &opts.with_honor_timestamps(false))
+        .unwrap();
+    let ignored_dps = ignored.number_data_points().unwrap();
+    let ignored_ts = ignored_dps
+        .column_by_name("time_unix_nano")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    assert_eq!(ignored_ts.value(0), 1_700_000_100_000_000_000);
+}
+
+#[test]
+fn honor_timestamps_tolerates_out_of_range_wire_timestamp() {
+    let payload = b"# TYPE lag_seconds gauge\nlag_seconds 1 9300000000000\n";
+    let opts = DecodeOptions::new().with_timestamp_ms(1_700_000_000_000);
+
+    let mut dec = ArrowDecoder::new();
+    let err = dec.decode(payload, &Format::TEXT, &opts).unwrap_err();
+    assert!(matches!(err, DecodeError::TimestampOverflow { .. }));
+
+    let mut dec = ArrowDecoder::new();
+    let records = dec
+        .decode(payload, &Format::TEXT, &opts.with_honor_timestamps(false))
+        .unwrap();
+    let dps = records.number_data_points().unwrap();
+    let ts = dps
+        .column_by_name("time_unix_nano")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    assert_eq!(ts.value(0), 1_700_000_000_000_000_000);
+}
+
+#[test]
+fn honor_timestamps_applies_to_assembled_families() {
+    let payload = b"# TYPE req_seconds histogram\n\
+                    req_seconds_bucket{le=\"1\"} 1 1700000000500\n\
+                    req_seconds_bucket{le=\"+Inf\"} 2 1700000000500\n\
+                    req_seconds_sum 3 1700000000500\n\
+                    req_seconds_count 2 1700000000500\n";
+    let opts = DecodeOptions::new()
+        .with_timestamp_ms(1_700_000_100_000)
+        .with_honor_timestamps(false);
+
+    let mut dec = ArrowDecoder::new();
+    let records = dec.decode(payload, &Format::TEXT, &opts).unwrap();
+    let hdp = records.histogram_data_points().unwrap();
+    let ts = hdp
+        .column_by_name("time_unix_nano")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    assert!(!ts.is_empty());
+    for i in 0..ts.len() {
+        assert_eq!(ts.value(i), 1_700_000_100_000_000_000);
+    }
+}
+
+#[test]
+fn honor_timestamps_preserves_start_timestamps() {
+    let payload = concat!(
+        "# TYPE calls counter\n",
+        "calls_total{service=\"auth\"} 9 1710000000.0\n",
+        "calls_created{service=\"auth\"} 1709000000.0\n",
+        "# EOF\n",
+    );
+    let opts = DecodeOptions::new().with_timestamp_ms(1_700_000_100_000);
+
+    let mut dec = ArrowDecoder::new();
+    let honored = dec
+        .decode(payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts)
+        .unwrap();
+    let mut dec = ArrowDecoder::new();
+    let ignored = dec
+        .decode(
+            payload.as_bytes(),
+            &Format::OPEN_METRICS_1_0_0,
+            &opts.with_honor_timestamps(false),
+        )
+        .unwrap();
+
+    let honored_dps = honored.number_data_points().unwrap();
+    let ignored_dps = ignored.number_data_points().unwrap();
+    let sample_ts = |dps: &arrow_array::RecordBatch| -> i64 {
+        dps.column_by_name("time_unix_nano")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap()
+            .value(0)
+    };
+    assert_eq!(sample_ts(honored_dps), 1_710_000_000_000_000_000);
+    assert_eq!(sample_ts(ignored_dps), 1_700_000_100_000_000_000);
+
+    let start_ts = |dps: &arrow_array::RecordBatch| -> Option<i64> {
+        let col = dps
+            .column_by_name("start_time_unix_nano")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        (!col.is_null(0)).then(|| col.value(0))
+    };
+    // The `_created` start timestamp survives the flag: only the sample timestamp moves.
+    assert!(
+        start_ts(honored_dps).is_some(),
+        "expected a start timestamp"
+    );
+    assert_eq!(start_ts(honored_dps), start_ts(ignored_dps));
+}
+
+#[test]
+fn honor_timestamps_leaves_exemplar_timestamps_alone() {
+    let payload = concat!(
+        "# TYPE rpc_seconds histogram\n",
+        "rpc_seconds_bucket{le=\"0.1\"} 3 1710000000.0 # {trace_id=\"0102030405060708090a0b0c0d0e0f10\"} 0.05 1709999999.0\n",
+        "rpc_seconds_bucket{le=\"+Inf\"} 4 1710000000.0\n",
+        "rpc_seconds_sum 0.42 1710000000.0\n",
+        "rpc_seconds_count 4 1710000000.0\n",
+        "# EOF\n",
+    );
+    let opts = DecodeOptions::new().with_timestamp_ms(1_700_000_100_000);
+
+    let mut dec = ArrowDecoder::new();
+    let honored = dec
+        .decode(payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts)
+        .unwrap();
+    let mut dec = ArrowDecoder::new();
+    let ignored = dec
+        .decode(
+            payload.as_bytes(),
+            &Format::OPEN_METRICS_1_0_0,
+            &opts.with_honor_timestamps(false),
+        )
+        .unwrap();
+
+    let exemplar_ts = |records: &OtapMetricRecords| -> i64 {
+        let batch = records
+            .histogram_dp_exemplars()
+            .expect("histogram exemplar batch");
+        batch
+            .column_by_name("time_unix_nano")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap()
+            .value(0)
+    };
+    assert_eq!(exemplar_ts(&honored), 1_709_999_999_000_000_000);
+    assert_eq!(exemplar_ts(&ignored), 1_709_999_999_000_000_000);
+}
+
+#[test]
+fn honor_timestamps_applies_in_streamed_batches() {
+    let mut payload = String::from("# TYPE req_total counter\n");
+    for _ in 0..4 {
+        payload.push_str("req_total 12 1700000000500\n");
+    }
+    let opts = DecodeOptions::new()
+        .with_timestamp_ms(1_700_000_100_000)
+        .with_honor_timestamps(false)
+        .with_max_data_points_per_batch(1);
+
+    let mut dec = ArrowDecoder::new();
+    let streamed = dec
+        .decode_stream(payload.as_bytes(), &Format::TEXT, &opts)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(streamed.len() > 1, "expected multiple batches");
+
+    let mut seen = 0_usize;
+    for records in &streamed {
+        let dps = records.number_data_points().unwrap();
+        let ts = dps
+            .column_by_name("time_unix_nano")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        for i in 0..ts.len() {
+            assert_eq!(ts.value(i), 1_700_000_100_000_000_000);
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 4);
+}
