@@ -752,6 +752,8 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
         cursor: DecodeCursor,
     }
 
+    assert_eq!(size_of::<DecodeCursor>(), 96);
+
     let om_payload = concat!(
         "# HELP rpc_seconds RPC latency.\n",
         "# UNIT rpc_seconds seconds\n",
@@ -944,6 +946,59 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
             .unwrap(),
         DecodeStep::Done
     );
+
+    let bad_om = b"# TYPE c counter\nc_total{a=\"1\"} 1\nbad_om_line\n# EOF\n";
+    let mut om_err_cursor = job
+        .decoder
+        .start_decode(&Format::OPEN_METRICS_1_0_0, &opts)
+        .unwrap();
+    assert_eq!(
+        job.decoder
+            .step_decode(&mut om_err_cursor, bad_om, budget)
+            .unwrap(),
+        DecodeStep::Pending
+    );
+    assert_eq!(
+        job.decoder
+            .step_decode(&mut om_err_cursor, bad_om, budget)
+            .unwrap(),
+        DecodeStep::Pending
+    );
+    assert!(matches!(
+        job.decoder.step_decode(&mut om_err_cursor, bad_om, budget),
+        Err(DecodeError::Syntax { .. })
+    ));
+    assert!(om_err_cursor.is_done());
+    assert_eq!(
+        job.decoder
+            .step_decode(&mut om_err_cursor, bad_om, budget)
+            .unwrap(),
+        DecodeStep::Done
+    );
+    assert_eq!(
+        job.decoder.om_state.retained_memory_bytes(),
+        retained_after_first
+    );
+
+    // Verify `om_state.reset()` cleared `metric_type = Counter` so a subsequent untyped
+    // `*_created` series is not skipped as a counter start-timestamp line.
+    let untyped_created_om = b"orphan_created 5\n# EOF\n";
+    let mut untyped_om_cursor = job
+        .decoder
+        .start_decode(&Format::OPEN_METRICS_1_0_0, &opts)
+        .unwrap();
+    match job
+        .decoder
+        .step_decode(
+            &mut untyped_om_cursor,
+            untyped_created_om,
+            DecodeBudget::default(),
+        )
+        .unwrap()
+    {
+        DecodeStep::Batch(records) => assert_eq!(records.num_data_points(), 1),
+        other => panic!("expected untyped _created series batch, got {other:?}"),
+    }
 
     let mut trunc_cursor = job.decoder.start_decode(&Format::TEXT, &opts).unwrap();
     assert_eq!(
