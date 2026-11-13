@@ -2175,3 +2175,84 @@ fn staleness_wire_nans_type_transitions_policies_and_cooperative_cursor() {
     assert_eq!(chunks.len(), 2);
     assert!(coop_tracker.is_empty());
 }
+
+#[test]
+fn staleness_label_set_deduplication_and_single_rotation_compaction() {
+    let mut dec = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    let opts = DecodeOptions::new().with_timestamp_ms(1_000);
+
+    // 1. 10 metric families sharing 100 identical 12-label sets (1,000 active series total).
+    //    Per-target label-set deduplication stores only 100 unique label sets in `series_attrs`
+    //    instead of 1,000 copies, keeping total tracker memory well under 48 KiB.
+    let build_shared_scrape = |cycle_id: u32| -> String {
+        let mut s = String::new();
+        for f in 0..10 {
+            s.push_str(&format!(
+                "# HELP metric_family_{f} Family {f}.\n# TYPE metric_family_{f} gauge\n"
+            ));
+            for series_id in 0..100 {
+                s.push_str(&format!(
+                    "metric_family_{f}{{cycle_id=\"{cycle_id}\",series_id=\"{series_id}\",\
+                     l0=\"val_0\",l1=\"val_1\",l2=\"val_2\",l3=\"val_3\",l4=\"val_4\",\
+                     l5=\"val_5\",l6=\"val_6\",l7=\"val_7\",l8=\"val_8\",l9=\"val_9\"}} {series_id}\n"
+                ));
+            }
+        }
+        s
+    };
+
+    let scrape_cycle_0 = build_shared_scrape(0);
+    let rec0 = dec
+        .decode_with_staleness(
+            scrape_cycle_0.as_bytes(),
+            &Format::TEXT,
+            &opts,
+            &mut tracker,
+        )
+        .unwrap();
+    assert_eq!(rec0.num_data_points(), 1_000);
+    assert_eq!(tracker.active_series_len(), 1_000);
+    let mem_cycle_0 = tracker.retained_memory_bytes();
+    // Without label-set deduplication and 8-byte bucket/entry packing, 1,000 series x 12 labels
+    // took >140 KiB; with deduplication and shrink-to-fit it takes ~33 KiB (< 48 KiB).
+    assert!(
+        mem_cycle_0 < 48 * 1024,
+        "expected deduplicated tracker memory < 48 KiB, got {mem_cycle_0} B"
+    );
+
+    // 2. A mid-scrape error after introducing new label sets rolls back `attr_sets` and
+    //    `series_attrs` cleanly.
+    let bad_scrape =
+        b"# TYPE metric_family_0 gauge\nmetric_family_0{new_k=\"new_v\"} 1\nbad_syntax_line\n";
+    assert!(
+        dec.decode_with_staleness(
+            bad_scrape,
+            &Format::TEXT,
+            &opts.with_timestamp_ms(1_500),
+            &mut tracker
+        )
+        .is_err()
+    );
+    assert_eq!(tracker.active_series_len(), 1_000);
+
+    // 3. A single 100% label rotation (`cycle_id="0"` -> `cycle_id="1"`) emits 1,000 live + 1,000
+    //    stale data points and immediately compacts the 1,000 deactivated series at the end of the
+    //    scrape instead of retaining 2x dead series until a second rotation.
+    let scrape_cycle_1 = build_shared_scrape(1);
+    let rec1 = dec
+        .decode_with_staleness(
+            scrape_cycle_1.as_bytes(),
+            &Format::TEXT,
+            &opts.with_timestamp_ms(2_000),
+            &mut tracker,
+        )
+        .unwrap();
+    assert_eq!(rec1.num_data_points(), 2_000);
+    assert_eq!(tracker.active_series_len(), 1_000);
+    let mem_cycle_1 = tracker.retained_memory_bytes();
+    assert_eq!(
+        mem_cycle_1, mem_cycle_0,
+        "single 100% churn rotation must compact dead series immediately ({mem_cycle_1} vs {mem_cycle_0})"
+    );
+}
