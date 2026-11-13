@@ -128,6 +128,21 @@ fn static_configs_and_target_group_serde_match_prometheus() {
     assert!(serde_json::from_str::<StaticConfig>(r#"{"target": ["127.0.0.1:80"]}"#).is_err());
     assert!(serde_json::from_str::<TargetGroup>(r#"{"targets": [], "source": "0"}"#).is_err());
     assert!(serde_json::from_str::<DiscoveryConfigs>(r#"{"static_config": []}"#).is_err());
+
+    // Empty label names in `labels` are rejected matching Prometheus model.LabelSet.UnmarshalJSON.
+    let invalid_labels = r#"{"targets":["a:1"],"labels":{"":"x"}}"#;
+    assert!(
+        serde_json::from_str::<StaticConfig>(invalid_labels)
+            .unwrap_err()
+            .to_string()
+            .contains(r#""" is not a valid label name"#)
+    );
+    assert!(
+        serde_json::from_str::<TargetGroup>(invalid_labels)
+            .unwrap_err()
+            .to_string()
+            .contains(r#""" is not a valid label name"#)
+    );
 }
 
 #[test]

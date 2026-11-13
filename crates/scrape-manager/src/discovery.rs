@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub use prometheus_relabel::{ADDRESS_LABEL, LabelSet};
+pub use prometheus_relabel::{ADDRESS_LABEL, LabelSet, ValidationScheme};
 
 /// Error returned when validating or running target discovery.
 #[derive(Debug, thiserror::Error)]
@@ -44,6 +44,21 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+fn deserialize_label_set<'de, D>(deserializer: D) -> Result<LabelSet, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let labels = Option::<LabelSet>::deserialize(deserializer)?.unwrap_or_default();
+    for name in labels.keys() {
+        if !ValidationScheme::Utf8.is_valid_label_name(name) {
+            return Err(serde::de::Error::custom(format!(
+                "{name:?} is not a valid label name"
+            )));
+        }
+    }
+    Ok(labels)
+}
+
 /// Static target group configuration matching Prometheus `static_configs` entries.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,7 +69,7 @@ pub struct StaticConfig {
     /// Labels assigned to all targets in the group.
     #[serde(
         default,
-        deserialize_with = "deserialize_null_default",
+        deserialize_with = "deserialize_label_set",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub labels: LabelSet,
