@@ -1,0 +1,3 @@
+# TYPE "req.duration" histogram
+{"req.duration",job="api"} {count:3,sum:6.0,bucket:[0.1:1,+Inf:3]}
+# EOF

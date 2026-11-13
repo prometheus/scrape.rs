@@ -1,0 +1,109 @@
+help "http_requests_total" "Total number of HTTP requests."
+type "http_requests_total" counter
+unit "http_requests_total" "requests"
+series "http_requests_total{method=\"get\"}" 40900c0000000000 1395066363000 "__name__"="http_requests_total" "method"="get"
+exemplar 3ff0000000000000 1395066362000 "trace_id"="abc123"
+st 1395066360000
+series "http_requests_total{method=\"post\"}" 4008000000000000 1395066363000 "__name__"="http_requests_total" "method"="post"
+st 0
+series "http_requests_total{method=\"put\"}" 0000000000000000 1395066363000 "__name__"="http_requests_total" "method"="put"
+exemplar 3ff0000000000000 1395066362500 "span_id"="s1" "trace_id"="t1"
+st 0
+help "go_gc_duration_seconds" "GC duration percentiles."
+type "go_gc_duration_seconds" summary
+unit "go_gc_duration_seconds" "seconds"
+series "go_gc_duration_seconds_count" 4059000000000000 - "__name__"="go_gc_duration_seconds_count"
+st 0
+series "go_gc_duration_seconds_sum" 3ff8000000000000 - "__name__"="go_gc_duration_seconds_sum"
+st 0
+series "go_gc_duration_secondsÿquantileÿ0.25" 3f1a36e2eb1c432d - "__name__"="go_gc_duration_seconds" "quantile"="0.25"
+st 0
+series "go_gc_duration_secondsÿquantileÿ0.5" 3f2a36e2eb1c432d - "__name__"="go_gc_duration_seconds" "quantile"="0.5"
+st 0
+series "go_gc_duration_secondsÿquantileÿ0.75" 3f33a92a30553261 - "__name__"="go_gc_duration_seconds" "quantile"="0.75"
+st 0
+series "go_gc_duration_secondsÿquantileÿ1.0" 3f3a36e2eb1c432d - "__name__"="go_gc_duration_seconds" "quantile"="1.0"
+st 0
+series "go_gc_duration_seconds_countÿgenÿyoung" 4054000000000000 - "__name__"="go_gc_duration_seconds_count" "gen"="young"
+st 0
+series "go_gc_duration_seconds_sumÿgenÿyoung" 3ff3333333333333 - "__name__"="go_gc_duration_seconds_sum" "gen"="young"
+st 0
+series "go_gc_duration_secondsÿgenÿyoungÿquantileÿ0.5" 3f1a36e2eb1c432d - "__name__"="go_gc_duration_seconds" "gen"="young" "quantile"="0.5"
+st 0
+series "go_gc_duration_secondsÿgenÿyoungÿquantileÿ0.99" 3f40624dd2f1a9fc - "__name__"="go_gc_duration_seconds" "gen"="young" "quantile"="0.99"
+st 0
+help "process_open_fds" "Number of open file descriptors."
+type "process_open_fds" gauge
+unit "process_open_fds" "fds"
+series "process_open_fds" 4020000000000000 - "__name__"="process_open_fds"
+st 0
+help "up" "1 if the target is up."
+type "up" gauge
+series "up{job=\"api\",instance=\"api-1:9090\"}" 3ff0000000000000 1395066363500 "__name__"="up" "instance"="api-1:9090" "job"="api"
+st 0
+series "up{job=\"api\",instance=\"api-2:9090\"}" 0000000000000000 1395066363500 "__name__"="up" "instance"="api-2:9090" "job"="api"
+st 0
+help "request_duration" "Request duration (classic histogram exposition)."
+type "request_duration" histogram
+unit "request_duration" "seconds"
+series "request_duration_count" 4062000000000000 - "__name__"="request_duration_count"
+exemplar 3fee666666666666 1395066362700 "trace_id"="slow-req"
+st 0
+series "request_duration_sum" 404ab33333333333 - "__name__"="request_duration_sum"
+st 0
+series "request_duration_bucketÿleÿ0.1" 4038000000000000 - "__name__"="request_duration_bucket" "le"="0.1"
+st 0
+series "request_duration_bucketÿleÿ0.2" 4040800000000000 - "__name__"="request_duration_bucket" "le"="0.2"
+st 0
+series "request_duration_bucketÿleÿ0.4" 4059000000000000 - "__name__"="request_duration_bucket" "le"="0.4"
+st 0
+series "request_duration_bucketÿleÿ1.0" 4062000000000000 - "__name__"="request_duration_bucket" "le"="1.0"
+st 0
+series "request_duration_bucketÿleÿ+Inf" 4062000000000000 - "__name__"="request_duration_bucket" "le"="+Inf"
+st 0
+series "request_duration_countÿrouteÿ/api/v1/query" 4028000000000000 - "__name__"="request_duration_count" "route"="/api/v1/query"
+st 0
+series "request_duration_sumÿrouteÿ/api/v1/query" 400999999999999a - "__name__"="request_duration_sum" "route"="/api/v1/query"
+st 0
+series "request_duration_bucketÿleÿ0.1ÿrouteÿ/api/v1/query" 4000000000000000 - "__name__"="request_duration_bucket" "le"="0.1" "route"="/api/v1/query"
+st 0
+series "request_duration_bucketÿleÿ1.0ÿrouteÿ/api/v1/query" 4028000000000000 - "__name__"="request_duration_bucket" "le"="1.0" "route"="/api/v1/query"
+st 0
+series "request_duration_bucketÿleÿ+Infÿrouteÿ/api/v1/query" 4028000000000000 - "__name__"="request_duration_bucket" "le"="+Inf" "route"="/api/v1/query"
+st 0
+help "latency_seconds" "Service latency (native histogram)."
+type "latency_seconds" histogram
+unit "latency_seconds" "seconds"
+histogram "latency_seconds" - int schema=0 count=5 sum=4028333333333333 zero_threshold=3f50624dd2f1a9fc zero_count=2 hint=0 pos_spans=[0:3] pos=[1,0,0] neg_spans=[] neg=[] "__name__"="latency_seconds"
+st 0
+help "payload_size" "Payload size (float native histogram)."
+type "payload_size" histogram
+histogram "payload_size" - float schema=0 count=4016000000000000 sum=4028333333333333 zero_threshold=3f50624dd2f1a9fc zero_count=4004000000000000 hint=0 pos_spans=[0:2] pos=[4000000000000000,3ff0000000000000] neg_spans=[] neg=[] "__name__"="payload_size"
+st 0
+help "request_size" "Request size distribution (gauge histogram)."
+type "request_size" gaugehistogram
+unit "request_size" "bytes"
+histogram "request_size" - int schema=0 count=6 sum=4059000000000000 zero_threshold=3f50624dd2f1a9fc zero_count=1 hint=3 pos_spans=[0:2] pos=[3,-1] neg_spans=[] neg=[] "__name__"="request_size"
+st 0
+help "build_info" "Build information."
+type "build_info" info
+series "build_info{version=\"1.0.0\",revision=\"abc123\"}" 3ff0000000000000 - "__name__"="build_info" "revision"="abc123" "version"="1.0.0"
+st 0
+help "subsystem_enabled" "Subsystem stateset."
+type "subsystem_enabled" stateset
+series "subsystem_enabled{subsystem_enabled=\"auth\"}" 0000000000000000 - "__name__"="subsystem_enabled" "subsystem_enabled"="auth"
+st 0
+series "subsystem_enabled{subsystem_enabled=\"metrics\"}" 3ff0000000000000 - "__name__"="subsystem_enabled" "subsystem_enabled"="metrics"
+st 0
+series "subsystem_enabled{subsystem_enabled=\"tracing\"}" 3ff0000000000000 - "__name__"="subsystem_enabled" "subsystem_enabled"="tracing"
+st 0
+help "unknown_metric" "Some metric of unknown type."
+type "unknown_metric" unknown
+series "unknown_metric" 4045000000000000 - "__name__"="unknown_metric"
+st 0
+series "another_unknown_metric" 4044800000000000 - "__name__"="another_unknown_metric"
+st 0
+help "metric.with.dots" "UTF-8 metric name."
+type "metric.with.dots" gauge
+series "{\"metric.with.dots\",label=\"value\"}" 3ff0000000000000 - "__name__"="metric.with.dots" "label"="value"
+st 0

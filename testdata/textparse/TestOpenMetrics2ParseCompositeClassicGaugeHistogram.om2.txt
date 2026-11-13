@@ -1,0 +1,3 @@
+# TYPE foo gaugehistogram
+foo {gcount:42,gsum:3289.3,bucket:[0.01:20,0.1:25,1:34,+Inf:42]}
+# EOF

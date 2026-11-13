@@ -1,0 +1,12 @@
+type "http_request_duration_seconds" histogram
+unit "http_request_duration_seconds" "seconds"
+series "http_request_duration_seconds_count" 4008000000000000 - "__name__"="http_request_duration_seconds_count"
+st 0
+series "http_request_duration_seconds_sum" 4018000000000000 - "__name__"="http_request_duration_seconds_sum"
+st 0
+series "http_request_duration_seconds_bucketÿleÿ0.1" 3ff0000000000000 - "__name__"="http_request_duration_seconds_bucket" "le"="0.1"
+st 0
+series "http_request_duration_seconds_bucketÿleÿ0.5" 4000000000000000 - "__name__"="http_request_duration_seconds_bucket" "le"="0.5"
+st 0
+series "http_request_duration_seconds_bucketÿleÿ+Inf" 4008000000000000 - "__name__"="http_request_duration_seconds_bucket" "le"="+Inf"
+st 0

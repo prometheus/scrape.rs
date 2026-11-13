@@ -20,7 +20,9 @@
 // It also writes the entries textparse.NewPromParser returns for each Prometheus
 // text fixture to testdata/promparse/, and the entries
 // textparse.NewOpenMetricsParser returns for each OpenMetrics fixture to
-// testdata/omparse/. It also marshals the createTestProtoBuf inputs from
+// testdata/omparse/, and the entries textparse.NewOpenMetrics2Parser returns for
+// each OpenMetrics 2.0 fixture and TestOpenMetrics2Parse* case to
+// testdata/om2parse/. It also marshals the createTestProtoBuf inputs from
 // protobufparse_test.go into testdata/textparse/TestProtobufParse.pb and writes
 // the entries textparse.NewProtobufParser returns to testdata/protobufparse/.
 package main
@@ -142,6 +144,12 @@ func run() error {
 		synced = append(synced, filepath.ToSlash(rel))
 	}
 
+	om2Cases, err := writeOM2Cases(outRoot, filepath.Join(promMod.Dir, "model", "textparse", "openmetrics2parse_test.go"))
+	if err != nil {
+		return err
+	}
+	synced = append(synced, om2Cases...)
+
 	protobufInput, err := writeProtobufParseInput(outRoot, filepath.Join(promMod.Dir, "model", "textparse", "protobufparse_test.go"))
 	if err != nil {
 		return err
@@ -159,6 +167,12 @@ func run() error {
 		return err
 	}
 	synced = append(synced, omParseFiles...)
+
+	om2ParseFiles, err := writeOM2ParseExpected(outRoot)
+	if err != nil {
+		return err
+	}
+	synced = append(synced, om2ParseFiles...)
 
 	protobufParseFiles, err := writeProtobufParseExpected(outRoot)
 	if err != nil {

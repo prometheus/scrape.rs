@@ -1,0 +1,9 @@
+type "req.duration" histogram
+series "req.duration_countÿjobÿapi" 4008000000000000 - "__name__"="req.duration_count" "job"="api"
+st 0
+series "req.duration_sumÿjobÿapi" 4018000000000000 - "__name__"="req.duration_sum" "job"="api"
+st 0
+series "req.duration_bucketÿjobÿapiÿleÿ0.1" 3ff0000000000000 - "__name__"="req.duration_bucket" "job"="api" "le"="0.1"
+st 0
+series "req.duration_bucketÿjobÿapiÿleÿ+Inf" 4008000000000000 - "__name__"="req.duration_bucket" "job"="api" "le"="+Inf"
+st 0

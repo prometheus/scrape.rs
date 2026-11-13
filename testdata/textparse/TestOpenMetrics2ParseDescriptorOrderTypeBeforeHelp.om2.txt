@@ -1,0 +1,5 @@
+# TYPE open_fds gauge
+# HELP open_fds Number of open file descriptors.
+# UNIT open_fds fds
+open_fds 8.0
+# EOF

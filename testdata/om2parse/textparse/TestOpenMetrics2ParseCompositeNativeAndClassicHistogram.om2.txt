@@ -1,0 +1,4 @@
+help "req_duration" "Request duration histogram with both representations."
+type "req_duration" histogram
+histogram "req_duration" - int schema=0 count=3 sum=4018000000000000 zero_threshold=3f50624dd2f1a9fc zero_count=0 hint=0 pos_spans=[0:2] pos=[1,1] neg_spans=[] neg=[] "__name__"="req_duration"
+st 0

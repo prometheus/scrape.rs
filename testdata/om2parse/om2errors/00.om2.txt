@@ -1,0 +1,3 @@
+series "metric" 3ff0000000000000 - "__name__"="metric"
+st 0
+error

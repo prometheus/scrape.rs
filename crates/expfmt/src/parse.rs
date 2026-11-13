@@ -19,6 +19,7 @@ use std::borrow::Cow;
 mod float;
 #[cfg(test)]
 mod go_diff_tests;
+mod om2parse;
 mod omlex;
 mod omparse;
 mod promlex;
@@ -27,6 +28,7 @@ mod promparse;
 mod protobufparse;
 
 pub(crate) use float::parse_go_float;
+pub use om2parse::OpenMetrics2Parser;
 pub use omparse::OpenMetricsParser;
 pub(crate) use omparse::{OmScratch, OpenMetricsParserState};
 pub use promparse::PromParser;
@@ -349,9 +351,10 @@ pub trait Parser<'a> {
     }
 
     /// Returns the start timestamp in ms of the current sample, read from its `_created` line
-    /// in OpenMetrics or its `start_timestamp` field in protobuf. Takes `&mut self` because the
-    /// OpenMetrics parser, like Go, caches the last hit and turns on `_created` skipping, so
-    /// later `_created` lines are not returned as series. The protobuf parser only reads the field.
+    /// in OpenMetrics 1.0, its `st@` field in OpenMetrics 2.0, or its `start_timestamp` field in
+    /// protobuf. Takes `&mut self` because the OpenMetrics 1.0 parser, like Go, caches the last
+    /// hit and turns on `_created` skipping, so later `_created` lines are not returned as series.
+    /// The other parsers only read the field.
     fn start_timestamp(&mut self) -> Option<i64> {
         None
     }

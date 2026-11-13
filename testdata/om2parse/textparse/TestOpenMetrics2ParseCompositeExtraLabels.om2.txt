@@ -1,0 +1,11 @@
+type "req_duration" histogram
+series "req_duration_countÿenvÿprodÿjobÿapi" 4008000000000000 - "__name__"="req_duration_count" "env"="prod" "job"="api"
+st 0
+series "req_duration_sumÿenvÿprodÿjobÿapi" 4018000000000000 - "__name__"="req_duration_sum" "env"="prod" "job"="api"
+st 0
+series "req_duration_bucketÿenvÿprodÿjobÿapiÿleÿ0.1" 3ff0000000000000 - "__name__"="req_duration_bucket" "env"="prod" "job"="api" "le"="0.1"
+st 0
+series "req_duration_bucketÿenvÿprodÿjobÿapiÿleÿ1.0" 4000000000000000 - "__name__"="req_duration_bucket" "env"="prod" "job"="api" "le"="1.0"
+st 0
+series "req_duration_bucketÿenvÿprodÿjobÿapiÿleÿ+Inf" 4008000000000000 - "__name__"="req_duration_bucket" "env"="prod" "job"="api" "le"="+Inf"
+st 0

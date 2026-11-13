@@ -24,7 +24,7 @@ use super::{
 };
 
 /// Go's `value.NormalNaN`, the canonical NaN bit pattern Prometheus stores.
-const NORMAL_NAN: u64 = 0x7ff8_0000_0000_0001;
+pub(super) const NORMAL_NAN: u64 = 0x7ff8_0000_0000_0001;
 
 const CREATED_SUFFIX: &[u8] = b"_created";
 
@@ -713,7 +713,7 @@ fn is_float_label(metric_type: MetricType, name: &str) -> bool {
 
 /// Go's `normalizeFloatsInLabelValues`: `le` on histograms and `quantile` on summaries
 /// use OpenMetrics float formatting. Keeps `value` borrowed when it is already canonical.
-fn normalize_float_label<'v>(
+pub(super) fn normalize_float_label<'v>(
     metric_type: MetricType,
     name: &str,
     value: Cow<'v, str>,
@@ -736,7 +736,7 @@ fn normalize_float_label<'v>(
 }
 
 /// Maps a `# TYPE` value to a [`MetricType`].
-fn parse_metric_type(text: &[u8]) -> Result<MetricType, ParseError> {
+pub(super) fn parse_metric_type(text: &[u8]) -> Result<MetricType, ParseError> {
     [
         MetricType::Counter,
         MetricType::Gauge,
@@ -753,7 +753,7 @@ fn parse_metric_type(text: &[u8]) -> Result<MetricType, ParseError> {
 }
 
 /// Go's `lvalReplacer`, which replaces `\"`, `\\`, and `\n`.
-fn unescape(raw: &[u8]) -> Cow<'_, [u8]> {
+pub(super) fn unescape(raw: &[u8]) -> Cow<'_, [u8]> {
     if !raw.contains(&b'\\') {
         return Cow::Borrowed(raw);
     }
@@ -775,7 +775,7 @@ fn unescape(raw: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(out)
 }
 
-fn unescape_label(raw: &str) -> Cow<'_, str> {
+pub(super) fn unescape_label(raw: &str) -> Cow<'_, str> {
     match unescape(raw.as_bytes()) {
         Cow::Borrowed(_) => Cow::Borrowed(raw),
         // Replacing ASCII escapes keeps valid UTF-8 valid, so nothing is lost here.
@@ -787,7 +787,7 @@ fn unescape_label(raw: &str) -> Cow<'_, str> {
 }
 
 /// Go's `parseFloat` in promparse.go, which rejects `pP_` before `strconv.ParseFloat`.
-fn parse_sample_value(raw: &[u8]) -> Option<f64> {
+pub(super) fn parse_sample_value(raw: &[u8]) -> Option<f64> {
     if raw.iter().any(|byte| matches!(byte, b'p' | b'P' | b'_')) {
         return None;
     }

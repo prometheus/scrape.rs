@@ -12,13 +12,16 @@
 // limitations under the License.
 
 //! Compares Layer 0 parser output with Go's `textparse` output stored in `testdata/promparse`,
-//! `testdata/omparse`, and `testdata/protobufparse`.
+//! `testdata/omparse`, `testdata/om2parse`, and `testdata/protobufparse`.
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::{Entry, HistogramRef, LabelsBuffer, OpenMetricsParser, Parser, PromParser, Span};
+use super::{
+    Entry, HistogramRef, LabelsBuffer, OpenMetrics2Parser, OpenMetricsParser, Parser, PromParser,
+    Span,
+};
 
 fn quote(out: &mut Vec<u8>, bytes: &[u8]) {
     out.push(b'"');
@@ -226,6 +229,13 @@ fn matches_go_promparse_output() {
 fn matches_go_openmetricsparse_output() {
     assert_matches_go("omparse", |input| {
         render(OpenMetricsParser::new(input), true)
+    });
+}
+
+#[test]
+fn matches_go_openmetrics2parse_output() {
+    assert_matches_go("om2parse", |input| {
+        render(OpenMetrics2Parser::new(input), true)
     });
 }
 

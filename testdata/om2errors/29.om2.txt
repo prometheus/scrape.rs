@@ -1,0 +1,3 @@
+# TYPE foo gaugehistogram
+foo 5
+# EOF

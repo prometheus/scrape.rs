@@ -1,0 +1,12 @@
+type "response_size_bytes" gaugehistogram
+unit "response_size_bytes" "bytes"
+series "response_size_bytes_gcount" 4010000000000000 - "__name__"="response_size_bytes_gcount"
+st 0
+series "response_size_bytes_gsum" 4090000000000000 - "__name__"="response_size_bytes_gsum"
+st 0
+series "response_size_bytes_bucketÿleÿ100.0" 3ff0000000000000 - "__name__"="response_size_bytes_bucket" "le"="100.0"
+st 0
+series "response_size_bytes_bucketÿleÿ500.0" 4008000000000000 - "__name__"="response_size_bytes_bucket" "le"="500.0"
+st 0
+series "response_size_bytes_bucketÿleÿ+Inf" 4010000000000000 - "__name__"="response_size_bytes_bucket" "le"="+Inf"
+st 0
