@@ -179,10 +179,19 @@ pub fn parse_duration(s: &str) -> Result<Duration, DiscoveryError> {
         ));
     }
 
+    const MS_NS: u64 = 1_000_000;
+    const SEC_NS: u64 = 1_000 * MS_NS;
+    const MIN_NS: u64 = 60 * SEC_NS;
+    const HOUR_NS: u64 = 60 * MIN_NS;
+    const DAY_NS: u64 = 24 * HOUR_NS;
+    const WEEK_NS: u64 = 7 * DAY_NS;
+    const YEAR_NS: u64 = 365 * DAY_NS;
+    const MAX_DURATION_NS: u64 = i64::MAX as u64;
+
     let orig = s;
     let bytes = s.as_bytes();
     let mut idx = 0;
-    let mut total_ms: u64 = 0;
+    let mut total_ns: u64 = 0;
     let mut last_unit_pos: u8 = 0;
 
     while idx < bytes.len() {
@@ -209,14 +218,14 @@ pub fn parse_duration(s: &str) -> Result<Duration, DiscoveryError> {
             )));
         }
         let unit = &s[unit_start..idx];
-        let (pos, mult_ms): (u8, u64) = match unit {
-            "y" => (1, 365 * 24 * 60 * 60 * 1000),
-            "w" => (2, 7 * 24 * 60 * 60 * 1000),
-            "d" => (3, 24 * 60 * 60 * 1000),
-            "h" => (4, 60 * 60 * 1000),
-            "m" => (5, 60 * 1000),
-            "s" => (6, 1000),
-            "ms" => (7, 1),
+        let (pos, mult_ns): (u8, u64) = match unit {
+            "y" => (1, YEAR_NS),
+            "w" => (2, WEEK_NS),
+            "d" => (3, DAY_NS),
+            "h" => (4, HOUR_NS),
+            "m" => (5, MIN_NS),
+            "s" => (6, SEC_NS),
+            "ms" => (7, MS_NS),
             _ => {
                 return Err(DiscoveryError::InvalidConfig(format!(
                     "unknown unit {unit:?} in duration {orig:?}"
@@ -230,15 +239,18 @@ pub fn parse_duration(s: &str) -> Result<Duration, DiscoveryError> {
         }
         last_unit_pos = pos;
 
-        let part_ms = val
-            .checked_mul(mult_ms)
-            .ok_or_else(|| DiscoveryError::InvalidConfig("duration out of range".to_owned()))?;
-        total_ms = total_ms
-            .checked_add(part_ms)
+        if val > (1u64 << 63) / mult_ns {
+            return Err(DiscoveryError::InvalidConfig(
+                "duration out of range".to_owned(),
+            ));
+        }
+        total_ns = total_ns
+            .checked_add(val * mult_ns)
+            .filter(|&d| d <= MAX_DURATION_NS)
             .ok_or_else(|| DiscoveryError::InvalidConfig("duration out of range".to_owned()))?;
     }
 
-    Ok(Duration::from_millis(total_ms))
+    Ok(Duration::from_nanos(total_ns))
 }
 
 /// Formats a [`Duration`] as a canonical Prometheus duration string (such as `"30s"` or `"1m30s"`),
