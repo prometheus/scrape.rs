@@ -958,6 +958,9 @@ fn sorted_float_label<'v>(
     }
     let mut formatted = FloatBuf::default();
     format_openmetrics_float(value, &mut formatted).map_err(|error| error.to_string())?;
+    if formatted.as_str() == text {
+        return Ok(Cow::Borrowed(text));
+    }
     Ok(Cow::Owned(formatted.as_str().to_owned()))
 }
 
@@ -990,6 +993,19 @@ mod tests {
         assert_eq!(parser.exemplar(&mut buf), Some((4.0, Some(5000))));
         assert_eq!(buf.get("id"), Some("y"));
         assert_eq!(parser.exemplar(&mut buf), None);
+    }
+
+    #[test]
+    fn sorted_float_label_borrows_canonical_bounds() {
+        let mut previous = f64::NEG_INFINITY;
+        assert!(matches!(
+            sorted_float_label("0.005", &mut previous, "buckets"),
+            Ok(Cow::Borrowed("0.005"))
+        ));
+        assert!(matches!(
+            sorted_float_label("5", &mut previous, "buckets"),
+            Ok(Cow::Owned(formatted)) if formatted == "5.0"
+        ));
     }
 
     #[test]
