@@ -68,11 +68,30 @@ fn static_configs_and_target_group_serde_match_prometheus() {
     );
     assert!(groups[1].labels.is_empty());
 
+    // TargetGroup Display returns its source identifier matching targetgroup.Group.String().
+    assert_eq!(groups[0].to_string(), "0");
+    assert_eq!(groups[1].to_string(), "1");
+
     // TargetGroup direct serde round-trip matches Prometheus targetgroup.Group.
     let tg_json = serde_json::to_string(&groups[0]).expect("serialize TargetGroup");
     let roundtrip: TargetGroup = serde_json::from_str(&tg_json).expect("deserialize TargetGroup");
     assert_eq!(roundtrip.targets, groups[0].targets);
     assert_eq!(roundtrip.labels, groups[0].labels);
+    assert_eq!(roundtrip.source, "");
+
+    // Targets missing ADDRESS_LABEL serialize as "" rather than being dropped.
+    let missing_addr_tg = TargetGroup {
+        targets: vec![
+            label_set(&[("job", "custom")]),
+            label_set(&[(ADDRESS_LABEL, "127.0.0.1:9090"), ("__meta_foo", "bar")]),
+        ],
+        labels: LabelSet::new(),
+        source: "custom".to_owned(),
+    };
+    assert_eq!(
+        serde_json::to_string(&missing_addr_tg).expect("serialize missing address TargetGroup"),
+        r#"{"targets":["","127.0.0.1:9090"]}"#
+    );
 
     // Empty TargetGroup always serializes `"targets": []` matching Prometheus targetgroup.Group.MarshalJSON.
     let empty_tg = TargetGroup::default();
@@ -83,14 +102,38 @@ fn static_configs_and_target_group_serde_match_prometheus() {
     assert!(empty_roundtrip.targets.is_empty());
     assert!(empty_roundtrip.labels.is_empty());
 
-    // Unknown fields are rejected on StaticConfig and DiscoveryConfigs.
+    // Omitted and explicit `null` fields unmarshal as empty defaults.
+    for payload in [
+        r#"{}"#,
+        r#"{"targets": null, "labels": null}"#,
+        r#"{"targets": ["127.0.0.1:9090"], "labels": null}"#,
+    ] {
+        let sc: StaticConfig = serde_json::from_str(payload).expect("deserialize StaticConfig");
+        let tg: TargetGroup = serde_json::from_str(payload).expect("deserialize TargetGroup");
+        assert_eq!(sc.into_target_group(""), tg);
+    }
+    assert_eq!(
+        serde_json::to_string(&StaticConfig::default()).unwrap(),
+        "{}"
+    );
+    assert_eq!(
+        serde_json::to_string(&DiscoveryConfigs::default()).unwrap(),
+        "{}"
+    );
+    let null_cfg: DiscoveryConfigs =
+        serde_json::from_str(r#"{"static_configs": null}"#).expect("deserialize null configs");
+    assert!(null_cfg.static_configs.is_empty());
+
+    // Unknown fields are rejected on StaticConfig, TargetGroup, and DiscoveryConfigs.
     assert!(serde_json::from_str::<StaticConfig>(r#"{"target": ["127.0.0.1:80"]}"#).is_err());
+    assert!(serde_json::from_str::<TargetGroup>(r#"{"targets": [], "source": "0"}"#).is_err());
     assert!(serde_json::from_str::<DiscoveryConfigs>(r#"{"static_config": []}"#).is_err());
 }
 
 #[test]
 fn prometheus_duration_parsing_and_formatting() {
     assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
+    assert_eq!(parse_duration("0w").unwrap(), Duration::ZERO);
     assert_eq!(parse_duration("0s").unwrap(), Duration::ZERO);
     assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
     assert_eq!(parse_duration("1m30s").unwrap(), Duration::from_secs(90));
@@ -99,21 +142,88 @@ fn prometheus_duration_parsing_and_formatting() {
         Duration::from_millis((2 * 3600 + 15 * 60) * 1000 + 500)
     );
     assert_eq!(
+        parse_duration("4d").unwrap(),
+        Duration::from_secs(4 * 24 * 3600)
+    );
+    assert_eq!(
         parse_duration("1w").unwrap(),
         Duration::from_secs(7 * 24 * 3600)
     );
+    assert_eq!(
+        parse_duration("14d").unwrap(),
+        Duration::from_secs(14 * 24 * 3600)
+    );
+    assert_eq!(
+        parse_duration("3w2d1h").unwrap(),
+        Duration::from_secs((23 * 24 + 1) * 3600)
+    );
+    assert_eq!(
+        parse_duration("1y").unwrap(),
+        Duration::from_secs(365 * 24 * 3600)
+    );
+    assert_eq!(
+        parse_duration("289y").unwrap(),
+        Duration::from_secs(289 * 365 * 24 * 3600)
+    );
+    let compound = parse_duration("1y2w3d4h5m6s7ms").unwrap();
+    assert_eq!(format_duration(compound), "382d4h5m6s7ms");
 
     assert_eq!(format_duration(Duration::ZERO), "0s");
+    assert_eq!(format_duration(Duration::from_nanos(1)), "0s");
     assert_eq!(format_duration(Duration::from_micros(500)), "0s");
+    assert_eq!(format_duration(Duration::from_micros(1500)), "1ms");
     assert_eq!(format_duration(Duration::from_secs(30)), "30s");
     assert_eq!(format_duration(Duration::from_secs(90)), "1m30s");
+    assert_eq!(format_duration(Duration::from_secs(14 * 24 * 3600)), "2w");
+    assert_eq!(
+        format_duration(Duration::from_secs((23 * 24 + 1) * 3600)),
+        "23d1h"
+    );
     assert_eq!(format_duration(Duration::from_secs(7 * 24 * 3600)), "1w");
     assert_eq!(format_duration(Duration::from_secs(8 * 24 * 3600)), "8d");
     assert_eq!(format_duration(Duration::from_secs(365 * 24 * 3600)), "1y");
-    assert_ne!(format_duration(Duration::MAX), "0s");
+    assert_eq!(format_duration(Duration::MAX), "213503982334601d7h15s999ms");
 
-    assert!(parse_duration("").is_err());
-    assert!(parse_duration("1s1m").is_err());
-    assert!(parse_duration("10x").is_err());
-    assert!(parse_duration("999999999999999y").is_err());
+    assert_eq!(
+        parse_duration("").unwrap_err().to_string(),
+        "empty duration string"
+    );
+    for invalid in [
+        "d",
+        "-3s",
+        "+3s",
+        "1",
+        "1m30",
+        "1s1m",
+        "1s1s",
+        "1y1m1d",
+        "18446744073709551616ms",
+    ] {
+        assert_eq!(
+            parse_duration(invalid).unwrap_err().to_string(),
+            format!("not a valid duration string: {invalid:?}"),
+            "expected invalid duration error for {invalid:?}"
+        );
+    }
+    assert_eq!(
+        parse_duration("1.5d").unwrap_err().to_string(),
+        "unknown unit \".\" in duration \"1.5d\""
+    );
+    assert_eq!(
+        parse_duration("10x").unwrap_err().to_string(),
+        "unknown unit \"x\" in duration \"10x\""
+    );
+    for overflow in [
+        "294y",
+        "200y10400w",
+        "107675d",
+        "2584200h",
+        "999999999999999y",
+    ] {
+        assert_eq!(
+            parse_duration(overflow).unwrap_err().to_string(),
+            "duration out of range",
+            "expected out of range error for {overflow:?}"
+        );
+    }
 }
