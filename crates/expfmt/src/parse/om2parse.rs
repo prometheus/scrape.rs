@@ -40,10 +40,26 @@ struct Exemplar {
     labels: Range<usize>,
 }
 
+/// Label text of an exploded series, from the input or from `pending_text`.
+enum PendingText<'a> {
+    Input(&'a str),
+    Arena(Range<usize>),
+}
+
+impl<'a> PendingText<'a> {
+    fn resolve<'s>(&'s self, arena: &'s str) -> &'s str {
+        match self {
+            Self::Input(text) => text,
+            Self::Arena(range) => &arena[range.clone()],
+        }
+    }
+}
+
 /// One flat series of a classic histogram or summary composite value.
-struct PendingSeries {
+struct PendingSeries<'a> {
     series: ByteSpan,
-    labels: Range<usize>,
+    name: Range<usize>,
+    injected: Option<(&'static str, PendingText<'a>)>,
     value: f64,
 }
 
@@ -71,10 +87,12 @@ pub struct OpenMetrics2Parser<'a> {
     float_histogram_kind: bool,
     int_histogram: Histogram<u64, i64>,
     float_histogram: Histogram<f64, f64>,
-    pending: Vec<PendingSeries>,
+    pending: Vec<PendingSeries<'a>>,
     /// Number of pending series returned so far; the current one is `pending_index - 1`.
     pending_index: usize,
-    pending_labels: Vec<Label<'a>>,
+    /// The unescaped labels of the composite line other than the metric name, sorted by name.
+    line_labels: Vec<Label<'a>>,
+    pending_text: String,
     pending_series: Vec<u8>,
 }
 
@@ -102,7 +120,8 @@ impl<'a> OpenMetrics2Parser<'a> {
             float_histogram: Histogram::default(),
             pending: Vec::new(),
             pending_index: 0,
-            pending_labels: Vec::new(),
+            line_labels: Vec::new(),
+            pending_text: String::new(),
             pending_series: Vec::new(),
         }
     }
@@ -428,17 +447,25 @@ impl<'a> OpenMetrics2Parser<'a> {
             self.parse_native_histogram(&fields, gauge)?;
             return Ok(Entry::Histogram);
         }
-        let extra = self.extra_labels();
+        let input = self.lexer.input;
+        let text = |start, end| std::str::from_utf8(&input[start..end]).unwrap_or_default();
+        self.line_labels.extend(self.labels.iter().map(|span| {
+            (
+                unescape_label(text(span.name_start, span.name_end)),
+                unescape_label(text(span.val_start, span.val_end)),
+            )
+        }));
+        self.line_labels.sort_by(|left, right| left.0.cmp(&right.0));
         let family = unescape_label(std::str::from_utf8(self.metric_name()).unwrap_or_default());
-        let (count_key, count, sum, sum_suffix) = if gauge {
-            ("gcount", fields.gcount, fields.gsum, "_gsum")
+        let (count_suffix, count, sum_suffix, sum) = if gauge {
+            ("_gcount", fields.gcount, "_gsum", fields.gsum)
         } else {
-            ("count", fields.count, fields.sum, "_sum")
+            ("_count", fields.count, "_sum", fields.sum)
         };
-        let count = go_float(required(count, count_key)?)?;
-        self.push_pending(format!("{family}_{count_key}"), &extra, None, count);
+        let count = go_float(required(count, &count_suffix[1..])?)?;
+        self.push_pending(&family, count_suffix, None, count);
         let sum = go_float(required(sum, &sum_suffix[1..])?)?;
-        self.push_pending(format!("{family}{sum_suffix}"), &extra, None, sum);
+        self.push_pending(&family, sum_suffix, None, sum);
         if summary {
             let quantiles = list_items(required(fields.quantile, "quantile")?)?;
             let mut previous = f64::NEG_INFINITY;
@@ -447,13 +474,13 @@ impl<'a> OpenMetrics2Parser<'a> {
                     .split_once(':')
                     .ok_or_else(|| format!("quantile missing ':': {part:?}"))?;
                 let value = go_float(value.trim())?;
-                let quantile = sorted_float_label(quantile.trim(), &mut previous, "quantiles")?;
-                self.push_pending(
-                    family.to_string(),
-                    &extra,
-                    Some((QUANTILE_LABEL, quantile)),
-                    value,
-                );
+                let quantile = sorted_float_label(
+                    quantile.trim(),
+                    &mut previous,
+                    "quantiles",
+                    &mut self.pending_text,
+                )?;
+                self.push_pending(&family, "", Some((QUANTILE_LABEL, quantile)), value);
             }
         } else {
             let buckets = list_items(required(fields.bucket, "bucket")?)?;
@@ -464,15 +491,14 @@ impl<'a> OpenMetrics2Parser<'a> {
                     .rsplit_once(':')
                     .ok_or_else(|| format!("bucket missing ':': {part:?}"))?;
                 let count = go_float(count.trim())?;
-                let bound =
-                    sorted_float_label(bound.trim(), &mut previous, "classic histogram buckets")?;
-                has_infinity |= bound == "+Inf";
-                self.push_pending(
-                    format!("{family}_bucket"),
-                    &extra,
-                    Some((BUCKET_LABEL, bound)),
-                    count,
-                );
+                let bound = sorted_float_label(
+                    bound.trim(),
+                    &mut previous,
+                    "classic histogram buckets",
+                    &mut self.pending_text,
+                )?;
+                has_infinity |= bound.resolve(&self.pending_text) == "+Inf";
+                self.push_pending(&family, "_bucket", Some((BUCKET_LABEL, bound)), count);
             }
             if !has_infinity {
                 return Err("classic histogram buckets must include a +Inf threshold".to_owned());
@@ -482,54 +508,45 @@ impl<'a> OpenMetrics2Parser<'a> {
         Ok(Entry::Series)
     }
 
-    /// The unescaped labels of the current line other than the metric name.
-    fn extra_labels(&self) -> Vec<Label<'a>> {
-        let input = self.lexer.input;
-        let text = |start, end| std::str::from_utf8(&input[start..end]).unwrap_or_default();
-        self.labels
-            .iter()
-            .map(|span| {
-                (
-                    unescape_label(text(span.name_start, span.name_end)),
-                    unescape_label(text(span.val_start, span.val_end)),
-                )
-            })
-            .collect()
-    }
-
-    /// Queues a flat series with its sorted labels and Go's `appendSeriesBytes` identity.
-    // ponytail: clones label Cows per series, borrow from a shared arena if classic histograms
-    // show up in profiles.
+    /// Queues a flat series named `family` + `suffix` with Go's `appendSeriesBytes` identity.
     fn push_pending(
         &mut self,
-        name: String,
-        extra: &[Label<'a>],
-        injected: Option<(&'static str, Cow<'a, str>)>,
+        family: &str,
+        suffix: &str,
+        injected: Option<(&'static str, PendingText<'a>)>,
         value: f64,
     ) {
-        let start = self.pending_labels.len();
-        self.pending_labels
-            .push((Cow::Borrowed(METRIC_NAME_LABEL), Cow::Owned(name)));
-        self.pending_labels.extend_from_slice(extra);
-        if let Some((label, label_value)) = injected {
-            self.pending_labels
-                .push((Cow::Borrowed(label), label_value));
-        }
-        let labels = start..self.pending_labels.len();
-        self.pending_labels[labels.clone()].sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let name_start = self.pending_text.len();
+        self.pending_text.push_str(family);
+        self.pending_text.push_str(suffix);
+        let name = name_start..self.pending_text.len();
         let series_start = self.pending_series.len();
-        for (label, label_value) in &self.pending_labels[labels.clone()] {
-            if label != METRIC_NAME_LABEL {
-                self.pending_series.push(SEPARATOR);
-                self.pending_series.extend_from_slice(label.as_bytes());
-                self.pending_series.push(SEPARATOR);
+        // `line_labels` is sorted and "__name__" sorts before "le" and "quantile", so merging
+        // the two keeps Go's sorted label order without sorting per series.
+        let mut special = [(METRIC_NAME_LABEL, &self.pending_text[name.clone()])]
+            .into_iter()
+            .chain(
+                injected
+                    .as_ref()
+                    .map(|(label, text)| (*label, text.resolve(&self.pending_text))),
+            )
+            .peekable();
+        let out = &mut self.pending_series;
+        for (label, label_value) in &self.line_labels {
+            while let Some((special_label, special_value)) =
+                special.next_if(|(special_label, _)| *special_label <= label.as_ref())
+            {
+                append_series_label(out, special_label, special_value);
             }
-            self.pending_series
-                .extend_from_slice(label_value.as_bytes());
+            append_series_label(out, label, label_value);
+        }
+        for (special_label, special_value) in special {
+            append_series_label(out, special_label, special_value);
         }
         self.pending.push(PendingSeries {
             series: ByteSpan::new(series_start, self.pending_series.len()),
-            labels,
+            name,
+            injected,
             value,
         });
     }
@@ -648,7 +665,7 @@ impl<'a> OpenMetrics2Parser<'a> {
         Ok(())
     }
 
-    fn pending_series(&self) -> Option<&PendingSeries> {
+    fn pending_series(&self) -> Option<&PendingSeries<'a>> {
         self.pending_index
             .checked_sub(1)
             .and_then(|index| self.pending.get(index))
@@ -666,7 +683,8 @@ impl<'a> Parser<'a> for OpenMetrics2Parser<'a> {
         }
         self.pending.clear();
         self.pending_index = 0;
-        self.pending_labels.clear();
+        self.line_labels.clear();
+        self.pending_text.clear();
         self.pending_series.clear();
         self.line_start = self.lexer.pos;
         self.name = None;
@@ -737,9 +755,26 @@ impl<'a> Parser<'a> for OpenMetrics2Parser<'a> {
     fn labels(&self, buf: &mut LabelsBuffer<'a>) {
         buf.clear();
         if let Some(pending) = self.pending_series() {
-            for (name, value) in &self.pending_labels[pending.labels.clone()] {
+            // LabelsBuffer borrows only from the input, so the `__name__` and formatted bound
+            // that live in `pending_text` are copied.
+            let name = &self.pending_text[pending.name.clone()];
+            buf.push(
+                Cow::Borrowed(METRIC_NAME_LABEL),
+                Cow::Owned(name.to_owned()),
+            );
+            for (name, value) in &self.line_labels {
                 buf.push(name.clone(), value.clone());
             }
+            if let Some((label, text)) = &pending.injected {
+                let value = match text {
+                    PendingText::Input(text) => Cow::Borrowed(*text),
+                    PendingText::Arena(range) => {
+                        Cow::Owned(self.pending_text[range.clone()].to_owned())
+                    }
+                };
+                buf.push(Cow::Borrowed(label), value);
+            }
+            buf.sort();
             return;
         }
         let name = std::str::from_utf8(self.metric_name()).unwrap_or_default();
@@ -937,15 +972,26 @@ fn absolute_to_deltas(buckets: &mut [i64]) {
     }
 }
 
+/// Go's `appendSeriesBytes` for one label.
+fn append_series_label(out: &mut Vec<u8>, label: &str, value: &str) {
+    if label != METRIC_NAME_LABEL {
+        out.push(SEPARATOR);
+        out.extend_from_slice(label.as_bytes());
+        out.push(SEPARATOR);
+    }
+    out.extend_from_slice(value.as_bytes());
+}
+
 /// Formats a parsable `le` or `quantile` value like Go's `FormatOpenMetricsFloat`, after
 /// checking it is greater than `previous`. Other values are kept as they are.
 fn sorted_float_label<'v>(
     text: &'v str,
     previous: &mut f64,
     what: &str,
-) -> Result<Cow<'v, str>, String> {
+    arena: &mut String,
+) -> Result<PendingText<'v>, String> {
     let Some(value) = parse_go_float(text) else {
-        return Ok(Cow::Borrowed(text));
+        return Ok(PendingText::Input(text));
     };
     if value <= *previous {
         return Err(format!(
@@ -954,14 +1000,16 @@ fn sorted_float_label<'v>(
     }
     *previous = value;
     if let Some(common) = common_openmetrics_float(value) {
-        return Ok(Cow::Borrowed(common));
+        return Ok(PendingText::Input(common));
     }
     let mut formatted = FloatBuf::default();
     format_openmetrics_float(value, &mut formatted).map_err(|error| error.to_string())?;
     if formatted.as_str() == text {
-        return Ok(Cow::Borrowed(text));
+        return Ok(PendingText::Input(text));
     }
-    Ok(Cow::Owned(formatted.as_str().to_owned()))
+    let start = arena.len();
+    arena.push_str(formatted.as_str());
+    Ok(PendingText::Arena(start..arena.len()))
 }
 
 #[cfg(test)]
@@ -998,14 +1046,14 @@ mod tests {
     #[test]
     fn sorted_float_label_borrows_canonical_bounds() {
         let mut previous = f64::NEG_INFINITY;
+        let mut arena = String::new();
         assert!(matches!(
-            sorted_float_label("0.005", &mut previous, "buckets"),
-            Ok(Cow::Borrowed("0.005"))
+            sorted_float_label("0.005", &mut previous, "buckets", &mut arena),
+            Ok(PendingText::Input("0.005"))
         ));
-        assert!(matches!(
-            sorted_float_label("5", &mut previous, "buckets"),
-            Ok(Cow::Owned(formatted)) if formatted == "5.0"
-        ));
+        let formatted = sorted_float_label("5", &mut previous, "buckets", &mut arena).unwrap();
+        assert!(matches!(formatted, PendingText::Arena(_)));
+        assert_eq!(formatted.resolve(&arena), "5.0");
     }
 
     #[test]
