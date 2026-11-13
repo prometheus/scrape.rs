@@ -17,10 +17,17 @@
 //! Mirrors [`prometheus/common/expfmt/expfmt.go`](https://github.com/prometheus/common/blob/main/expfmt/expfmt.go),
 //! [`encode.go`](https://github.com/prometheus/common/blob/main/expfmt/encode.go), and
 //! [`decode.go`](https://github.com/prometheus/common/blob/main/expfmt/decode.go).
+//!
+//! Scraper-side request and response handling lives here too, because Prometheus keeps its
+//! scraper-side counterparts in `config` and `scrape` rather than in `prometheus/common/expfmt`:
+//! [`ScrapeProtocol`] and [`accept_header`] mirror `config.ScrapeProtocol` and
+//! `scrape.acceptHeader`, and [`resolve_scrape_format`] mirrors the `fallback_scrape_protocol`
+//! handling of `textparse.extractMediaType`.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
+use std::fmt::Write as _;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
@@ -29,6 +36,9 @@ pub const TEXT_TYPE: &str = "text/plain";
 
 /// Version string for Prometheus classic text format.
 pub const TEXT_VERSION: &str = "0.0.4";
+
+/// Version string for Prometheus UTF-8 text format (`text/plain; version=1.0.0`).
+pub const TEXT_VERSION_1_0_0: &str = "1.0.0";
 
 /// MIME type for Prometheus protobuf wire format.
 pub const PROTO_TYPE: &str = "application/vnd.google.protobuf";
@@ -78,6 +88,9 @@ pub const FMT_UNKNOWN: &str = "<unknown>";
 
 /// Baseline `Content-Type` string for Prometheus 0.0.4 text format.
 pub const FMT_TEXT: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// Baseline `Content-Type` string for Prometheus 1.0.0 (UTF-8) text format.
+pub const FMT_TEXT_1_0_0: &str = "text/plain; version=1.0.0; charset=utf-8";
 
 /// Baseline `Content-Type` string for varint length-delimited Prometheus protobuf format.
 pub const FMT_PROTO_DELIM: &str =
@@ -150,6 +163,10 @@ pub enum FormatError {
     /// An OpenMetrics version string passed to [`Format::new_open_metrics`] is not supported.
     #[error("unknown open metrics version string: {0}")]
     UnknownOpenMetricsVersion(String),
+
+    /// A `scrape_protocols` token does not name a known [`ScrapeProtocol`].
+    #[error("unknown scrape protocol: {0}")]
+    UnknownScrapeProtocol(String),
 }
 
 impl FromStr for EscapingScheme {
@@ -197,6 +214,8 @@ impl Format {
     pub const UNKNOWN: Self = Self(Cow::Borrowed(FMT_UNKNOWN));
     /// Prometheus 0.0.4 plain text format.
     pub const TEXT: Self = Self(Cow::Borrowed(FMT_TEXT));
+    /// Prometheus 1.0.0 (UTF-8 names) plain text format.
+    pub const TEXT_1_0_0: Self = Self(Cow::Borrowed(FMT_TEXT_1_0_0));
     /// Varint length-delimited binary protobuf format.
     pub const PROTO_DELIM: Self = Self(Cow::Borrowed(FMT_PROTO_DELIM));
     /// Multi-line text protobuf format.
@@ -286,7 +305,9 @@ impl Format {
                 FormatType::OpenMetrics
             }
             TEXT_TYPE => match params.get(VERSION_KEY).copied() {
-                None | Some(TEXT_VERSION) => FormatType::TextPlain,
+                // `text/plain; version=1.0.0` is the UTF-8 text format Prometheus negotiates
+                // through `scrape_protocols`, and it is parsed by the Prometheus text parser.
+                None | Some(TEXT_VERSION | TEXT_VERSION_1_0_0) => FormatType::TextPlain,
                 Some(_) => FormatType::Unknown,
             },
             _ => FormatType::Unknown,
@@ -403,13 +424,16 @@ pub const DEFAULT_OPEN_METRICS_ACCEPTED_FORMATS: &[Format] = &[
 
 /// Extracts the baseline [`Format`] from an HTTP response `Content-Type` header value,
 /// matching `ResponseFormat` in `prometheus/common/expfmt/decode.go`.
+///
+/// A valid `escaping=<scheme>` parameter on a format that negotiates one is carried over to the
+/// returned [`Format`].
 #[must_use]
 pub fn response_format(content_type: &str) -> Format {
     let Some((media_type, params)) = parse_media_type(content_type) else {
         return Format::UNKNOWN;
     };
 
-    match media_type.as_str() {
+    let format = match media_type.as_str() {
         PROTO_TYPE => {
             if let Some(&p) = params.get(PROTO_KEY)
                 && p != PROTO_PROTOCOL
@@ -423,20 +447,567 @@ pub fn response_format(content_type: &str) -> Format {
             }
             Format::PROTO_DELIM
         }
-        TEXT_TYPE => {
-            if let Some(&v) = params.get(VERSION_KEY)
-                && v != TEXT_VERSION
-            {
-                return Format::UNKNOWN;
-            }
-            Format::TEXT
-        }
+        TEXT_TYPE => match params.get(VERSION_KEY).copied() {
+            None | Some(TEXT_VERSION) => Format::TEXT,
+            // NOTE: Go's `expfmt.ResponseFormat` predates Prometheus text 1.0.0 and rejects it.
+            // Scrapers negotiate that format (`ScrapeProtocol::PrometheusText1_0_0`), so it is
+            // resolved here instead of falling through to `Format::UNKNOWN`.
+            Some(TEXT_VERSION_1_0_0) => Format::TEXT_1_0_0,
+            Some(_) => return Format::UNKNOWN,
+        },
         OPEN_METRICS_TYPE => match params.get(VERSION_KEY).copied() {
             None | Some("") | Some(OPEN_METRICS_VERSION_0_0_1) => Format::OPEN_METRICS_0_0_1,
             Some(OPEN_METRICS_VERSION_1_0_0) => Format::OPEN_METRICS_1_0_0,
-            Some(_) => Format::UNKNOWN,
+            Some(_) => return Format::UNKNOWN,
         },
-        _ => Format::UNKNOWN,
+        _ => return Format::UNKNOWN,
+    };
+
+    with_declared_escaping(format, &params)
+}
+
+/// Metrics wire protocol a scraper advertises to targets and accepts as a
+/// `fallback_scrape_protocol`.
+///
+/// Mirrors `config.ScrapeProtocol` in
+/// [`prometheus/prometheus/config/config.go`](https://github.com/prometheus/prometheus/blob/main/config/config.go).
+/// Prometheus keeps these scraper-side protocol descriptors outside
+/// `prometheus/common/expfmt`, so `scrape.rs` exposes them from [`crate::format`] as well: a scrape
+/// pipeline needs both the exporter-side [`Format`] negotiation and the scraper-side request and
+/// response handling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ScrapeProtocol {
+    /// Varint length-delimited Prometheus protobuf (`PrometheusProto`).
+    PrometheusProto,
+    /// Prometheus text `0.0.4` (`PrometheusText0.0.4`).
+    PrometheusText0_0_4,
+    /// Prometheus UTF-8 text `1.0.0` (`PrometheusText1.0.0`).
+    PrometheusText1_0_0,
+    /// OpenMetrics text `0.0.1` (`OpenMetricsText0.0.1`).
+    OpenMetricsText0_0_1,
+    /// OpenMetrics text `1.0.0` (`OpenMetricsText1.0.0`).
+    OpenMetricsText1_0_0,
+    /// OpenMetrics text `2.0.0-rc` (`OpenMetricsText2.0.0-rc`).
+    OpenMetricsText2_0_0Rc,
+    /// OpenMetrics text `2.0.0` (`OpenMetricsText2.0.0`).
+    OpenMetricsText2_0_0,
+}
+
+impl ScrapeProtocol {
+    /// Every supported scrape protocol, in [`ScrapeProtocol::as_str`] order.
+    pub const ALL: [Self; 7] = [
+        Self::PrometheusProto,
+        Self::PrometheusText0_0_4,
+        Self::PrometheusText1_0_0,
+        Self::OpenMetricsText0_0_1,
+        Self::OpenMetricsText1_0_0,
+        Self::OpenMetricsText2_0_0Rc,
+        Self::OpenMetricsText2_0_0,
+    ];
+
+    /// Prometheus `scrape_protocols` / `fallback_scrape_protocol` configuration token for this
+    /// protocol.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PrometheusProto => "PrometheusProto",
+            Self::PrometheusText0_0_4 => "PrometheusText0.0.4",
+            Self::PrometheusText1_0_0 => "PrometheusText1.0.0",
+            Self::OpenMetricsText0_0_1 => "OpenMetricsText0.0.1",
+            Self::OpenMetricsText1_0_0 => "OpenMetricsText1.0.0",
+            Self::OpenMetricsText2_0_0Rc => "OpenMetricsText2.0.0-rc",
+            Self::OpenMetricsText2_0_0 => "OpenMetricsText2.0.0",
+        }
+    }
+
+    /// `Content-Type` header value advertised for this protocol, matching
+    /// `config.ScrapeProtocolsHeaders`.
+    ///
+    /// These values use Prometheus's compact form without spaces after `;` and without
+    /// `; charset=utf-8`, unlike the canonical [`Format`] constants, because they are embedded
+    /// verbatim in the scrape `Accept` request header.
+    #[must_use]
+    pub const fn header(self) -> &'static str {
+        match self {
+            Self::PrometheusProto => {
+                "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited"
+            }
+            Self::PrometheusText0_0_4 => "text/plain;version=0.0.4",
+            Self::PrometheusText1_0_0 => "text/plain;version=1.0.0",
+            Self::OpenMetricsText0_0_1 => "application/openmetrics-text;version=0.0.1",
+            Self::OpenMetricsText1_0_0 => "application/openmetrics-text;version=1.0.0",
+            Self::OpenMetricsText2_0_0Rc => "application/openmetrics-text;version=2.0.0-rc",
+            Self::OpenMetricsText2_0_0 => "application/openmetrics-text;version=2.0.0",
+        }
+    }
+
+    /// MIME media type of [`ScrapeProtocol::header`], matching
+    /// `config.ScrapeProtocol::HeaderMediaType`.
+    #[must_use]
+    pub const fn media_type(self) -> &'static str {
+        match self {
+            Self::PrometheusProto => PROTO_TYPE,
+            Self::PrometheusText0_0_4 | Self::PrometheusText1_0_0 => TEXT_TYPE,
+            Self::OpenMetricsText0_0_1
+            | Self::OpenMetricsText1_0_0
+            | Self::OpenMetricsText2_0_0Rc
+            | Self::OpenMetricsText2_0_0 => OPEN_METRICS_TYPE,
+        }
+    }
+
+    /// Canonical [`Format`] that decodes scrapes of this protocol.
+    #[must_use]
+    pub const fn format(self) -> Format {
+        match self {
+            Self::PrometheusProto => Format::PROTO_DELIM,
+            Self::PrometheusText0_0_4 => Format::TEXT,
+            Self::PrometheusText1_0_0 => Format::TEXT_1_0_0,
+            Self::OpenMetricsText0_0_1 => Format::OPEN_METRICS_0_0_1,
+            Self::OpenMetricsText1_0_0 => Format::OPEN_METRICS_1_0_0,
+            Self::OpenMetricsText2_0_0Rc => Format::OPEN_METRICS_2_0_0_RC,
+            Self::OpenMetricsText2_0_0 => Format::OPEN_METRICS_2_0_0,
+        }
+    }
+
+    /// Whether the protocol accepts an `escaping=<scheme>` `Accept` parameter.
+    ///
+    /// Prometheus only advertises `escaping=...` on text `1.0.0` and OpenMetrics `1.0.0`+ media
+    /// types, because legacy `0.0.1` and `0.0.4` formats have no escaping scheme.
+    #[must_use]
+    pub const fn supports_escaping(self) -> bool {
+        matches!(
+            self,
+            Self::PrometheusText1_0_0
+                | Self::OpenMetricsText1_0_0
+                | Self::OpenMetricsText2_0_0Rc
+                | Self::OpenMetricsText2_0_0
+        )
+    }
+
+    /// Whether this protocol is decoded by the OpenMetrics 2.0 parser.
+    #[must_use]
+    pub const fn is_open_metrics_2(self) -> bool {
+        matches!(
+            self,
+            Self::OpenMetricsText2_0_0Rc | Self::OpenMetricsText2_0_0
+        )
+    }
+}
+
+impl fmt::Display for ScrapeProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ScrapeProtocol {
+    type Err = FormatError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|protocol| protocol.as_str() == s)
+            .ok_or_else(|| FormatError::UnknownScrapeProtocol(s.to_owned()))
+    }
+}
+
+/// Scrape protocols a scraper advertises by default, ordered by preference.
+///
+/// Matches `config.DefaultScrapeProtocols`.
+pub const DEFAULT_SCRAPE_PROTOCOLS: &[ScrapeProtocol] = &[
+    ScrapeProtocol::OpenMetricsText1_0_0,
+    ScrapeProtocol::OpenMetricsText0_0_1,
+    ScrapeProtocol::PrometheusText1_0_0,
+    ScrapeProtocol::PrometheusText0_0_4,
+];
+
+/// Scrape protocols a scraper advertises by default when protobuf comes first, ordered by
+/// preference.
+///
+/// Matches `config.DefaultProtoFirstScrapeProtocols`, which Prometheus uses for
+/// `scrape_native_histograms` and feature flags that need `created` timestamps.
+pub const DEFAULT_PROTO_FIRST_SCRAPE_PROTOCOLS: &[ScrapeProtocol] = &[
+    ScrapeProtocol::PrometheusProto,
+    ScrapeProtocol::OpenMetricsText1_0_0,
+    ScrapeProtocol::OpenMetricsText0_0_1,
+    ScrapeProtocol::PrometheusText1_0_0,
+    ScrapeProtocol::PrometheusText0_0_4,
+];
+
+/// Builds the HTTP `Accept` header value a scraper sends to its targets, matching `acceptHeader`
+/// in [`scrape/scrape.go`](https://github.com/prometheus/prometheus/blob/main/scrape/scrape.go).
+///
+/// `protocols` are advertised in caller order with descending `q` weights. The first protocol
+/// always weighs `q=0.8`, because Prometheus derives the starting weight from the size of its
+/// protocol header map (`len(ScrapeProtocolsHeaders) + 1`) rather than from the number of
+/// configured protocols, and `*/*` closes the header with the next weight down.
+/// `;escaping=<scheme>` is appended only to protocols that support it, see
+/// [`ScrapeProtocol::supports_escaping`].
+///
+/// Weights are clamped at `q=0.1`. Go derives them from the same fixed base, so an over-long list
+/// would advertise `q=0.0` ("not acceptable") past seven protocols and eventually the malformed
+/// `q=0.-1`. Validated `scrape_protocols` rejects duplicates, so reachable lists stay below that.
+#[must_use]
+pub fn accept_header(protocols: &[ScrapeProtocol], scheme: EscapingScheme) -> String {
+    let mut weight = ScrapeProtocol::ALL.len() + 1;
+    let mut header = String::with_capacity(64 * protocols.len() + 12);
+    for (i, protocol) in protocols.iter().enumerate() {
+        if i > 0 {
+            header.push(',');
+        }
+        header.push_str(protocol.header());
+        if protocol.supports_escaping() {
+            header.push(';');
+            header.push_str(ESCAPING_KEY);
+            header.push('=');
+            header.push_str(scheme.as_str());
+        }
+        let _ = write!(header, ";q=0.{weight}");
+        weight = weight.saturating_sub(1).max(1);
+    }
+    if !protocols.is_empty() {
+        header.push(',');
+    }
+    let _ = write!(header, "*/*;q=0.{weight}");
+    header
+}
+
+/// A non-fatal `Content-Type` problem found by [`resolve_scrape_format`] that the configured
+/// `fallback_scrape_protocol` resolved.
+///
+/// Prometheus logs these as scrape warnings rather than failing the scrape. [`fmt::Display`]
+/// renders the Prometheus log message, including the resolved fallback media type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScrapeFormatWarning {
+    /// The target sent an empty `Content-Type` header.
+    BlankContentType {
+        /// Fallback protocol applied to the scrape.
+        fallback: ScrapeProtocol,
+    },
+    /// The `Content-Type` header is not valid media type syntax.
+    UnparsableContentType {
+        /// Raw `Content-Type` header value received from the target.
+        content_type: String,
+        /// Why the header could not be parsed as a media type.
+        reason: &'static str,
+        /// Fallback protocol applied to the scrape.
+        fallback: ScrapeProtocol,
+    },
+    /// The target negotiated OpenMetrics 2.0 while the OpenMetrics 2.0 feature is disabled.
+    OpenMetrics2Disabled {
+        /// Raw `Content-Type` header value received from the target.
+        content_type: String,
+        /// Fallback protocol applied to the scrape.
+        fallback: ScrapeProtocol,
+    },
+    /// The media type is not a supported Prometheus or OpenMetrics exposition format.
+    UnsupportedContentType {
+        /// Raw `Content-Type` header value received from the target.
+        content_type: String,
+        /// Fallback protocol applied to the scrape.
+        fallback: ScrapeProtocol,
+    },
+}
+
+impl fmt::Display for ScrapeFormatWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BlankContentType { fallback } => write!(
+                f,
+                "non-compliant scrape target sending blank Content-Type, using \
+                 fallback_scrape_protocol {fallback_mt:?}",
+                fallback_mt = fallback.media_type(),
+            ),
+            Self::UnparsableContentType {
+                content_type,
+                reason,
+                fallback,
+            } => write!(
+                f,
+                "could not parse received Content-Type {content_type:?} ({reason}), using \
+                 fallback_scrape_protocol {fallback_mt:?}",
+                fallback_mt = fallback.media_type(),
+            ),
+            Self::OpenMetrics2Disabled {
+                content_type,
+                fallback,
+            } => write!(
+                f,
+                "received OpenMetrics 2.0 Content-Type {content_type:?}, but the openmetrics2 \
+                 feature flag is not enabled, using fallback_scrape_protocol {fallback_mt:?}",
+                fallback_mt = fallback.media_type(),
+            ),
+            Self::UnsupportedContentType {
+                content_type,
+                fallback,
+            } => write!(
+                f,
+                "received unsupported Content-Type {content_type:?}, using \
+                 fallback_scrape_protocol {fallback_mt:?}",
+                fallback_mt = fallback.media_type(),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ScrapeFormatWarning {}
+
+/// A fatal `Content-Type` problem found by [`resolve_scrape_format`] with no
+/// `fallback_scrape_protocol` configured.
+///
+/// [`fmt::Display`] renders the Prometheus scrape error message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScrapeFormatError {
+    /// The target sent an empty `Content-Type` header and no fallback protocol is configured.
+    BlankContentType,
+    /// The `Content-Type` header is not valid media type syntax.
+    UnparsableContentType {
+        /// Raw `Content-Type` header value received from the target.
+        content_type: String,
+        /// Why the header could not be parsed as a media type.
+        reason: &'static str,
+    },
+    /// The target negotiated OpenMetrics 2.0 while the OpenMetrics 2.0 feature is disabled.
+    OpenMetrics2Disabled {
+        /// Raw `Content-Type` header value received from the target.
+        content_type: String,
+    },
+    /// The media type is not a supported Prometheus or OpenMetrics exposition format.
+    UnsupportedContentType {
+        /// Raw `Content-Type` header value received from the target.
+        content_type: String,
+    },
+}
+
+impl fmt::Display for ScrapeFormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BlankContentType => f.write_str(
+                "non-compliant scrape target sending blank Content-Type and no \
+                 fallback_scrape_protocol specified for target",
+            ),
+            Self::UnparsableContentType {
+                content_type,
+                reason,
+            } => write!(
+                f,
+                "cannot parse Content-Type {content_type:?} ({reason}) and no \
+                 fallback_scrape_protocol for target"
+            ),
+            Self::OpenMetrics2Disabled { content_type } => write!(
+                f,
+                "received OpenMetrics 2.0 Content-Type {content_type:?}, but the openmetrics2 \
+                 feature flag is not enabled and no fallback_scrape_protocol specified for target"
+            ),
+            Self::UnsupportedContentType { content_type } => write!(
+                f,
+                "received unsupported Content-Type {content_type:?} and no \
+                 fallback_scrape_protocol specified for target"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ScrapeFormatError {}
+
+/// Scrape response format resolved by [`resolve_scrape_format`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ResolvedScrapeFormat {
+    /// Wire format to decode the scrape payload with.
+    pub format: Format,
+    /// Non-fatal `Content-Type` problem that the configured fallback protocol resolved. Callers
+    /// should surface it as a scrape warning, like Prometheus does, instead of dropping it.
+    pub warning: Option<ScrapeFormatWarning>,
+}
+
+/// Resolves the [`Format`] to decode a scrape response with from its `Content-Type` header,
+/// matching the `fallback_scrape_protocol` handling of `extractMediaType` in
+/// [`model/textparse/interface.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/interface.go).
+///
+/// Unlike [`response_format`], which mirrors the stricter exporter-side `ResponseFormat` in
+/// `prometheus/common/expfmt`, this is the scraper-side resolution Prometheus actually applies:
+/// only the media type and `version` parameter determine the format, so non-compliant targets that
+/// omit `charset=utf-8` on `application/openmetrics-text` still decode as OpenMetrics, and
+/// `text/plain; version=1.0.0` resolves to [`Format::TEXT_1_0_0`]. `proto` and `encoding`
+/// parameters are ignored on `application/vnd.google.protobuf`, matching Prometheus, which feeds
+/// every protobuf media type to its delimited protobuf parser.
+///
+/// A valid `escaping=<scheme>` parameter is additionally carried over to the resolved [`Format`]
+/// on formats that negotiate one (text `1.0.0`, OpenMetrics `1.0.0`+), see
+/// `with_declared_escaping`.
+///
+/// Resolving an OpenMetrics 2.0 or protobuf format authorizes *negotiation*, not decoding: those
+/// layers land in Phase 3, so `arrow::ArrowDecoder` still rejects the resolved format with
+/// `DecodeError::UnsupportedFormat`.
+///
+/// `fallback_protocol` resolves blank, unparsable, unsupported, and OpenMetrics 2.0-without-flag
+/// content types to the protocol's own format and returns the problem as a
+/// [`ScrapeFormatWarning`]; without a fallback those content types are a [`ScrapeFormatError`].
+///
+/// # Errors
+///
+/// Returns [`ScrapeFormatError`] when the `Content-Type` cannot be used and no fallback protocol is
+/// configured.
+pub fn resolve_scrape_format(
+    content_type: Option<&str>,
+    fallback_protocol: Option<ScrapeProtocol>,
+    enable_open_metrics_2: bool,
+) -> Result<ResolvedScrapeFormat, ScrapeFormatError> {
+    match resolve_media_type(content_type.unwrap_or_default(), enable_open_metrics_2) {
+        Ok(format) => Ok(ResolvedScrapeFormat {
+            format,
+            warning: None,
+        }),
+        Err(err) => {
+            let Some(fallback) = fallback_protocol else {
+                return Err(err);
+            };
+            let warning = match &err {
+                ScrapeFormatError::BlankContentType => {
+                    ScrapeFormatWarning::BlankContentType { fallback }
+                }
+                ScrapeFormatError::UnparsableContentType {
+                    content_type,
+                    reason,
+                } => ScrapeFormatWarning::UnparsableContentType {
+                    content_type: content_type.clone(),
+                    reason,
+                    fallback,
+                },
+                ScrapeFormatError::OpenMetrics2Disabled { content_type } => {
+                    ScrapeFormatWarning::OpenMetrics2Disabled {
+                        content_type: content_type.clone(),
+                        fallback,
+                    }
+                }
+                ScrapeFormatError::UnsupportedContentType { content_type } => {
+                    ScrapeFormatWarning::UnsupportedContentType {
+                        content_type: content_type.clone(),
+                        fallback,
+                    }
+                }
+            };
+            Ok(ResolvedScrapeFormat {
+                format: resolve_fallback_format(fallback, enable_open_metrics_2),
+                warning: Some(warning),
+            })
+        }
+    }
+}
+
+/// Resolves `fallback_scrape_protocol` to a [`Format`], honoring OpenMetrics 2.0 gating.
+///
+/// Prometheus truncates `fallback_scrape_protocol` to a bare media type (`HeaderMediaType`), which
+/// always selects the OpenMetrics 1.0.0 parser for OpenMetrics fallbacks. Keeping the configured
+/// version instead means `OpenMetricsText2.0.0` selects the OpenMetrics 2.0 parser, and a 2.x
+/// fallback with OpenMetrics 2.0 disabled degrades to [`Format::OPEN_METRICS_1_0_0`], which is the
+/// parser Prometheus ends up using for that configuration.
+fn resolve_fallback_format(protocol: ScrapeProtocol, enable_open_metrics_2: bool) -> Format {
+    if protocol.is_open_metrics_2() && !enable_open_metrics_2 {
+        Format::OPEN_METRICS_1_0_0
+    } else {
+        protocol.format()
+    }
+}
+
+/// Scraper-side media type resolution behind [`resolve_scrape_format`], matching
+/// `extractMediaType` in `prometheus/prometheus/model/textparse/interface.go`.
+fn resolve_media_type(
+    content_type: &str,
+    enable_open_metrics_2: bool,
+) -> Result<Format, ScrapeFormatError> {
+    if content_type.is_empty() {
+        return Err(ScrapeFormatError::BlankContentType);
+    }
+    let (media_type, params) = parse_media_type_detailed(content_type).map_err(|reason| {
+        ScrapeFormatError::UnparsableContentType {
+            content_type: content_type.to_owned(),
+            reason,
+        }
+    })?;
+    let version = params.get(VERSION_KEY).copied().unwrap_or("");
+
+    let format = match media_type.as_str() {
+        OPEN_METRICS_TYPE if is_open_metrics_20_version(version) => {
+            // OpenMetrics 2.0 stays experimental in Prometheus, so it is only usable when
+            // explicitly enabled.
+            if !enable_open_metrics_2 {
+                return Err(ScrapeFormatError::OpenMetrics2Disabled {
+                    content_type: content_type.to_owned(),
+                });
+            }
+            if version == OPEN_METRICS_VERSION_2_0_0_RC {
+                Format::OPEN_METRICS_2_0_0_RC
+            } else {
+                Format::OPEN_METRICS_2_0_0
+            }
+        }
+        OPEN_METRICS_TYPE => match version {
+            "" | OPEN_METRICS_VERSION_0_0_1 => Format::OPEN_METRICS_0_0_1,
+            // `1.0.0` and every unknown version are decoded by the OpenMetrics 1.0 parser in
+            // Prometheus, so they resolve to the 1.0.0 baseline instead of failing.
+            _ => Format::OPEN_METRICS_1_0_0,
+        },
+        TEXT_TYPE => {
+            if version == TEXT_VERSION_1_0_0 {
+                Format::TEXT_1_0_0
+            } else {
+                // Prometheus decodes every `text/plain` version, including unknown ones, with the
+                // Prometheus text parser, so the legacy baseline is the faithful resolution.
+                Format::TEXT
+            }
+        }
+        // Prometheus ignores `proto` and `encoding` and feeds every protobuf media type to its
+        // delimited protobuf parser, so there is no escaping scheme to carry over either.
+        PROTO_TYPE => return Ok(Format::PROTO_DELIM),
+        _ => {
+            return Err(ScrapeFormatError::UnsupportedContentType {
+                content_type: content_type.to_owned(),
+            });
+        }
+    };
+
+    Ok(with_declared_escaping(format, &params))
+}
+
+/// Carries a valid `escaping=<scheme>` response parameter over to `format`.
+///
+/// Prometheus never reads escaping from responses, but [`Format`] is this crate's carrier for the
+/// escaping scheme, so dropping a scheme a target declared would silently make
+/// [`Format::to_escaping_scheme`] report the `underscores` default for, say, an `allow-utf-8`
+/// target.
+///
+/// Only formats that negotiate an escaping scheme are considered, matching
+/// [`ScrapeProtocol::supports_escaping`]: legacy `0.0.1` and `0.0.4` media types never advertise
+/// `escaping=`, so a stray parameter on such a response must not change how callers interpret its
+/// names. Invalid schemes are ignored, as Prometheus does.
+fn with_declared_escaping(format: Format, params: &HashMap<String, &str>) -> Format {
+    if !carries_escaping_scheme(&format) {
+        return format;
+    }
+    let Some(scheme) = params
+        .get(ESCAPING_KEY)
+        .copied()
+        .and_then(|raw| raw.parse::<EscapingScheme>().ok())
+    else {
+        return format;
+    };
+    format.with_escaping_scheme(scheme)
+}
+
+/// Whether `format` has a version that negotiates `escaping=<scheme>`, matching
+/// [`ScrapeProtocol::supports_escaping`].
+fn carries_escaping_scheme(format: &Format) -> bool {
+    match format.format_type() {
+        FormatType::TextPlain => format.version() == TEXT_VERSION_1_0_0,
+        FormatType::OpenMetrics => {
+            let version = format.version();
+            version == OPEN_METRICS_VERSION_1_0_0 || is_open_metrics_20_version(version)
+        }
+        _ => false,
     }
 }
 
@@ -645,11 +1216,19 @@ fn match_format(ac: &AcceptClause<'_>, f: &Format) -> bool {
 
 /// Minimal RFC 1521 / `mime.ParseMediaType` parser for `type/subtype; key=val` strings.
 fn parse_media_type(input: &str) -> Option<(String, HashMap<String, &str>)> {
+    parse_media_type_detailed(input).ok()
+}
+
+/// [`parse_media_type`] with a parse reason, so scrape errors can say *why* a target
+/// `Content-Type` was rejected, like the `mime.ParseMediaType` error Go joins into its message.
+fn parse_media_type_detailed(input: &str) -> Result<(String, HashMap<String, &str>), &'static str> {
     let mut parts = input.split(';');
-    let base = parts.next()?.trim();
-    let (main_type, sub_type) = base.split_once('/')?;
+    let base = parts.next().unwrap_or_default().trim();
+    let Some((main_type, sub_type)) = base.split_once('/') else {
+        return Err("expected a type/subtype media type");
+    };
     if !is_valid_token(main_type) || !is_valid_token(sub_type) {
-        return None;
+        return Err("invalid media type token");
     }
 
     let mut params = HashMap::new();
@@ -658,23 +1237,27 @@ fn parse_media_type(input: &str) -> Option<(String, HashMap<String, &str>)> {
         if trimmed.is_empty() {
             continue;
         }
-        let (k, v) = trimmed.split_once('=')?;
+        let Some((k, v)) = trimmed.split_once('=') else {
+            return Err("invalid media parameter");
+        };
         let k = k.trim();
         let v = v.trim();
         let v = if let Some(inner) = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
             inner
         } else {
             if v.is_empty() || v.contains('"') {
-                return None;
+                return Err("invalid media parameter value");
             }
             v
         };
         if !is_valid_token(k) {
-            return None;
+            return Err("invalid media parameter name");
         }
+        // NOTE: Duplicate parameter names are last-wins, where Go's `mime.ParseMediaType` rejects
+        // them as "duplicate parameter name".
         params.insert(k.to_ascii_lowercase(), v);
     }
-    Some((base.to_ascii_lowercase(), params))
+    Ok((base.to_ascii_lowercase(), params))
 }
 
 fn is_valid_token(s: &str) -> bool {
@@ -729,6 +1312,11 @@ mod tests {
                 FormatType::Unknown,
             ),
             (Format::from("text/plain"), FormatType::TextPlain),
+            (Format::TEXT_1_0_0, FormatType::TextPlain),
+            (
+                Format::from("text/plain; version=1.0.0; escaping=allow-utf-8"),
+                FormatType::TextPlain,
+            ),
             (
                 Format::from("text/plain; version=invalid"),
                 FormatType::Unknown,
@@ -1136,6 +1724,27 @@ mod tests {
         assert_eq!(response_format("text/plain"), Format::TEXT);
         assert_eq!(response_format("Text/Plain"), Format::TEXT);
         assert_eq!(response_format("Text/Plain; VERSION=0.0.4"), Format::TEXT);
+        // NOTE: unlike Go's `expfmt.ResponseFormat`, `text/plain; version=1.0.0` is recognized
+        // because it is a format scrapers negotiate (`ScrapeProtocol::PrometheusText1_0_0`).
+        assert_eq!(response_format(FMT_TEXT_1_0_0), Format::TEXT_1_0_0);
+        assert_eq!(
+            response_format("text/plain; version=1.0.0; escaping=allow-utf-8"),
+            Format::TEXT_1_0_0.with_escaping_scheme(EscapingScheme::AllowUtf8)
+        );
+        assert_eq!(
+            response_format("application/openmetrics-text; version=1.0.0; escaping=dots"),
+            Format::OPEN_METRICS_1_0_0.with_escaping_scheme(EscapingScheme::EscapeDots)
+        );
+        // Legacy formats never negotiate `escaping=`, so a stray parameter is ignored.
+        assert_eq!(
+            response_format("text/plain; version=0.0.4; escaping=allow-utf-8"),
+            Format::TEXT
+        );
+        assert_eq!(
+            response_format("application/openmetrics-text; version=1.0.0; escaping=invalid-scheme"),
+            Format::OPEN_METRICS_1_0_0
+        );
+        assert_eq!(response_format("text/plain; version="), Format::UNKNOWN);
         assert_eq!(
             response_format("text/plain; version=0.0.5"),
             Format::UNKNOWN
@@ -1181,5 +1790,511 @@ mod tests {
             err.to_string(),
             "unknown open metrics version string: 9.9.9"
         );
+
+        let err = "PrometheusText9.9.9".parse::<ScrapeProtocol>().unwrap_err();
+        assert_eq!(
+            err,
+            FormatError::UnknownScrapeProtocol("PrometheusText9.9.9".to_owned())
+        );
+        assert_eq!(
+            err.to_string(),
+            "unknown scrape protocol: PrometheusText9.9.9"
+        );
+    }
+
+    #[test]
+    fn scrape_protocol_round_trip() {
+        for protocol in ScrapeProtocol::ALL {
+            assert_eq!(
+                protocol.as_str().parse::<ScrapeProtocol>(),
+                Ok(protocol),
+                "token={protocol}"
+            );
+            assert_eq!(protocol.to_string(), protocol.as_str());
+            assert_eq!(
+                protocol.header().split(';').next(),
+                Some(protocol.media_type())
+            );
+            let format = protocol.format();
+            assert_ne!(
+                format.format_type(),
+                FormatType::Unknown,
+                "token={protocol}"
+            );
+            // The header and format tables are hand-maintained; a version typo in either would
+            // otherwise go unnoticed, since every text version maps to the same `FormatType`.
+            if protocol != ScrapeProtocol::PrometheusProto {
+                let (_, header_params) = parse_media_type(protocol.header()).unwrap();
+                assert_eq!(
+                    format.version(),
+                    header_params.get(VERSION_KEY).copied().unwrap_or_default(),
+                    "token={protocol}"
+                );
+            }
+        }
+
+        // The two tables that encode "which versions negotiate `escaping=`" must not drift:
+        // the response side infers it from the resolved `Format`, the request side from the
+        // protocol.
+        for protocol in ScrapeProtocol::ALL {
+            assert_eq!(
+                carries_escaping_scheme(&protocol.format()),
+                protocol.supports_escaping(),
+                "token={protocol}"
+            );
+        }
+
+        // Configuration tokens are case-sensitive, matching `config.ScrapeProtocol.Validate`.
+        assert!("prometheustext0.0.4".parse::<ScrapeProtocol>().is_err());
+        assert_eq!(
+            "PrometheusText1.0.0".parse::<ScrapeProtocol>(),
+            Ok(ScrapeProtocol::PrometheusText1_0_0)
+        );
+    }
+
+    #[test]
+    fn accept_header_matches_prometheus() {
+        // Cases copied from `TestAcceptHeader` in `scrape/scrape_test.go`.
+        let cases: &[(&str, &[ScrapeProtocol], EscapingScheme, &str)] = &[
+            (
+                "default scrape protocols with underscore escaping",
+                DEFAULT_SCRAPE_PROTOCOLS,
+                EscapingScheme::EscapeUnderscores,
+                "application/openmetrics-text;version=1.0.0;escaping=underscores;q=0.8,\
+                 application/openmetrics-text;version=0.0.1;q=0.7,\
+                 text/plain;version=1.0.0;escaping=underscores;q=0.6,\
+                 text/plain;version=0.0.4;q=0.5,*/*;q=0.4",
+            ),
+            (
+                "default proto first scrape protocols with dots escaping",
+                DEFAULT_PROTO_FIRST_SCRAPE_PROTOCOLS,
+                EscapingScheme::EscapeDots,
+                "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.8,\
+                 application/openmetrics-text;version=1.0.0;escaping=dots;q=0.7,\
+                 application/openmetrics-text;version=0.0.1;q=0.6,\
+                 text/plain;version=1.0.0;escaping=dots;q=0.5,\
+                 text/plain;version=0.0.4;q=0.4,*/*;q=0.3",
+            ),
+            (
+                "default scrape protocols with allow-utf-8 escaping",
+                DEFAULT_SCRAPE_PROTOCOLS,
+                EscapingScheme::AllowUtf8,
+                "application/openmetrics-text;version=1.0.0;escaping=allow-utf-8;q=0.8,\
+                 application/openmetrics-text;version=0.0.1;q=0.7,\
+                 text/plain;version=1.0.0;escaping=allow-utf-8;q=0.6,\
+                 text/plain;version=0.0.4;q=0.5,*/*;q=0.4",
+            ),
+            (
+                "default proto first scrape protocols with allow-utf-8 escaping",
+                DEFAULT_PROTO_FIRST_SCRAPE_PROTOCOLS,
+                EscapingScheme::AllowUtf8,
+                "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.8,\
+                 application/openmetrics-text;version=1.0.0;escaping=allow-utf-8;q=0.7,\
+                 application/openmetrics-text;version=0.0.1;q=0.6,\
+                 text/plain;version=1.0.0;escaping=allow-utf-8;q=0.5,\
+                 text/plain;version=0.0.4;q=0.4,*/*;q=0.3",
+            ),
+            (
+                "openmetrics 2.0.0 and 2.0.0-rc first with allow-utf-8 escaping",
+                &[
+                    ScrapeProtocol::OpenMetricsText2_0_0,
+                    ScrapeProtocol::OpenMetricsText2_0_0Rc,
+                    ScrapeProtocol::OpenMetricsText1_0_0,
+                ],
+                EscapingScheme::AllowUtf8,
+                "application/openmetrics-text;version=2.0.0;escaping=allow-utf-8;q=0.8,\
+                 application/openmetrics-text;version=2.0.0-rc;escaping=allow-utf-8;q=0.7,\
+                 application/openmetrics-text;version=1.0.0;escaping=allow-utf-8;q=0.6,\
+                 */*;q=0.5",
+            ),
+            (
+                "openmetrics 2.0.0 first with underscore escaping",
+                &[
+                    ScrapeProtocol::OpenMetricsText2_0_0,
+                    ScrapeProtocol::OpenMetricsText1_0_0,
+                ],
+                EscapingScheme::EscapeUnderscores,
+                "application/openmetrics-text;version=2.0.0;escaping=underscores;q=0.8,\
+                 application/openmetrics-text;version=1.0.0;escaping=underscores;q=0.7,\
+                 */*;q=0.6",
+            ),
+            (
+                "openmetrics 2.0.0 only with allow-utf-8 escaping",
+                &[ScrapeProtocol::OpenMetricsText2_0_0],
+                EscapingScheme::AllowUtf8,
+                "application/openmetrics-text;version=2.0.0;escaping=allow-utf-8;q=0.8,\
+                 */*;q=0.7",
+            ),
+            (
+                "empty protocol list only advertises the wildcard",
+                &[],
+                EscapingScheme::EscapeValues,
+                "*/*;q=0.8",
+            ),
+            (
+                "over-long protocol list clamps weights at q=0.1",
+                &[ScrapeProtocol::PrometheusText1_0_0; 9],
+                EscapingScheme::EscapeUnderscores,
+                "text/plain;version=1.0.0;escaping=underscores;q=0.8,\
+                 text/plain;version=1.0.0;escaping=underscores;q=0.7,\
+                 text/plain;version=1.0.0;escaping=underscores;q=0.6,\
+                 text/plain;version=1.0.0;escaping=underscores;q=0.5,\
+                 text/plain;version=1.0.0;escaping=underscores;q=0.4,\
+                 text/plain;version=1.0.0;escaping=underscores;q=0.3,\
+                 text/plain;version=1.0.0;escaping=underscores;q=0.2,\
+                 text/plain;version=1.0.0;escaping=underscores;q=0.1,\
+                 text/plain;version=1.0.0;escaping=underscores;q=0.1,*/*;q=0.1",
+            ),
+        ];
+
+        for (name, protocols, scheme, expected) in cases {
+            assert_eq!(accept_header(protocols, *scheme), *expected, "case={name}");
+        }
+    }
+
+    #[test]
+    fn resolve_scrape_format_matches_prometheus() {
+        // Cases mirror `TestNew` in `model/textparse/interface_test.go`; error and warning text is
+        // Prometheus's own wording, because callers relay it in scrape warnings and reports.
+        /// `(name, content_type, fallback, openmetrics 2.0 enabled, expected, warning)`.
+        struct Case(
+            &'static str,
+            Option<&'static str>,
+            Option<ScrapeProtocol>,
+            bool,
+            Result<Format, &'static str>,
+            Option<&'static str>,
+        );
+
+        let cases: &[Case] = &[
+            Case(
+                "blank content type without fallback",
+                None,
+                None,
+                false,
+                Err(
+                    "non-compliant scrape target sending blank Content-Type and no fallback_scrape_protocol specified for target",
+                ),
+                None,
+            ),
+            Case(
+                "empty content type without fallback",
+                Some(""),
+                None,
+                false,
+                Err(
+                    "non-compliant scrape target sending blank Content-Type and no fallback_scrape_protocol specified for target",
+                ),
+                None,
+            ),
+            Case(
+                "blank content type with text fallback",
+                None,
+                Some(ScrapeProtocol::PrometheusText0_0_4),
+                false,
+                Ok(Format::TEXT),
+                Some(
+                    "non-compliant scrape target sending blank Content-Type, using fallback_scrape_protocol \"text/plain\"",
+                ),
+            ),
+            Case(
+                "unparsable content type without fallback",
+                Some("invalid/"),
+                None,
+                false,
+                Err(
+                    "cannot parse Content-Type \"invalid/\" (invalid media type token) and no fallback_scrape_protocol for target",
+                ),
+                None,
+            ),
+            Case(
+                "unparsable content type with text fallback",
+                Some("invalid/"),
+                Some(ScrapeProtocol::PrometheusText0_0_4),
+                false,
+                Ok(Format::TEXT),
+                Some(
+                    "could not parse received Content-Type \"invalid/\" (invalid media type token), using fallback_scrape_protocol \"text/plain\"",
+                ),
+            ),
+            Case(
+                "unparsable content type with openmetrics fallback",
+                Some("invalid/invalid/invalid"),
+                Some(ScrapeProtocol::OpenMetricsText0_0_1),
+                false,
+                Ok(Format::OPEN_METRICS_0_0_1),
+                Some(
+                    "could not parse received Content-Type \"invalid/invalid/invalid\" (invalid media type token), using fallback_scrape_protocol \"application/openmetrics-text\"",
+                ),
+            ),
+            Case(
+                "unparsable content type with protobuf fallback",
+                Some("invalid/"),
+                Some(ScrapeProtocol::PrometheusProto),
+                false,
+                Ok(Format::PROTO_DELIM),
+                Some(
+                    "could not parse received Content-Type \"invalid/\" (invalid media type token), using fallback_scrape_protocol \"application/vnd.google.protobuf\"",
+                ),
+            ),
+            Case(
+                "openmetrics without version or charset",
+                Some("application/openmetrics-text"),
+                None,
+                false,
+                Ok(Format::OPEN_METRICS_0_0_1),
+                None,
+            ),
+            Case(
+                "openmetrics with charset only",
+                Some("application/openmetrics-text; charset=utf-8"),
+                None,
+                false,
+                Ok(Format::OPEN_METRICS_0_0_1),
+                None,
+            ),
+            Case(
+                "openmetrics 1.0.0 with charset",
+                Some("application/openmetrics-text; version=1.0.0; charset=utf-8"),
+                None,
+                false,
+                Ok(Format::OPEN_METRICS_1_0_0),
+                None,
+            ),
+            Case(
+                "openmetrics unknown version uses the 1.0.0 baseline",
+                Some("application/openmetrics-text; version=0.0.4"),
+                None,
+                false,
+                Ok(Format::OPEN_METRICS_1_0_0),
+                None,
+            ),
+            Case(
+                "openmetrics 2.0.0-rc gated",
+                Some("application/openmetrics-text; version=2.0.0-rc"),
+                None,
+                true,
+                Ok(Format::OPEN_METRICS_2_0_0_RC),
+                None,
+            ),
+            Case(
+                "openmetrics 2.0.0-rc disabled without fallback",
+                Some("application/openmetrics-text; version=2.0.0-rc"),
+                None,
+                false,
+                Err(
+                    "received OpenMetrics 2.0 Content-Type \"application/openmetrics-text; version=2.0.0-rc\", but the openmetrics2 feature flag is not enabled and no fallback_scrape_protocol specified for target",
+                ),
+                None,
+            ),
+            Case(
+                "openmetrics 2.0.0-rc disabled with openmetrics fallback",
+                Some("application/openmetrics-text; version=2.0.0-rc"),
+                Some(ScrapeProtocol::OpenMetricsText1_0_0),
+                false,
+                Ok(Format::OPEN_METRICS_1_0_0),
+                Some(
+                    "received OpenMetrics 2.0 Content-Type \"application/openmetrics-text; version=2.0.0-rc\", but the openmetrics2 feature flag is not enabled, using fallback_scrape_protocol \"application/openmetrics-text\"",
+                ),
+            ),
+            Case(
+                "openmetrics 2.0.0 gated",
+                Some("application/openmetrics-text; version=2.0.0; charset=utf-8"),
+                None,
+                true,
+                Ok(Format::OPEN_METRICS_2_0_0),
+                None,
+            ),
+            Case(
+                "openmetrics 2.0.0 disabled without fallback",
+                Some("application/openmetrics-text; version=2.0.0"),
+                None,
+                false,
+                Err(
+                    "received OpenMetrics 2.0 Content-Type \"application/openmetrics-text; version=2.0.0\", but the openmetrics2 feature flag is not enabled and no fallback_scrape_protocol specified for target",
+                ),
+                None,
+            ),
+            Case(
+                "text plain without version",
+                Some("text/plain"),
+                None,
+                false,
+                Ok(Format::TEXT),
+                None,
+            ),
+            Case(
+                "text plain 0.0.4",
+                Some("text/plain; version=0.0.4"),
+                None,
+                false,
+                Ok(Format::TEXT),
+                None,
+            ),
+            Case(
+                "text plain 1.0.0",
+                Some("text/plain; version=1.0.0"),
+                None,
+                false,
+                Ok(Format::TEXT_1_0_0),
+                None,
+            ),
+            Case(
+                "text plain 1.0.0 with allow-utf-8 escaping",
+                Some("text/plain; version=1.0.0; escaping=allow-utf-8"),
+                None,
+                false,
+                Ok(Format::TEXT_1_0_0.with_escaping_scheme(EscapingScheme::AllowUtf8)),
+                None,
+            ),
+            Case(
+                "openmetrics 1.0.0 with dots escaping",
+                Some("application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=dots"),
+                None,
+                false,
+                Ok(Format::OPEN_METRICS_1_0_0.with_escaping_scheme(EscapingScheme::EscapeDots)),
+                None,
+            ),
+            Case(
+                "invalid escaping parameter is ignored",
+                Some("text/plain; version=1.0.0; escaping=bogus"),
+                None,
+                false,
+                Ok(Format::TEXT_1_0_0),
+                None,
+            ),
+            Case(
+                "legacy text 0.0.4 never negotiates escaping",
+                Some("text/plain; version=0.0.4; escaping=allow-utf-8"),
+                None,
+                false,
+                Ok(Format::TEXT),
+                None,
+            ),
+            Case(
+                "legacy openmetrics 0.0.1 never negotiates escaping",
+                Some("application/openmetrics-text; version=0.0.1; escaping=allow-utf-8"),
+                None,
+                false,
+                Ok(Format::OPEN_METRICS_0_0_1),
+                None,
+            ),
+            Case(
+                "openmetrics 2.0.0 with allow-utf-8 escaping",
+                Some("application/openmetrics-text; version=2.0.0; escaping=allow-utf-8"),
+                None,
+                true,
+                Ok(Format::OPEN_METRICS_2_0_0.with_escaping_scheme(EscapingScheme::AllowUtf8)),
+                None,
+            ),
+            Case(
+                "duplicate media type parameters are last-wins",
+                Some("application/openmetrics-text; charset=UTF-8; charset=utf-8"),
+                None,
+                false,
+                Ok(Format::OPEN_METRICS_0_0_1),
+                None,
+            ),
+            Case(
+                "content type without media type separator",
+                Some("gobbledygook"),
+                Some(ScrapeProtocol::PrometheusText0_0_4),
+                false,
+                Ok(Format::TEXT),
+                Some(
+                    "could not parse received Content-Type \"gobbledygook\" (expected a type/subtype media type), using fallback_scrape_protocol \"text/plain\"",
+                ),
+            ),
+            Case(
+                "text plain unknown version uses the 0.0.4 baseline",
+                Some("text/plain; version=9.9.9"),
+                None,
+                false,
+                Ok(Format::TEXT),
+                None,
+            ),
+            Case(
+                "protobuf without parameters",
+                Some("application/vnd.google.protobuf"),
+                None,
+                false,
+                Ok(Format::PROTO_DELIM),
+                None,
+            ),
+            Case(
+                "protobuf delimited",
+                Some(
+                    "application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited",
+                ),
+                None,
+                false,
+                Ok(Format::PROTO_DELIM),
+                None,
+            ),
+            Case(
+                "unsupported content type without fallback",
+                Some("text/html"),
+                None,
+                false,
+                Err(
+                    "received unsupported Content-Type \"text/html\" and no fallback_scrape_protocol specified for target",
+                ),
+                None,
+            ),
+            Case(
+                "unsupported content type with text fallback",
+                Some("text/html"),
+                Some(ScrapeProtocol::PrometheusText0_0_4),
+                false,
+                Ok(Format::TEXT),
+                Some(
+                    "received unsupported Content-Type \"text/html\", using fallback_scrape_protocol \"text/plain\"",
+                ),
+            ),
+            Case(
+                "openmetrics 2.0.0 fallback stays 2.0.0 when gated on",
+                None,
+                Some(ScrapeProtocol::OpenMetricsText2_0_0),
+                true,
+                Ok(Format::OPEN_METRICS_2_0_0),
+                Some(
+                    "non-compliant scrape target sending blank Content-Type, using fallback_scrape_protocol \"application/openmetrics-text\"",
+                ),
+            ),
+            Case(
+                "openmetrics 2.0.0 fallback degrades when gated off",
+                None,
+                Some(ScrapeProtocol::OpenMetricsText2_0_0),
+                false,
+                Ok(Format::OPEN_METRICS_1_0_0),
+                Some(
+                    "non-compliant scrape target sending blank Content-Type, using fallback_scrape_protocol \"application/openmetrics-text\"",
+                ),
+            ),
+        ];
+
+        for Case(name, content_type, fallback, enable_om2, expected, expected_warning) in cases {
+            let resolved = resolve_scrape_format(*content_type, *fallback, *enable_om2);
+            match expected {
+                Ok(format) => {
+                    let resolved = resolved.expect(name);
+                    assert_eq!(&resolved.format, format, "case={name}");
+                    assert_eq!(
+                        resolved
+                            .warning
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .as_deref(),
+                        *expected_warning,
+                        "case={name}"
+                    );
+                }
+                Err(message) => {
+                    let err = resolved.expect_err(name);
+                    assert_eq!(&err.to_string(), message, "case={name}");
+                    assert_eq!(*expected_warning, None, "case={name}");
+                }
+            }
+        }
     }
 }
