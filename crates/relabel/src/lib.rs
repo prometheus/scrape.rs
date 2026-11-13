@@ -1074,7 +1074,7 @@ pub fn populate_labels(
 /// Parses a non-negative Prometheus duration string into nanoseconds matching
 /// `github.com/prometheus/common/model.ParseDuration` (`y`, `w`, `d`, `h`, `m`, `s`, `ms` in
 /// strictly decreasing unit order, plus `"0"`).
-fn parse_prometheus_duration(s: &str) -> Result<u64, String> {
+pub fn parse_prometheus_duration(s: &str) -> Result<u64, String> {
     if s == "0" {
         return Ok(0);
     }

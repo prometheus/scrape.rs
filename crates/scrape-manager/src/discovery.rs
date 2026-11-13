@@ -181,87 +181,9 @@ impl DiscoveryConfigs {
 /// Parses a Prometheus duration string (such as `"30s"`, `"1m"`, `"500ms"`, `"1h30m"`, `"7d"`,
 /// `"1w"`, `"1y"`, or `"0"`) into a [`Duration`], matching `prometheus/common/model.ParseDuration`.
 pub fn parse_duration(s: &str) -> Result<Duration, DiscoveryError> {
-    if s == "0" {
-        return Ok(Duration::ZERO);
-    }
-    if s.is_empty() {
-        return Err(DiscoveryError::InvalidConfig(
-            "empty duration string".to_owned(),
-        ));
-    }
-
-    const MS_NS: u64 = 1_000_000;
-    const SEC_NS: u64 = 1_000 * MS_NS;
-    const MIN_NS: u64 = 60 * SEC_NS;
-    const HOUR_NS: u64 = 60 * MIN_NS;
-    const DAY_NS: u64 = 24 * HOUR_NS;
-    const WEEK_NS: u64 = 7 * DAY_NS;
-    const YEAR_NS: u64 = 365 * DAY_NS;
-    const MAX_DURATION_NS: u64 = i64::MAX as u64;
-
-    let orig = s;
-    let bytes = s.as_bytes();
-    let mut idx = 0;
-    let mut total_ns: u64 = 0;
-    let mut last_unit_pos: u8 = 0;
-
-    while idx < bytes.len() {
-        if !bytes[idx].is_ascii_digit() {
-            return Err(DiscoveryError::InvalidConfig(format!(
-                "not a valid duration string: {orig:?}"
-            )));
-        }
-        let num_start = idx;
-        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
-            idx += 1;
-        }
-        let val: u64 = s[num_start..idx].parse().map_err(|_| {
-            DiscoveryError::InvalidConfig(format!("not a valid duration string: {orig:?}"))
-        })?;
-
-        let unit_start = idx;
-        while idx < bytes.len() && !bytes[idx].is_ascii_digit() {
-            idx += 1;
-        }
-        if unit_start == idx {
-            return Err(DiscoveryError::InvalidConfig(format!(
-                "not a valid duration string: {orig:?}"
-            )));
-        }
-        let unit = &s[unit_start..idx];
-        let (pos, mult_ns): (u8, u64) = match unit {
-            "y" => (1, YEAR_NS),
-            "w" => (2, WEEK_NS),
-            "d" => (3, DAY_NS),
-            "h" => (4, HOUR_NS),
-            "m" => (5, MIN_NS),
-            "s" => (6, SEC_NS),
-            "ms" => (7, MS_NS),
-            _ => {
-                return Err(DiscoveryError::InvalidConfig(format!(
-                    "unknown unit {unit:?} in duration {orig:?}"
-                )));
-            }
-        };
-        if pos <= last_unit_pos {
-            return Err(DiscoveryError::InvalidConfig(format!(
-                "not a valid duration string: {orig:?}"
-            )));
-        }
-        last_unit_pos = pos;
-
-        if val > (1u64 << 63) / mult_ns {
-            return Err(DiscoveryError::InvalidConfig(
-                "duration out of range".to_owned(),
-            ));
-        }
-        total_ns = total_ns
-            .checked_add(val * mult_ns)
-            .filter(|&d| d <= MAX_DURATION_NS)
-            .ok_or_else(|| DiscoveryError::InvalidConfig("duration out of range".to_owned()))?;
-    }
-
-    Ok(Duration::from_nanos(total_ns))
+    prometheus_relabel::parse_prometheus_duration(s)
+        .map(Duration::from_nanos)
+        .map_err(DiscoveryError::InvalidConfig)
 }
 
 /// Formats a [`Duration`] as a canonical Prometheus duration string (such as `"30s"` or `"1m30s"`),
