@@ -55,17 +55,17 @@ fn main() {
             let input: &'static [u8] = fs::read(root.join(format!("{case}.bench.{format}.txt")))
                 .unwrap()
                 .leak();
+            let parse: fn(&'static [u8], &mut LabelsBuffer<'static>) = if format == "om2" {
+                |input, labels| read_all(OpenMetrics2Parser::new(input), labels)
+            } else {
+                |input, labels| read_all(OpenMetricsParser::new(input), labels)
+            };
             suite = suite.bench(format!("Parse/case={case}/format={format}"), move |b| {
                 let mut labels = LabelsBuffer::new();
                 b.set_bytes(input.len() as u64);
                 b.report_allocs();
                 while b.keep_running() {
-                    let input = black_box(input);
-                    if format == "om2" {
-                        read_all(OpenMetrics2Parser::new(input), &mut labels);
-                    } else {
-                        read_all(OpenMetricsParser::new(input), &mut labels);
-                    }
+                    parse(black_box(input), &mut labels);
                 }
             });
         }

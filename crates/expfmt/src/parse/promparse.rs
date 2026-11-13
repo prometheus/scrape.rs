@@ -69,6 +69,18 @@ pub(crate) struct LabelSpan {
     pub(crate) val_end: usize,
 }
 
+impl LabelSpan {
+    /// The label name in `input`. Parsers check UTF-8 when they record the span.
+    pub(crate) fn name<'a>(&self, input: &'a [u8]) -> &'a str {
+        std::str::from_utf8(&input[self.name_start..self.name_end]).unwrap_or_default()
+    }
+
+    /// The label value in `input`. Parsers check UTF-8 when they record the span.
+    pub(crate) fn value<'a>(&self, input: &'a [u8]) -> &'a str {
+        std::str::from_utf8(&input[self.val_start..self.val_end]).unwrap_or_default()
+    }
+}
+
 /// Lifetime-free state of [`PromParser`] that can be stored across suspension points alongside an
 /// owned input buffer without self-referential lifetimes.
 pub(crate) struct PromParserState {

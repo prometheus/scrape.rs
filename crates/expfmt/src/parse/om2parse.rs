@@ -21,8 +21,8 @@ use std::ops::Range;
 use super::float::{FloatBuf, common_openmetrics_float, format_openmetrics_float, parse_go_float};
 use super::omlex::{Lexer, Token};
 use super::omparse::{
-    NORMAL_NAN, normalize_float_label, parse_metric_type, parse_sample_value, unescape,
-    unescape_label,
+    label_value_span, metadata_text, normalize_float_label, normalize_nan, parse_metric_type,
+    parse_sample_value, timestamp_ms, unescape, unescape_label, unexpected, utf8_span,
 };
 use super::{
     BUCKET_LABEL, ByteSpan, CounterResetHint, Entry, Histogram, HistogramRef, LabelSpan,
@@ -40,7 +40,24 @@ struct Exemplar {
     labels: Range<usize>,
 }
 
-/// Label text of an exploded series, from the input or from `pending_text`.
+/// The exemplars of the current line.
+#[derive(Default)]
+struct Exemplars {
+    entries: Vec<Exemplar>,
+    labels: Vec<LabelSpan>,
+    /// Like Go, exemplars are handed out one per call across the series of a composite value.
+    next: usize,
+}
+
+impl Exemplars {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.labels.clear();
+        self.next = 0;
+    }
+}
+
+/// Label text of an exploded series, from the input or from [`Pending::text`].
 enum PendingText<'a> {
     Input(&'a str),
     Arena(Range<usize>),
@@ -57,11 +74,177 @@ impl<'a> PendingText<'a> {
 
 /// One flat series of a classic histogram or summary composite value.
 struct PendingSeries<'a> {
-    series: ByteSpan,
+    series: Range<usize>,
     name: Range<usize>,
     injected: Option<(&'static str, PendingText<'a>)>,
     value: f64,
 }
+
+/// The flat series of the current classic composite line, Go's `pending`.
+#[derive(Default)]
+struct Pending<'a> {
+    entries: Vec<PendingSeries<'a>>,
+    /// Number of entries returned so far; the current one is `returned - 1`.
+    returned: usize,
+    /// The unescaped labels of the line other than the metric name, sorted by name.
+    line_labels: Vec<Label<'a>>,
+    /// Series names and formatted bounds, which are not in the input.
+    text: String,
+    series_bytes: Vec<u8>,
+}
+
+impl<'a> Pending<'a> {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.returned = 0;
+        self.line_labels.clear();
+        self.text.clear();
+        self.series_bytes.clear();
+    }
+
+    fn advance(&mut self) -> bool {
+        if self.returned < self.entries.len() {
+            self.returned += 1;
+            return true;
+        }
+        false
+    }
+
+    fn current(&self) -> Option<&PendingSeries<'a>> {
+        self.returned
+            .checked_sub(1)
+            .and_then(|index| self.entries.get(index))
+    }
+
+    fn series_bytes(&self, entry: &PendingSeries<'a>) -> &[u8] {
+        &self.series_bytes[entry.series.clone()]
+    }
+
+    fn set_line_labels(&mut self, input: &'a [u8], labels: &[LabelSpan]) {
+        self.line_labels.extend(labels.iter().map(|span| {
+            (
+                unescape_label(span.name(input)),
+                unescape_label(span.value(input)),
+            )
+        }));
+        self.line_labels.sort_by(|left, right| left.0.cmp(&right.0));
+    }
+
+    /// Queues one series per `bound:value` item of `list`. Returns whether a bound is `+Inf`.
+    fn push_bounds(
+        &mut self,
+        family: &str,
+        field: &BoundsField,
+        list: Option<&'a str>,
+    ) -> Result<bool, String> {
+        let mut previous = f64::NEG_INFINITY;
+        let mut has_infinity = false;
+        for part in list_items(required(list, field.key)?)? {
+            let cut = if field.cut_at_last_colon {
+                part.rsplit_once(':')
+            } else {
+                part.split_once(':')
+            };
+            let (bound, value) =
+                cut.ok_or_else(|| format!("{} missing ':': {part:?}", field.key))?;
+            let value = go_float(value.trim())?;
+            let bound =
+                sorted_float_label(bound.trim(), &mut previous, field.plural, &mut self.text)?;
+            has_infinity |= bound.resolve(&self.text) == "+Inf";
+            self.push(family, field.suffix, Some((field.label, bound)), value);
+        }
+        Ok(has_infinity)
+    }
+
+    /// Queues a flat series named `family` + `suffix` with Go's `appendSeriesBytes` identity.
+    fn push(
+        &mut self,
+        family: &str,
+        suffix: &str,
+        injected: Option<(&'static str, PendingText<'a>)>,
+        value: f64,
+    ) {
+        let name_start = self.text.len();
+        self.text.push_str(family);
+        self.text.push_str(suffix);
+        let name = name_start..self.text.len();
+        let series_start = self.series_bytes.len();
+        // `line_labels` is sorted and "__name__" sorts before "le" and "quantile", so merging
+        // the two keeps Go's sorted label order without sorting per series.
+        let mut special = [(METRIC_NAME_LABEL, &self.text[name.clone()])]
+            .into_iter()
+            .chain(
+                injected
+                    .as_ref()
+                    .map(|(label, text)| (*label, text.resolve(&self.text))),
+            )
+            .peekable();
+        let out = &mut self.series_bytes;
+        for (label, label_value) in &self.line_labels {
+            while let Some((special_label, special_value)) =
+                special.next_if(|(special_label, _)| *special_label <= label.as_ref())
+            {
+                append_series_label(out, special_label, special_value);
+            }
+            append_series_label(out, label, label_value);
+        }
+        for (special_label, special_value) in special {
+            append_series_label(out, special_label, special_value);
+        }
+        self.entries.push(PendingSeries {
+            series: series_start..self.series_bytes.len(),
+            name,
+            injected,
+            value,
+        });
+    }
+
+    fn write_labels(&self, entry: &PendingSeries<'a>, buf: &mut LabelsBuffer<'a>) {
+        // LabelsBuffer borrows only from the input, so the `__name__` and formatted bound
+        // that live in `text` are copied.
+        buf.push(
+            Cow::Borrowed(METRIC_NAME_LABEL),
+            Cow::Owned(self.text[entry.name.clone()].to_owned()),
+        );
+        for (name, value) in &self.line_labels {
+            buf.push(name.clone(), value.clone());
+        }
+        if let Some((label, text)) = &entry.injected {
+            let value = match text {
+                PendingText::Input(text) => Cow::Borrowed(*text),
+                PendingText::Arena(range) => Cow::Owned(self.text[range.clone()].to_owned()),
+            };
+            buf.push(Cow::Borrowed(label), value);
+        }
+        buf.sort();
+    }
+}
+
+/// The `quantile` or `bucket` list of a classic composite value.
+struct BoundsField {
+    key: &'static str,
+    label: &'static str,
+    suffix: &'static str,
+    plural: &'static str,
+    /// Go cuts buckets at the last ':' and quantiles at the first.
+    cut_at_last_colon: bool,
+}
+
+const QUANTILES: BoundsField = BoundsField {
+    key: "quantile",
+    label: QUANTILE_LABEL,
+    suffix: "",
+    plural: "quantiles",
+    cut_at_last_colon: false,
+};
+
+const BUCKETS: BoundsField = BoundsField {
+    key: "bucket",
+    label: BUCKET_LABEL,
+    suffix: "_bucket",
+    plural: "classic histogram buckets",
+    cut_at_last_colon: true,
+};
 
 /// Zero-copy parser for the OpenMetrics 2.0 text exposition format. Like Go, it returns native
 /// histograms as [`Entry::Histogram`] and explodes classic histogram and summary composite
@@ -80,20 +263,11 @@ pub struct OpenMetrics2Parser<'a> {
     timestamp: Option<i64>,
     start_timestamp: Option<i64>,
     labels: Vec<LabelSpan>,
-    exemplars: Vec<Exemplar>,
-    exemplar_labels: Vec<LabelSpan>,
-    /// Like Go, exemplars are handed out one per call across the series of a composite value.
-    exemplar_index: usize,
+    exemplars: Exemplars,
     float_histogram_kind: bool,
     int_histogram: Histogram<u64, i64>,
     float_histogram: Histogram<f64, f64>,
-    pending: Vec<PendingSeries<'a>>,
-    /// Number of pending series returned so far; the current one is `pending_index - 1`.
-    pending_index: usize,
-    /// The unescaped labels of the composite line other than the metric name, sorted by name.
-    line_labels: Vec<Label<'a>>,
-    pending_text: String,
-    pending_series: Vec<u8>,
+    pending: Pending<'a>,
 }
 
 impl<'a> OpenMetrics2Parser<'a> {
@@ -112,25 +286,16 @@ impl<'a> OpenMetrics2Parser<'a> {
             timestamp: None,
             start_timestamp: None,
             labels: Vec::new(),
-            exemplars: Vec::new(),
-            exemplar_labels: Vec::new(),
-            exemplar_index: 0,
+            exemplars: Exemplars::default(),
             float_histogram_kind: false,
             int_histogram: Histogram::default(),
             float_histogram: Histogram::default(),
-            pending: Vec::new(),
-            pending_index: 0,
-            line_labels: Vec::new(),
-            pending_text: String::new(),
-            pending_series: Vec::new(),
+            pending: Pending::default(),
         }
     }
 
     fn unexpected(&self, expected: &'static str) -> ParseError {
-        ParseError::UnexpectedToken {
-            expected,
-            offset: self.lexer.token_start,
-        }
+        unexpected(&self.lexer, expected)
     }
 
     fn invalid_value(message: impl Into<String>) -> ParseError {
@@ -138,12 +303,7 @@ impl<'a> OpenMetrics2Parser<'a> {
     }
 
     fn utf8_span(&self, start: usize, end: usize) -> Result<ByteSpan, ParseError> {
-        if std::str::from_utf8(&self.lexer.input[start..end]).is_err() {
-            return Err(ParseError::InvalidUtf8 {
-                offset: self.lexer.token_start,
-            });
-        }
-        Ok(ByteSpan::new(start, end))
+        utf8_span(&self.lexer, start, end)
     }
 
     fn bytes(&self, span: ByteSpan) -> &'a [u8] {
@@ -182,16 +342,7 @@ impl<'a> OpenMetrics2Parser<'a> {
         if self.lexer.lex() != Token::Text {
             return Err(self.unexpected("expected text"));
         }
-        let text_span = self.lexer.token_span();
-        // The text token starts with a blank and ends with a linebreak, which the lexer
-        // can follow with NUL bytes.
-        let text = self.bytes(text_span);
-        let text_end = text_span.start
-            + text
-                .iter()
-                .position(|&byte| byte == b'\n')
-                .unwrap_or(text.len());
-        self.text = ByteSpan::new((text_span.start + 1).min(text_end), text_end);
+        self.text = metadata_text(&self.lexer);
         let raw_text = self.bytes(self.text);
         match kind {
             Token::Type => {
@@ -270,22 +421,9 @@ impl<'a> OpenMetrics2Parser<'a> {
             if self.lexer.lex() != Token::LValue {
                 return Err(self.unexpected("expected label value"));
             }
-            let value_start = self.lexer.token_start;
-            let value =
-                std::str::from_utf8(self.lexer.token()).map_err(|_| ParseError::InvalidUtf8 {
-                    offset: value_start,
-                })?;
-            // The token can end in NUL bytes after the closing quote, which we drop like the
-            // OpenMetrics 1.0 parser.
-            let close = value.rfind('"').unwrap_or(0);
-            let span = LabelSpan {
-                name_start: start,
-                name_end: end,
-                val_start: value_start + 1,
-                val_end: value_start + close.max(1),
-            };
+            let span = label_value_span(&self.lexer, start, end)?;
             if exemplar {
-                self.exemplar_labels.push(span);
+                self.exemplars.labels.push(span);
             } else {
                 self.labels.push(span);
             }
@@ -327,14 +465,10 @@ impl<'a> OpenMetrics2Parser<'a> {
         }
         let value = parse_sample_value(raw)
             .ok_or_else(|| Self::invalid_value(String::from_utf8_lossy(raw)))?;
-        self.value = if value.is_nan() {
-            if self.metric_type == MetricType::Counter {
-                return Err(Self::invalid_value("counter sample value must not be NaN"));
-            }
-            f64::from_bits(NORMAL_NAN)
-        } else {
-            value
-        };
+        if value.is_nan() && self.metric_type == MetricType::Counter {
+            return Err(Self::invalid_value("counter sample value must not be NaN"));
+        }
+        self.value = normalize_nan(value);
         if self.metric_type == MetricType::Stateset {
             if self.value != 0.0 && self.value != 1.0 {
                 return Err(Self::invalid_value("stateset sample value must be 0 or 1"));
@@ -386,7 +520,7 @@ impl<'a> OpenMetrics2Parser<'a> {
     /// Parses exemplars after ` # {` up to and including the linebreak. Each needs a timestamp.
     fn parse_exemplars(&mut self) -> Result<(), ParseError> {
         loop {
-            let labels_start = self.exemplar_labels.len();
+            let labels_start = self.exemplars.labels.len();
             self.parse_label_values(true)?;
             if self.lexer.lex() != Token::Value {
                 return Err(self.unexpected("expected exemplar value"));
@@ -394,20 +528,15 @@ impl<'a> OpenMetrics2Parser<'a> {
             let raw = &self.lexer.token()[1..];
             let value = parse_sample_value(raw)
                 .ok_or_else(|| Self::invalid_value(String::from_utf8_lossy(raw)))?;
-            let value = if value.is_nan() {
-                f64::from_bits(NORMAL_NAN)
-            } else {
-                value
-            };
             match self.lexer.lex() {
                 Token::Eof => return Err(ParseError::MissingEof),
                 Token::Timestamp => {}
                 _ => return Err(self.unexpected("expected exemplar timestamp")),
             }
-            self.exemplars.push(Exemplar {
-                value,
+            self.exemplars.entries.push(Exemplar {
+                value: normalize_nan(value),
                 timestamp: self.timestamp_value(1)?,
-                labels: labels_start..self.exemplar_labels.len(),
+                labels: labels_start..self.exemplars.labels.len(),
             });
             match self.lexer.lex() {
                 Token::Eof => return Err(ParseError::MissingEof),
@@ -420,14 +549,7 @@ impl<'a> OpenMetrics2Parser<'a> {
 
     /// Parses float seconds after the first `skip` bytes of the current token into milliseconds.
     fn timestamp_value(&self, skip: usize) -> Result<i64, ParseError> {
-        let raw = &self.lexer.token()[skip..];
-        let seconds = parse_sample_value(raw)
-            .filter(|seconds| seconds.is_finite())
-            .ok_or_else(|| {
-                ParseError::InvalidTimestamp(String::from_utf8_lossy(raw).into_owned())
-            })?;
-        // NOTE: Rust saturates out-of-range casts, Go's int64() is platform-specific there.
-        Ok((seconds * 1000.0) as i64)
+        timestamp_ms(&self.lexer.token()[skip..])
     }
 
     fn parse_composite_value(&mut self, raw: &'a str) -> Result<Entry, String> {
@@ -447,108 +569,20 @@ impl<'a> OpenMetrics2Parser<'a> {
             self.parse_native_histogram(&fields, gauge)?;
             return Ok(Entry::Histogram);
         }
-        let input = self.lexer.input;
-        let text = |start, end| std::str::from_utf8(&input[start..end]).unwrap_or_default();
-        self.line_labels.extend(self.labels.iter().map(|span| {
-            (
-                unescape_label(text(span.name_start, span.name_end)),
-                unescape_label(text(span.val_start, span.val_end)),
-            )
-        }));
-        self.line_labels.sort_by(|left, right| left.0.cmp(&right.0));
+        self.pending.set_line_labels(self.lexer.input, &self.labels);
         let family = unescape_label(std::str::from_utf8(self.metric_name()).unwrap_or_default());
-        let (count_suffix, count, sum_suffix, sum) = if gauge {
-            ("_gcount", fields.gcount, "_gsum", fields.gsum)
-        } else {
-            ("_count", fields.count, "_sum", fields.sum)
-        };
-        let count = go_float(required(count, &count_suffix[1..])?)?;
-        self.push_pending(&family, count_suffix, None, count);
-        let sum = go_float(required(sum, &sum_suffix[1..])?)?;
-        self.push_pending(&family, sum_suffix, None, sum);
+        for (key, suffix, field) in fields.count_and_sum(gauge) {
+            let value = required_float(field, key)?;
+            self.pending.push(&family, suffix, None, value);
+        }
         if summary {
-            let quantiles = list_items(required(fields.quantile, "quantile")?)?;
-            let mut previous = f64::NEG_INFINITY;
-            for part in quantiles {
-                let (quantile, value) = part
-                    .split_once(':')
-                    .ok_or_else(|| format!("quantile missing ':': {part:?}"))?;
-                let value = go_float(value.trim())?;
-                let quantile = sorted_float_label(
-                    quantile.trim(),
-                    &mut previous,
-                    "quantiles",
-                    &mut self.pending_text,
-                )?;
-                self.push_pending(&family, "", Some((QUANTILE_LABEL, quantile)), value);
-            }
-        } else {
-            let buckets = list_items(required(fields.bucket, "bucket")?)?;
-            let mut previous = f64::NEG_INFINITY;
-            let mut has_infinity = false;
-            for part in buckets {
-                let (bound, count) = part
-                    .rsplit_once(':')
-                    .ok_or_else(|| format!("bucket missing ':': {part:?}"))?;
-                let count = go_float(count.trim())?;
-                let bound = sorted_float_label(
-                    bound.trim(),
-                    &mut previous,
-                    "classic histogram buckets",
-                    &mut self.pending_text,
-                )?;
-                has_infinity |= bound.resolve(&self.pending_text) == "+Inf";
-                self.push_pending(&family, "_bucket", Some((BUCKET_LABEL, bound)), count);
-            }
-            if !has_infinity {
-                return Err("classic histogram buckets must include a +Inf threshold".to_owned());
-            }
+            self.pending
+                .push_bounds(&family, &QUANTILES, fields.quantile)?;
+        } else if !self.pending.push_bounds(&family, &BUCKETS, fields.bucket)? {
+            return Err("classic histogram buckets must include a +Inf threshold".to_owned());
         }
-        self.pending_index = 1;
+        self.pending.advance();
         Ok(Entry::Series)
-    }
-
-    /// Queues a flat series named `family` + `suffix` with Go's `appendSeriesBytes` identity.
-    fn push_pending(
-        &mut self,
-        family: &str,
-        suffix: &str,
-        injected: Option<(&'static str, PendingText<'a>)>,
-        value: f64,
-    ) {
-        let name_start = self.pending_text.len();
-        self.pending_text.push_str(family);
-        self.pending_text.push_str(suffix);
-        let name = name_start..self.pending_text.len();
-        let series_start = self.pending_series.len();
-        // `line_labels` is sorted and "__name__" sorts before "le" and "quantile", so merging
-        // the two keeps Go's sorted label order without sorting per series.
-        let mut special = [(METRIC_NAME_LABEL, &self.pending_text[name.clone()])]
-            .into_iter()
-            .chain(
-                injected
-                    .as_ref()
-                    .map(|(label, text)| (*label, text.resolve(&self.pending_text))),
-            )
-            .peekable();
-        let out = &mut self.pending_series;
-        for (label, label_value) in &self.line_labels {
-            while let Some((special_label, special_value)) =
-                special.next_if(|(special_label, _)| *special_label <= label.as_ref())
-            {
-                append_series_label(out, special_label, special_value);
-            }
-            append_series_label(out, label, label_value);
-        }
-        for (special_label, special_value) in special {
-            append_series_label(out, special_label, special_value);
-        }
-        self.pending.push(PendingSeries {
-            series: ByteSpan::new(series_start, self.pending_series.len()),
-            name,
-            injected,
-            value,
-        });
     }
 
     /// Go's `buildNativeHistogram`, including `Validate`.
@@ -561,114 +595,50 @@ impl<'a> OpenMetrics2Parser<'a> {
         if !(-4..=8).contains(&schema) {
             return Err(format!("schema must be between -4 and 8, got {schema}"));
         }
-        let (count, sum) = if gauge {
-            (
-                required(fields.gcount, "gcount")?,
-                required(fields.gsum, "gsum")?,
-            )
-        } else {
-            (
-                required(fields.count, "count")?,
-                required(fields.sum, "sum")?,
-            )
-        };
-        let count = go_float(count)?;
-        let sum = go_float(sum)?;
-        let zero_threshold = go_float(required(fields.zero_threshold, "zero_threshold")?)?;
+        let [(count_key, _, count), (sum_key, _, sum)] = fields.count_and_sum(gauge);
+        let count = required_float(count, count_key)?;
+        let sum = required_float(sum, sum_key)?;
+        let zero_threshold = required_float(fields.zero_threshold, "zero_threshold")?;
         if !zero_threshold.is_finite() || zero_threshold < 0.0 {
             return Err(format!(
                 "zero_threshold must be a non-negative, finite number, got {zero_threshold}"
             ));
         }
-        let zero_count = go_float(required(fields.zero_count, "zero_count")?)?;
-        let positive_buckets = fields.positive_buckets.unwrap_or_default();
-        let negative_buckets = fields.negative_buckets.unwrap_or_default();
+        let zero_count = required_float(fields.zero_count, "zero_count")?;
         // Like Go, any non-integer count or a bucket with a decimal point or exponent makes it
         // a float histogram.
-        let has_float = |buckets: &str| buckets.contains(['.', 'e', 'E']);
+        let has_float =
+            |buckets: Option<&str>| buckets.unwrap_or_default().contains(['.', 'e', 'E']);
         self.float_histogram_kind = count != count.trunc()
             || zero_count != zero_count.trunc()
-            || has_float(positive_buckets)
-            || has_float(negative_buckets);
-        let counter_reset_hint = if gauge {
-            CounterResetHint::Gauge
-        } else {
-            CounterResetHint::Unknown
+            || has_float(fields.positive_buckets)
+            || has_float(fields.negative_buckets);
+        let header = NativeHeader {
+            counter_reset_hint: if gauge {
+                CounterResetHint::Gauge
+            } else {
+                CounterResetHint::Unknown
+            },
+            schema: schema as i32,
+            zero_threshold,
+            sum,
         };
-        let positive_spans = fields.positive_spans.unwrap_or_default();
-        let negative_spans = fields.negative_spans.unwrap_or_default();
         if self.float_histogram_kind {
             let histogram = &mut self.float_histogram;
-            parse_spans(positive_spans, &mut histogram.positive_spans)?;
-            parse_spans(negative_spans, &mut histogram.negative_spans)?;
-            parse_buckets(positive_buckets, &mut histogram.positive_buckets, go_float)?;
-            parse_buckets(negative_buckets, &mut histogram.negative_buckets, go_float)?;
-            histogram.counter_reset_hint = counter_reset_hint;
-            histogram.schema = schema as i32;
-            histogram.zero_threshold = zero_threshold;
+            fill_histogram(histogram, fields, &header, go_float)?;
             histogram.zero_count = zero_count;
             histogram.count = count;
-            histogram.sum = sum;
-            check_spans(&histogram.positive_spans, histogram.positive_buckets.len())?;
-            check_spans(&histogram.negative_spans, histogram.negative_buckets.len())?;
-            let negative_count = histogram
-                .negative_buckets
-                .iter()
-                .any(|&bucket| bucket < 0.0);
-            let positive_count = histogram
-                .positive_buckets
-                .iter()
-                .any(|&bucket| bucket < 0.0);
-            if negative_count || positive_count || zero_count < 0.0 || count < 0.0 {
-                return Err("histogram has a negative observation count".to_owned());
-            }
-            return Ok(());
+            return check_float_counts(histogram);
         }
         let histogram = &mut self.int_histogram;
-        parse_spans(positive_spans, &mut histogram.positive_spans)?;
-        parse_spans(negative_spans, &mut histogram.negative_spans)?;
-        parse_buckets(positive_buckets, &mut histogram.positive_buckets, go_int)?;
-        parse_buckets(negative_buckets, &mut histogram.negative_buckets, go_int)?;
-        histogram.counter_reset_hint = counter_reset_hint;
-        histogram.schema = schema as i32;
-        histogram.zero_threshold = zero_threshold;
+        fill_histogram(histogram, fields, &header, go_int)?;
         // NOTE: Rust saturates out-of-range casts, Go's uint64() is platform-specific there.
         histogram.zero_count = zero_count as u64;
         histogram.count = count as u64;
-        histogram.sum = sum;
-        check_spans(&histogram.positive_spans, histogram.positive_buckets.len())?;
-        check_spans(&histogram.negative_spans, histogram.negative_buckets.len())?;
-        let mut observations = histogram.zero_count;
-        for &bucket in histogram
-            .negative_buckets
-            .iter()
-            .chain(&histogram.positive_buckets)
-        {
-            if bucket < 0 {
-                return Err(format!("bucket has observation count of {bucket}"));
-            }
-            observations = observations.wrapping_add(bucket as u64);
-        }
-        let count_too_small = if sum.is_nan() {
-            observations > histogram.count
-        } else {
-            observations != histogram.count
-        };
-        if count_too_small {
-            return Err(format!(
-                "{observations} observations found in buckets, but the Count field is {}",
-                histogram.count
-            ));
-        }
+        check_int_counts(histogram)?;
         absolute_to_deltas(&mut histogram.positive_buckets);
         absolute_to_deltas(&mut histogram.negative_buckets);
         Ok(())
-    }
-
-    fn pending_series(&self) -> Option<&PendingSeries<'a>> {
-        self.pending_index
-            .checked_sub(1)
-            .and_then(|index| self.pending.get(index))
     }
 }
 
@@ -677,21 +647,14 @@ impl<'a> Parser<'a> for OpenMetrics2Parser<'a> {
         if self.done {
             return Ok(None);
         }
-        if self.pending_index < self.pending.len() {
-            self.pending_index += 1;
+        if self.pending.advance() {
             return Ok(Some(Entry::Series));
         }
         self.pending.clear();
-        self.pending_index = 0;
-        self.line_labels.clear();
-        self.pending_text.clear();
-        self.pending_series.clear();
+        self.exemplars.clear();
         self.line_start = self.lexer.pos;
         self.name = None;
         self.labels.clear();
-        self.exemplars.clear();
-        self.exemplar_labels.clear();
-        self.exemplar_index = 0;
         self.timestamp = None;
         self.start_timestamp = None;
         let entry = match self.lexer.lex() {
@@ -733,11 +696,11 @@ impl<'a> Parser<'a> for OpenMetrics2Parser<'a> {
     }
 
     fn series(&self) -> (&[u8], Option<i64>, f64) {
-        match self.pending_series() {
-            Some(pending) => (
-                &self.pending_series[pending.series.start..pending.series.end],
+        match self.pending.current() {
+            Some(entry) => (
+                self.pending.series_bytes(entry),
                 self.timestamp,
-                pending.value,
+                entry.value,
             ),
             None => (self.bytes(self.series), self.timestamp, self.value),
         }
@@ -754,37 +717,17 @@ impl<'a> Parser<'a> for OpenMetrics2Parser<'a> {
 
     fn labels(&self, buf: &mut LabelsBuffer<'a>) {
         buf.clear();
-        if let Some(pending) = self.pending_series() {
-            // LabelsBuffer borrows only from the input, so the `__name__` and formatted bound
-            // that live in `pending_text` are copied.
-            let name = &self.pending_text[pending.name.clone()];
-            buf.push(
-                Cow::Borrowed(METRIC_NAME_LABEL),
-                Cow::Owned(name.to_owned()),
-            );
-            for (name, value) in &self.line_labels {
-                buf.push(name.clone(), value.clone());
-            }
-            if let Some((label, text)) = &pending.injected {
-                let value = match text {
-                    PendingText::Input(text) => Cow::Borrowed(*text),
-                    PendingText::Arena(range) => {
-                        Cow::Owned(self.pending_text[range.clone()].to_owned())
-                    }
-                };
-                buf.push(Cow::Borrowed(label), value);
-            }
-            buf.sort();
+        if let Some(entry) = self.pending.current() {
+            self.pending.write_labels(entry, buf);
             return;
         }
         let name = std::str::from_utf8(self.metric_name()).unwrap_or_default();
         buf.push(Cow::Borrowed(METRIC_NAME_LABEL), unescape_label(name));
         let input = self.lexer.input;
-        let text = |start, end| std::str::from_utf8(&input[start..end]).unwrap_or_default();
         for span in &self.labels {
-            let name = unescape_label(text(span.name_start, span.name_end));
-            let value = unescape_label(text(span.val_start, span.val_end));
-            let value = normalize_float_label(self.metric_type, &name, value);
+            let name = unescape_label(span.name(input));
+            let value =
+                normalize_float_label(self.metric_type, &name, unescape_label(span.value(input)));
             buf.push(name, value);
         }
         buf.sort();
@@ -792,15 +735,14 @@ impl<'a> Parser<'a> for OpenMetrics2Parser<'a> {
 
     fn exemplar(&mut self, buf: &mut LabelsBuffer<'a>) -> Option<(f64, Option<i64>)> {
         buf.clear();
-        let exemplar = self.exemplars.get(self.exemplar_index)?;
-        self.exemplar_index += 1;
+        let exemplar = self.exemplars.entries.get(self.exemplars.next)?;
+        self.exemplars.next += 1;
         let input = self.lexer.input;
-        let text = |start, end| std::str::from_utf8(&input[start..end]).unwrap_or_default();
         // Go keeps exemplar label names escaped and unescapes only the values.
-        for span in &self.exemplar_labels[exemplar.labels.clone()] {
+        for span in &self.exemplars.labels[exemplar.labels.clone()] {
             buf.push(
-                Cow::Borrowed(text(span.name_start, span.name_end)),
-                unescape_label(text(span.val_start, span.val_end)),
+                Cow::Borrowed(span.name(input)),
+                unescape_label(span.value(input)),
             );
         }
         buf.sort();
@@ -869,6 +811,101 @@ impl<'v> CompositeFields<'v> {
         }
         Ok(fields)
     }
+
+    /// The count and sum as `(key, series suffix, value)`. Gauge histograms use `gcount` and
+    /// `gsum`, like Go.
+    fn count_and_sum(&self, gauge: bool) -> [(&'static str, &'static str, Option<&'v str>); 2] {
+        if gauge {
+            [
+                ("gcount", "_gcount", self.gcount),
+                ("gsum", "_gsum", self.gsum),
+            ]
+        } else {
+            [("count", "_count", self.count), ("sum", "_sum", self.sum)]
+        }
+    }
+}
+
+/// The scalar fields that int and float native histograms share.
+struct NativeHeader {
+    counter_reset_hint: CounterResetHint,
+    schema: i32,
+    zero_threshold: f64,
+    sum: f64,
+}
+
+/// Fills the parts of a native histogram that do not depend on its count type, and checks
+/// the spans against the buckets.
+fn fill_histogram<C, B>(
+    histogram: &mut Histogram<C, B>,
+    fields: &CompositeFields<'_>,
+    header: &NativeHeader,
+    parse_bucket: impl Fn(&str) -> Result<B, String>,
+) -> Result<(), String> {
+    histogram.counter_reset_hint = header.counter_reset_hint;
+    histogram.schema = header.schema;
+    histogram.zero_threshold = header.zero_threshold;
+    histogram.sum = header.sum;
+    parse_spans(
+        fields.positive_spans.unwrap_or_default(),
+        &mut histogram.positive_spans,
+    )?;
+    parse_spans(
+        fields.negative_spans.unwrap_or_default(),
+        &mut histogram.negative_spans,
+    )?;
+    parse_buckets(
+        fields.positive_buckets.unwrap_or_default(),
+        &mut histogram.positive_buckets,
+        &parse_bucket,
+    )?;
+    parse_buckets(
+        fields.negative_buckets.unwrap_or_default(),
+        &mut histogram.negative_buckets,
+        &parse_bucket,
+    )?;
+    check_spans(&histogram.positive_spans, histogram.positive_buckets.len())?;
+    check_spans(&histogram.negative_spans, histogram.negative_buckets.len())
+}
+
+/// Go's `FloatHistogram.Validate` count checks.
+fn check_float_counts(histogram: &Histogram<f64, f64>) -> Result<(), String> {
+    let negative_bucket = histogram
+        .negative_buckets
+        .iter()
+        .chain(&histogram.positive_buckets)
+        .any(|&bucket| bucket < 0.0);
+    if negative_bucket || histogram.zero_count < 0.0 || histogram.count < 0.0 {
+        return Err("histogram has a negative observation count".to_owned());
+    }
+    Ok(())
+}
+
+/// Go's `Histogram.Validate` count checks, on absolute bucket counts.
+fn check_int_counts(histogram: &Histogram<u64, i64>) -> Result<(), String> {
+    let mut observations = histogram.zero_count;
+    for &bucket in histogram
+        .negative_buckets
+        .iter()
+        .chain(&histogram.positive_buckets)
+    {
+        if bucket < 0 {
+            return Err(format!("bucket has observation count of {bucket}"));
+        }
+        observations = observations.wrapping_add(bucket as u64);
+    }
+    let count_too_small = if histogram.sum.is_nan() {
+        observations > histogram.count
+    } else {
+        observations != histogram.count
+    };
+    if count_too_small {
+        return Err(format!(
+            "{observations} observations found in buckets, but the Count field is {}",
+            histogram.count
+        ));
+    }
+    Ok(())
 }
 
 /// Go's `splitCompositeFields`: splits at commas outside `[]` and `()`.
@@ -888,15 +925,16 @@ fn required<'v>(field: Option<&'v str>, key: &str) -> Result<&'v str, String> {
     field.ok_or_else(|| format!("missing required field: {key}"))
 }
 
+fn required_float(field: Option<&str>, key: &str) -> Result<f64, String> {
+    go_float(required(field, key)?)
+}
+
 /// Go's `strconv.ParseFloat`, with Go's NaN bit pattern.
 // NOTE: Go also accepts hex floats here, like `0x1p3`; we reject them.
 fn go_float(text: &str) -> Result<f64, String> {
-    let value = parse_go_float(text).ok_or_else(|| format!("invalid float {text:?}"))?;
-    Ok(if value.is_nan() {
-        f64::from_bits(NORMAL_NAN)
-    } else {
-        value
-    })
+    parse_go_float(text)
+        .map(normalize_nan)
+        .ok_or_else(|| format!("invalid float {text:?}"))
 }
 
 /// Go's base 10 `strconv.ParseInt`.
