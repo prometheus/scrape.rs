@@ -49,11 +49,7 @@ where
 #[serde(deny_unknown_fields)]
 pub struct StaticConfig {
     /// List of target `"<host>:<port>"` addresses.
-    #[serde(
-        default,
-        deserialize_with = "deserialize_null_default",
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub targets: Vec<String>,
     /// Labels assigned to all targets in the group.
     #[serde(

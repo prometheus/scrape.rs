@@ -114,7 +114,7 @@ fn static_configs_and_target_group_serde_match_prometheus() {
     }
     assert_eq!(
         serde_json::to_string(&StaticConfig::default()).unwrap(),
-        "{}"
+        r#"{"targets":[]}"#
     );
     assert_eq!(
         serde_json::to_string(&DiscoveryConfigs::default()).unwrap(),
