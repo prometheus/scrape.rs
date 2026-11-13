@@ -1,0 +1,318 @@
+help "http_requests_total" "Total number of HTTP requests."
+type "http_requests_total" counter
+unit "http_requests_total" "requests"
+series "http_requests_total{method=\"GET\",status=\"200\"}" 40c7810000000000 1710000000000 "__name__"="http_requests_total" "method"="GET" "status"="200"
+exemplar 3ff0000000000000 1709999999500 "trace_id"="t-001"
+st 0
+series "http_requests_total{method=\"GET\",status=\"404\"}" 4055c00000000000 1710000000000 "__name__"="http_requests_total" "method"="GET" "status"="404"
+st 0
+series "http_requests_total{method=\"GET\",status=\"500\"}" 4028000000000000 1710000000000 "__name__"="http_requests_total" "method"="GET" "status"="500"
+st 0
+series "http_requests_total{method=\"POST\",status=\"200\"}" 40b1a90000000000 1710000000000 "__name__"="http_requests_total" "method"="POST" "status"="200"
+exemplar 3ff0000000000000 1709999999700 "trace_id"="t-002"
+st 0
+series "http_requests_total{method=\"POST\",status=\"404\"}" 4022000000000000 1710000000000 "__name__"="http_requests_total" "method"="POST" "status"="404"
+st 0
+series "http_requests_total{method=\"POST\",status=\"500\"}" 403f000000000000 1710000000000 "__name__"="http_requests_total" "method"="POST" "status"="500"
+st 0
+help "grpc_calls_total" "Total number of gRPC calls."
+type "grpc_calls_total" counter
+series "grpc_calls_total{service=\"catalog\"}" 40d2c88000000000 1710000000000 "__name__"="grpc_calls_total" "service"="catalog"
+st 0
+series "grpc_calls_total{service=\"orders\"}" 40c0138000000000 1710000000000 "__name__"="grpc_calls_total" "service"="orders"
+st 0
+series "grpc_calls_total{service=\"payments\"}" 40b5ec0000000000 1710000000000 "__name__"="grpc_calls_total" "service"="payments"
+st 0
+help "db_queries_total" "Total number of database queries."
+type "db_queries_total" counter
+series "db_queries_total" 411d797800000000 1710000000000 "__name__"="db_queries_total"
+st 0
+help "cache_hits_total" "Total number of cache hits."
+type "cache_hits_total" counter
+series "cache_hits_total" 412c21cc00000000 1710000000000 "__name__"="cache_hits_total"
+st 0
+help "cache_misses_total" "Total number of cache misses."
+type "cache_misses_total" counter
+series "cache_misses_total" 40df718000000000 1710000000000 "__name__"="cache_misses_total"
+st 0
+help "errors_total" "Total number of errors by code."
+type "errors_total" counter
+series "errors_total{code=\"EINVAL\"}" 4037000000000000 1710000000000 "__name__"="errors_total" "code"="EINVAL"
+st 0
+series "errors_total{code=\"ETIMEDOUT\"}" 401c000000000000 1710000000000 "__name__"="errors_total" "code"="ETIMEDOUT"
+st 0
+series "errors_total{code=\"ECONNRESET\"}" 402c000000000000 1710000000000 "__name__"="errors_total" "code"="ECONNRESET"
+st 0
+series "errors_total{code=\"EIO\"}" 4000000000000000 1710000000000 "__name__"="errors_total" "code"="EIO"
+st 0
+help "network_received_bytes_total" "Total bytes received."
+type "network_received_bytes_total" counter
+unit "network_received_bytes_total" "bytes"
+series "network_received_bytes_total" 4236e322f7000000 1710000000000 "__name__"="network_received_bytes_total"
+st 0
+help "network_sent_bytes_total" "Total bytes sent."
+type "network_sent_bytes_total" counter
+unit "network_sent_bytes_total" "bytes"
+series "network_sent_bytes_total" 423d91ca36000000 1710000000000 "__name__"="network_sent_bytes_total"
+st 0
+help "jobs_completed_total" "Total number of jobs completed."
+type "jobs_completed_total" counter
+series "jobs_completed_total" 40d1ce8000000000 1710000000000 "__name__"="jobs_completed_total"
+st 0
+help "jobs_failed_total" "Total number of jobs failed."
+type "jobs_failed_total" counter
+series "jobs_failed_total" 4061c00000000000 1710000000000 "__name__"="jobs_failed_total"
+st 0
+help "signals_received_total" "Total number of signals received."
+type "signals_received_total" counter
+series "signals_received_total" 4020000000000000 1710000000000 "__name__"="signals_received_total"
+st 0
+help "gc_invocations_total" "Total number of GC invocations."
+type "gc_invocations_total" counter
+series "gc_invocations_total" 40b2d50000000000 1710000000000 "__name__"="gc_invocations_total"
+st 0
+help "allocations_total" "Total allocations by pool."
+type "allocations_total" counter
+series "allocations_total{pool=\"small\"}" 41cbbef760000000 1710000000000 "__name__"="allocations_total" "pool"="small"
+st 0
+series "allocations_total{pool=\"medium\"}" 416b159800000000 1710000000000 "__name__"="allocations_total" "pool"="medium"
+st 0
+series "allocations_total{pool=\"large\"}" 408a000000000000 1710000000000 "__name__"="allocations_total" "pool"="large"
+st 0
+help "mutex_contentions_total" "Total mutex contentions."
+type "mutex_contentions_total" counter
+series "mutex_contentions_total" 40baaf0000000000 1710000000000 "__name__"="mutex_contentions_total"
+st 0
+help "scrape_samples_total" "Total samples scraped."
+type "scrape_samples_total" counter
+series "scrape_samples_total" 40c06e0000000000 1710000000000 "__name__"="scrape_samples_total"
+st 0
+help "memory_bytes" "Memory in use by area."
+type "memory_bytes" gauge
+unit "memory_bytes" "bytes"
+series "memory_bytes{area=\"heap\"}" 41d2635620000000 1710000000000 "__name__"="memory_bytes" "area"="heap"
+st 0
+series "memory_bytes{area=\"stack\"}" 415fa97800000000 1710000000000 "__name__"="memory_bytes" "area"="stack"
+st 0
+series "memory_bytes{area=\"static\"}" 4140059000000000 1710000000000 "__name__"="memory_bytes" "area"="static"
+st 0
+help "goroutines" "Number of goroutines."
+type "goroutines" gauge
+series "goroutines" 4073800000000000 1710000000000 "__name__"="goroutines"
+st 0
+help "threads" "Number of OS threads."
+type "threads" gauge
+series "threads" 4047800000000000 1710000000000 "__name__"="threads"
+st 0
+help "file_descriptors" "Open file descriptors."
+type "file_descriptors" gauge
+series "file_descriptors" 4067000000000000 1710000000000 "__name__"="file_descriptors"
+st 0
+help "queue_depth" "Items currently queued."
+type "queue_depth" gauge
+series "queue_depth{queue=\"ingest\"}" 402c000000000000 1710000000000 "__name__"="queue_depth" "queue"="ingest"
+st 0
+series "queue_depth{queue=\"export\"}" 4008000000000000 1710000000000 "__name__"="queue_depth" "queue"="export"
+st 0
+series "queue_depth{queue=\"retry\"}" 403b000000000000 1710000000000 "__name__"="queue_depth" "queue"="retry"
+st 0
+help "active_connections" "Currently active connections."
+type "active_connections" gauge
+series "active_connections" 4079c00000000000 1710000000000 "__name__"="active_connections"
+st 0
+help "temperature_celsius" "Sensor temperature."
+type "temperature_celsius" gauge
+unit "temperature_celsius" "celsius"
+series "temperature_celsius{sensor=\"cpu0\"}" 404f333333333333 1710000000000 "__name__"="temperature_celsius" "sensor"="cpu0"
+st 0
+series "temperature_celsius{sensor=\"cpu1\"}" 4050066666666666 1710000000000 "__name__"="temperature_celsius" "sensor"="cpu1"
+st 0
+series "temperature_celsius{sensor=\"gpu\"}" 4051f33333333333 1710000000000 "__name__"="temperature_celsius" "sensor"="gpu"
+st 0
+help "request_duration_seconds" "Request duration histogram."
+type "request_duration_seconds" histogram
+unit "request_duration_seconds" "seconds"
+series "request_duration_seconds_countÿhandlerÿ/api/query" 40c0728000000000 - "__name__"="request_duration_seconds_count" "handler"="/api/query"
+st 0
+series "request_duration_seconds_sumÿhandlerÿ/api/query" 40934a0000000000 - "__name__"="request_duration_seconds_sum" "handler"="/api/query"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.005" 405e000000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.005"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.01" 4081800000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.01"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.025" 40a0680000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.025"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.05" 40b4be0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.05"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.1" 40bc200000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.1"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.25" 40bfa40000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.25"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.5" 40c04f0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.5"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ1.0" 40c06d0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="1.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ2.5" 40c0720000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="2.5"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ5.0" 40c0728000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="5.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ10.0" 40c0728000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="10.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ+Inf" 40c0728000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="+Inf"
+st 0
+series "request_duration_seconds_countÿhandlerÿ/api/write" 40b0720000000000 - "__name__"="request_duration_seconds_count" "handler"="/api/write"
+st 0
+series "request_duration_seconds_sumÿhandlerÿ/api/write" 4080026666666666 - "__name__"="request_duration_seconds_sum" "handler"="/api/write"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.005" 4054000000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.005"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.01" 4073800000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.01"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.025" 4091300000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.025"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.05" 40a2c00000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.05"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.1" 40adb00000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.1"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.25" 40b0040000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.25"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.5" 40b0540000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.5"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ1.0" 40b06d0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="1.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ2.5" 40b0720000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="2.5"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ5.0" 40b0720000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="5.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ10.0" 40b0720000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="10.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ+Inf" 40b0720000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="+Inf"
+st 0
+series "request_duration_seconds_countÿhandlerÿ/api/health" 40fd4c0000000000 - "__name__"="request_duration_seconds_count" "handler"="/api/health"
+st 0
+series "request_duration_seconds_sumÿhandlerÿ/api/health" 404819999999999a - "__name__"="request_duration_seconds_sum" "handler"="/api/health"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ0.005" 40fd3f8000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="0.005"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ0.01" 40fd4ac000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="0.01"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ0.025" 40fd4bf000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="0.025"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ0.05" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="0.05"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ0.1" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="0.1"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ0.25" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="0.25"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ0.5" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="0.5"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ1.0" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="1.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ2.5" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="2.5"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ5.0" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="5.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ10.0" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="10.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ+Inf" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="+Inf"
+st 0
+help "response_size_bytes" "Response size histogram."
+type "response_size_bytes" histogram
+unit "response_size_bytes" "bytes"
+series "response_size_bytes_count" 40c32e8000000000 - "__name__"="response_size_bytes_count"
+st 0
+series "response_size_bytes_sum" 41d25413e0000000 - "__name__"="response_size_bytes_sum"
+st 0
+series "response_size_bytes_bucketÿleÿ128.0" 4072c00000000000 - "__name__"="response_size_bytes_bucket" "le"="128.0"
+st 0
+series "response_size_bytes_bucketÿleÿ512.0" 409c200000000000 - "__name__"="response_size_bytes_bucket" "le"="512.0"
+st 0
+series "response_size_bytes_bucketÿleÿ2048.0" 40b0680000000000 - "__name__"="response_size_bytes_bucket" "le"="2048.0"
+st 0
+series "response_size_bytes_bucketÿleÿ8192.0" 40bbbc0000000000 - "__name__"="response_size_bytes_bucket" "le"="8192.0"
+st 0
+series "response_size_bytes_bucketÿleÿ32768.0" 40c1c60000000000 - "__name__"="response_size_bytes_bucket" "le"="32768.0"
+st 0
+series "response_size_bytes_bucketÿleÿ131072.0" 40c3240000000000 - "__name__"="response_size_bytes_bucket" "le"="131072.0"
+st 0
+series "response_size_bytes_bucketÿleÿ524288.0" 40c32e8000000000 - "__name__"="response_size_bytes_bucket" "le"="524288.0"
+st 0
+series "response_size_bytes_bucketÿleÿ+Inf" 40c32e8000000000 - "__name__"="response_size_bytes_bucket" "le"="+Inf"
+st 0
+help "db_query_duration_seconds" "Database query duration."
+type "db_query_duration_seconds" histogram
+unit "db_query_duration_seconds" "seconds"
+series "db_query_duration_seconds_count" 411d797800000000 - "__name__"="db_query_duration_seconds_count"
+st 0
+series "db_query_duration_seconds_sum" 40a860cccccccccd - "__name__"="db_query_duration_seconds_sum"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ0.001" 40fd4c0000000000 - "__name__"="db_query_duration_seconds_bucket" "le"="0.001"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ0.005" 4117318000000000 - "__name__"="db_query_duration_seconds_bucket" "le"="0.005"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ0.01" 411b292000000000 - "__name__"="db_query_duration_seconds_bucket" "le"="0.01"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ0.05" 411d2cc000000000 - "__name__"="db_query_duration_seconds_bucket" "le"="0.05"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ0.1" 411d6b4000000000 - "__name__"="db_query_duration_seconds_bucket" "le"="0.1"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ0.5" 411d77c000000000 - "__name__"="db_query_duration_seconds_bucket" "le"="0.5"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ1.0" 411d797800000000 - "__name__"="db_query_duration_seconds_bucket" "le"="1.0"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ+Inf" 411d797800000000 - "__name__"="db_query_duration_seconds_bucket" "le"="+Inf"
+st 0
+help "gc_duration_seconds" "GC duration summary."
+type "gc_duration_seconds" summary
+unit "gc_duration_seconds" "seconds"
+series "gc_duration_seconds_count" 40b2d50000000000 - "__name__"="gc_duration_seconds_count"
+st 0
+series "gc_duration_seconds_sum" 4028cccccccccccd - "__name__"="gc_duration_seconds_sum"
+st 0
+series "gc_duration_secondsÿquantileÿ0.5" 3f62d77318fc5048 - "__name__"="gc_duration_seconds" "quantile"="0.5"
+st 0
+series "gc_duration_secondsÿquantileÿ0.9" 3f8096bb98c7e282 - "__name__"="gc_duration_seconds" "quantile"="0.9"
+st 0
+series "gc_duration_secondsÿquantileÿ0.99" 3f8db22d0e560419 - "__name__"="gc_duration_seconds" "quantile"="0.99"
+st 0
+series "gc_duration_secondsÿquantileÿ1.0" 3f9ff2e48e8a71de - "__name__"="gc_duration_seconds" "quantile"="1.0"
+st 0
+help "allocation_duration_seconds" "Allocation duration summary."
+type "allocation_duration_seconds" summary
+unit "allocation_duration_seconds" "seconds"
+series "allocation_duration_seconds_countÿpoolÿsmall" 41cbbef760000000 - "__name__"="allocation_duration_seconds_count" "pool"="small"
+st 0
+series "allocation_duration_seconds_sumÿpoolÿsmall" 4061c9999999999a - "__name__"="allocation_duration_seconds_sum" "pool"="small"
+st 0
+series "allocation_duration_secondsÿpoolÿsmallÿquantileÿ0.5" 3f1f75104d551d69 - "__name__"="allocation_duration_seconds" "pool"="small" "quantile"="0.5"
+st 0
+series "allocation_duration_secondsÿpoolÿsmallÿquantileÿ0.9" 3f364840e1719f80 - "__name__"="allocation_duration_seconds" "pool"="small" "quantile"="0.9"
+st 0
+series "allocation_duration_secondsÿpoolÿsmallÿquantileÿ0.99" 3f4dd1a21ea35936 - "__name__"="allocation_duration_seconds" "pool"="small" "quantile"="0.99"
+st 0
+series "allocation_duration_seconds_countÿpoolÿmedium" 416b159800000000 - "__name__"="allocation_duration_seconds_count" "pool"="medium"
+st 0
+series "allocation_duration_seconds_sumÿpoolÿmedium" 4055066666666666 - "__name__"="allocation_duration_seconds_sum" "pool"="medium"
+st 0
+series "allocation_duration_secondsÿpoolÿmediumÿquantileÿ0.5" 3f3adea897635e74 - "__name__"="allocation_duration_seconds" "pool"="medium" "quantile"="0.5"
+st 0
+series "allocation_duration_secondsÿpoolÿmediumÿquantileÿ0.9" 3f53a92a30553261 - "__name__"="allocation_duration_seconds" "pool"="medium" "quantile"="0.9"
+st 0
+series "allocation_duration_secondsÿpoolÿmediumÿquantileÿ0.99" 3f6bda5119ce075f - "__name__"="allocation_duration_seconds" "pool"="medium" "quantile"="0.99"
+st 0
+help "build_info" "Build information."
+type "build_info" info
+series "build_info{version=\"2.51.0\",revision=\"abc123\",branch=\"main\"}" 3ff0000000000000 - "__name__"="build_info" "branch"="main" "revision"="abc123" "version"="2.51.0"
+st 0
+help "feature_flags" "Feature flag stateset."
+type "feature_flags" stateset
+series "feature_flags{feature_flags=\"native_histograms\"}" 3ff0000000000000 - "__name__"="feature_flags" "feature_flags"="native_histograms"
+st 0
+series "feature_flags{feature_flags=\"exemplar_storage\"}" 3ff0000000000000 - "__name__"="feature_flags" "feature_flags"="exemplar_storage"
+st 0
+series "feature_flags{feature_flags=\"otlp_receiver\"}" 0000000000000000 - "__name__"="feature_flags" "feature_flags"="otlp_receiver"
+st 0
+help "legacy_metric" "Legacy metric of unknown type."
+type "legacy_metric" unknown
+series "legacy_metric" 4045000000000000 - "__name__"="legacy_metric"
+st 0

@@ -1,0 +1,4 @@
+help "test_histogram" "Native histogram."
+type "test_histogram" histogram
+histogram "test_histogram" - int schema=0 count=6 sum=4028333333333333 zero_threshold=3f50624dd2f1a9fc zero_count=2 hint=0 pos_spans=[0:3] pos=[1,1,-1] neg_spans=[] neg=[] "__name__"="test_histogram"
+st 0

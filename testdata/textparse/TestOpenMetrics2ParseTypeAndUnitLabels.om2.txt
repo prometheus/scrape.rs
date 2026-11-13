@@ -1,0 +1,7 @@
+# TYPE process_open_fds gauge
+# UNIT process_open_fds fds
+process_open_fds 8.0
+# TYPE rpc_duration_seconds summary
+# UNIT rpc_duration_seconds seconds
+rpc_duration_seconds {count:10,sum:5.0,quantile:[0.5:1.0]}
+# EOF

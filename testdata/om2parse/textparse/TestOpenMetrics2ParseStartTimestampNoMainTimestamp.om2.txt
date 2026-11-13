@@ -1,0 +1,3 @@
+type "requests_total" counter
+series "requests_total" 4045000000000000 - "__name__"="requests_total"
+st 500000000

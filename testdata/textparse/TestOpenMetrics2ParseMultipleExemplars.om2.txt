@@ -1,0 +1,3 @@
+# TYPE foo_total counter
+foo_total 17.0 # {id="a"} 1.0 1234566.0 # {id="b"} 2.0 1234567.0
+# EOF

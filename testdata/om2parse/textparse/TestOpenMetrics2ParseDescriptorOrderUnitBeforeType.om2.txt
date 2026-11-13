@@ -1,0 +1,4 @@
+unit "http_requests" "requests"
+type "http_requests" counter
+series "http_requests" 3ff0000000000000 - "__name__"="http_requests"
+st 0

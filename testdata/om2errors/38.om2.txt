@@ -1,0 +1,3 @@
+# TYPE ss stateset
+ss{ss="foo"} 2
+# EOF

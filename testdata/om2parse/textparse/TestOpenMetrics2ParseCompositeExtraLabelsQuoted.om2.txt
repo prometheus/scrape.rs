@@ -1,0 +1,7 @@
+type "foo" summary
+series "foo_countÿuser.idÿx" 3ff0000000000000 - "__name__"="foo_count" "user.id"="x"
+st 0
+series "foo_sumÿuser.idÿx" 4000000000000000 - "__name__"="foo_sum" "user.id"="x"
+st 0
+series "fooÿquantileÿ0.5ÿuser.idÿx" 3ff0000000000000 - "__name__"="foo" "quantile"="0.5" "user.id"="x"
+st 0

@@ -12,13 +12,16 @@
 // limitations under the License.
 
 //! Compares Layer 0 parser output with Go's `textparse` output stored in `testdata/promparse`,
-//! `testdata/omparse`, and `testdata/protobufparse`.
+//! `testdata/omparse`, `testdata/om2parse`, and `testdata/protobufparse`.
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::{Entry, HistogramRef, LabelsBuffer, OpenMetricsParser, Parser, PromParser, Span};
+use super::{
+    Entry, HistogramRef, LabelsBuffer, OpenMetrics2Parser, OpenMetricsParser, ParseError, Parser,
+    PromParser, Span,
+};
 
 fn quote(out: &mut Vec<u8>, bytes: &[u8]) {
     out.push(b'"');
@@ -227,6 +230,72 @@ fn matches_go_openmetricsparse_output() {
     assert_matches_go("omparse", |input| {
         render(OpenMetricsParser::new(input), true)
     });
+}
+
+#[test]
+fn matches_go_openmetrics2parse_output() {
+    assert_matches_go("om2parse", |input| {
+        render(OpenMetrics2Parser::new(input), true)
+    });
+}
+
+/// The `.om2.txt` inputs under `testdata/<dir>/`, sorted.
+fn om2_inputs(root: &Path, dir: &str) -> Vec<PathBuf> {
+    let mut inputs: Vec<PathBuf> = fs::read_dir(root.join(dir))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.to_string_lossy().ends_with(".om2.txt"))
+        .collect();
+    inputs.sort();
+    inputs
+}
+
+#[test]
+fn every_openmetrics2_input_has_go_output() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata");
+    for dir in ["textparse", "om2errors"] {
+        for input in om2_inputs(&root, dir) {
+            let expected = root
+                .join("om2parse")
+                .join(input.strip_prefix(&root).unwrap());
+            assert!(expected.exists(), "no Go output for {}", input.display());
+        }
+    }
+}
+
+#[test]
+fn openmetrics2_errors_match_go_reason() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata");
+    let inputs = om2_inputs(&root, "om2errors");
+    assert!(!inputs.is_empty(), "no inputs in testdata/om2errors");
+    for path in inputs {
+        let want = fs::read_to_string(path.with_extension("").with_extension("err")).unwrap();
+        let input = fs::read(&path).unwrap();
+        let mut parser = OpenMetrics2Parser::new(&input);
+        let err = loop {
+            match parser.next_entry() {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("{}: no error, Go fails with {want:?}", path.display()),
+                Err(err) => break err,
+            }
+        };
+        // These ParseError variants are shared by every parser and do not carry Go's wording.
+        let same_reason = match want.as_str() {
+            "invalid UTF-8 metric name" | "invalid UTF-8 label name" => {
+                matches!(err, ParseError::InvalidUtf8 { .. })
+            }
+            "metric name must not be empty"
+            | "metric name must be the first item in the label set" => {
+                matches!(err, ParseError::InvalidMetricName { .. })
+            }
+            _ => err.to_string().contains(&want),
+        };
+        assert!(
+            same_reason,
+            "{}: got {err}, Go fails with {want:?}",
+            path.display()
+        );
+    }
 }
 
 #[cfg(feature = "dto")]

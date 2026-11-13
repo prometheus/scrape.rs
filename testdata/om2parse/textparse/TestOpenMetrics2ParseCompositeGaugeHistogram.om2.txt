@@ -1,0 +1,3 @@
+type "req_size" gaugehistogram
+histogram "req_size" - int schema=0 count=6 sum=4059000000000000 zero_threshold=3f50624dd2f1a9fc zero_count=1 hint=3 pos_spans=[0:2] pos=[3,-1] neg_spans=[] neg=[] "__name__"="req_size"
+st 0

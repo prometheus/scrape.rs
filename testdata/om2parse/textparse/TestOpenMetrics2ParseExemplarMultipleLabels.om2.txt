@@ -1,0 +1,4 @@
+type "http_requests_total" counter
+series "http_requests_total" 40900c0000000000 1710000000000 "__name__"="http_requests_total"
+exemplar 3ff0000000000000 1709999999000 "span_id"="def456" "trace_id"="abc123"
+st 0

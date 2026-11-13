@@ -11,8 +11,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Lexer for the OpenMetrics 1.0 text format, a hand-written port of
-//! [`openmetricslex.l`](https://github.com/prometheus/prometheus/blob/main/model/textparse/openmetricslex.l).
+//! Lexer for the OpenMetrics 1.0 and 2.0 text formats, a hand-written port of
+//! [`openmetricslex.l`](https://github.com/prometheus/prometheus/blob/main/model/textparse/openmetricslex.l)
+//! and [`openmetrics2lex.l`](https://github.com/prometheus/prometheus/blob/v0.315.1/model/textparse/openmetrics2lex.l),
+//! which adds `st@` start timestamps and several exemplars per line.
 
 use super::ByteSpan;
 
@@ -63,6 +65,7 @@ pub(super) enum Token {
     Equal,
     Value,
     Timestamp,
+    StartTimestamp,
     Comment,
 }
 
@@ -95,6 +98,7 @@ pub(super) struct Lexer<'a> {
     pub(super) pos: usize,
     pub(super) token_start: usize,
     state: State,
+    openmetrics2: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -104,6 +108,14 @@ impl<'a> Lexer<'a> {
             pos: 0,
             token_start: 0,
             state: State::Init,
+            openmetrics2: false,
+        }
+    }
+
+    pub(super) fn new_openmetrics2(input: &'a [u8]) -> Self {
+        Self {
+            openmetrics2: true,
+            ..Self::new(input)
         }
     }
 
@@ -123,6 +135,7 @@ impl<'a> Lexer<'a> {
             pos: state.pos,
             token_start: state.token_start,
             state: state.state,
+            openmetrics2: false,
         }
     }
 
@@ -337,6 +350,14 @@ impl<'a> Lexer<'a> {
                 },
                 byte if is_value_char(byte) => {
                     self.eat_after(is_value_char);
+                    let token = self.token();
+                    if self.openmetrics2
+                        && self.state == State::Timestamp
+                        && token.len() > 4
+                        && token.starts_with(b" st@")
+                    {
+                        return Token::StartTimestamp;
+                    }
                     Token::Timestamp
                 }
                 _ => Token::Invalid,
@@ -368,6 +389,9 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_etimestamp(&mut self, byte: u8) -> Token {
+        if self.openmetrics2 {
+            return self.lex_timestamp(byte);
+        }
         match byte {
             b'\n' => self.emit(State::Init, Token::Linebreak),
             b' ' => self.emit_value(State::ETimestamp, Token::Timestamp),
@@ -441,6 +465,54 @@ mod tests {
                 (Token::Linebreak, b"\n"),
                 (Token::Eof, b""),
             ]
+        );
+    }
+
+    fn lex_all_openmetrics2(input: &[u8]) -> Vec<Token> {
+        let mut lexer = Lexer::new_openmetrics2(input);
+        let mut tokens = Vec::new();
+        loop {
+            let token = lexer.lex();
+            tokens.push(token);
+            if matches!(token, Token::Eof | Token::Invalid) {
+                return tokens;
+            }
+        }
+    }
+
+    #[test]
+    fn openmetrics2_start_timestamp_and_exemplars() {
+        use Token::*;
+        assert_eq!(
+            lex_all_openmetrics2(b"a 1 2 st@3 # {} 4 5 # {} 6 7\n"),
+            [
+                MName,
+                Value,
+                Timestamp,
+                StartTimestamp,
+                Comment,
+                BraceClose,
+                Value,
+                Timestamp,
+                Comment,
+                BraceClose,
+                Value,
+                Timestamp,
+                Linebreak,
+                Eof
+            ]
+        );
+        // Like golex, `st@` with nothing after it is a plain timestamp.
+        assert_eq!(
+            lex_all_openmetrics2(b"a 1 st@\n"),
+            [MName, Value, Timestamp, Linebreak, Eof]
+        );
+        assert_eq!(
+            lex_all(b"a 1 st@3\n")
+                .iter()
+                .map(|(token, _)| *token)
+                .collect::<Vec<_>>(),
+            [MName, Value, Timestamp, Linebreak, Eof]
         );
     }
 

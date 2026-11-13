@@ -1,0 +1,36 @@
+help "go_gc_duration_seconds" "A summary of GC invocation durations."
+type "go_gc_duration_seconds" summary
+unit "go_gc_duration_seconds" "seconds"
+series "go_gc_duration_seconds_count" 4058c00000000000 - "__name__"="go_gc_duration_seconds_count"
+st 0
+series "go_gc_duration_seconds_sum" 3f70624dd2f1a9fc - "__name__"="go_gc_duration_seconds_sum"
+st 0
+series "go_gc_duration_secondsÿquantileÿ0.0" 3f09dfc772bd2e41 - "__name__"="go_gc_duration_seconds" "quantile"="0.0"
+st 0
+series "go_gc_duration_secondsÿquantileÿ0.5" 3f15fa12554226c1 - "__name__"="go_gc_duration_seconds" "quantile"="0.5"
+st 0
+type "go_goroutines" gauge
+series "go_goroutines" 4040800000000000 123456789 "__name__"="go_goroutines"
+st 0
+type "hh" histogram
+series "hh_count" 3ff0000000000000 - "__name__"="hh_count"
+st 0
+series "hh_sum" 3ff0000000000000 - "__name__"="hh_sum"
+st 0
+series "hh_bucketÿleÿ+Inf" 3ff0000000000000 - "__name__"="hh_bucket" "le"="+Inf"
+st 0
+type "ii_info" info
+series "ii_info{foo=\"bar\"}" 3ff0000000000000 - "__name__"="ii_info" "foo"="bar"
+st 0
+type "ss" stateset
+series "ss{ss=\"foo\"}" 3ff0000000000000 - "__name__"="ss" "ss"="foo"
+st 0
+series "ss{ss=\"bar\"}" 0000000000000000 - "__name__"="ss" "ss"="bar"
+st 0
+type "un" unknown
+series "un" 3ff0000000000000 - "__name__"="un"
+st 0
+type "foo_total" counter
+series "foo_total" 4031000000000000 1520879607789 "__name__"="foo_total"
+exemplar 4014000000000000 1520879600789 "id"="counter-test"
+st 0

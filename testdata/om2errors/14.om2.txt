@@ -1,0 +1,3 @@
+# TYPE foo counter
+foo{"aÿb"="v"} 1.0
+# EOF

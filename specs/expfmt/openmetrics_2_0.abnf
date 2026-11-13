@@ -1,0 +1,137 @@
+; OpenMetrics 2.0 text format grammar (RFC 7405 ABNF), copied verbatim from
+; https://github.com/prometheus/docs/blob/50dc412606a37fed42773448fd6a4ffc2bb7ff7b/docs/specs/om/open_metrics_spec_2_0.md#abnf
+; "exposition" is the top level rule.
+
+exposition = metricset HASH SP %s"EOF" [ LF ]
+
+metricset = *metricfamily
+
+metricfamily = *metric-descriptor *sample
+
+metric-descriptor = HASH SP %s"TYPE" SP (metricname / metricname-utf8) SP metric-type LF
+metric-descriptor =/ HASH SP %s"HELP" SP (metricname / metricname-utf8) SP escaped-string LF
+metric-descriptor =/ HASH SP %s"UNIT" SP (metricname / metricname-utf8) SP *metricname-char LF
+
+metric-type = %s"counter" / %s"gauge" / %s"histogram" / %s"gaugehistogram" / %s"stateset"
+metric-type =/ %s"info" / %s"summary" / %s"unknown"
+
+sample = metricname-and-labels SP value [SP timestamp] [SP start-timestamp] *exemplar LF
+
+value = number / "{" composite-value "}"
+
+timestamp = realnumber
+
+; Lowercase st @ timestamp
+start-timestamp = %s"st" "@" timestamp
+
+exemplar = SP HASH SP labels-in-braces SP number SP timestamp
+
+metricname-and-labels = metricname [labels-in-braces] / name-and-labels-in-braces
+labels-in-braces = "{" [label *(COMMA label)] "}"
+name-and-labels-in-braces = "{" metricname-utf8 *(COMMA label) "}"
+
+label = label-key "=" DQUOTE escaped-string DQUOTE
+
+; Number value
+number = realnumber
+; Case insensitive
+number =/ [SIGN] (%i"inf" / %i"infinity")
+number =/ %i"nan"
+
+; Real floats
+; Leading 0s explicitly okay
+realnumber = [SIGN] 1*DIGIT ["." *DIGIT] [ "e" [SIGN] 1*DIGIT ]
+realnumber =/ [SIGN] *DIGIT "." 1*DIGIT [ "e" [SIGN] 1*DIGIT ]
+
+; Integers
+; Leading 0s explicitly okay
+integer = [SIGN] 1*"0" / [SIGN] positive-integer
+non-negative-integer = ["+"] 1*"0" / ["+"] positive-integer
+positive-integer = *"0" positive-digit *DIGIT
+positive-digit = "1" / "2" / "3" / "4" / "5" / "6" / "7" / "8" / "9"
+
+BS = "\"
+COMMA = ","
+HASH = "#"
+SIGN = "-" / "+"
+
+metricname = metricname-initial-char 0*metricname-char
+
+metricname-char = metricname-initial-char / DIGIT
+metricname-initial-char = ALPHA / "_" / ":"
+metricname-utf8 = DQUOTE escaped-string-non-empty DQUOTE
+
+label-key = label-name / DQUOTE escaped-string-non-empty DQUOTE
+label-name = label-name-initial-char *label-name-char
+
+label-name-char = label-name-initial-char / DIGIT
+label-name-initial-char = ALPHA / "_"
+
+escaped-string = *escaped-char
+escaped-string-non-empty = 1*escaped-char
+
+escaped-char = normal-char
+escaped-char =/ BS ("n" / DQUOTE / BS)
+escaped-char =/ BS normal-char
+
+; Any unicode character, except newline, double quote, and backslash
+normal-char = %x00-09 / %x0B-21 / %x23-5B / %x5D-D7FF / %xE000-10FFFF
+
+; Composite values
+composite-value = histogram-value / gauge-histogram-value / summary-value
+
+; Histograms
+histogram-value = h-count "," h-sum "," histogram-buckets
+gauge-histogram-value = %s"g" h-count "," %s"g" h-sum "," histogram-buckets
+
+; count:x
+h-count = %s"count" ":" number
+; sum:f allows real numbers and +-Inf and NaN
+h-sum = %s"sum" ":" number
+
+histogram-buckets = classic-buckets / native-buckets [ "," classic-buckets ]
+
+; bucket:[...,+Inf:v] The +Inf bucket is required.
+classic-buckets = %s"bucket" ":" "[" [ ch-le-counts "," ] ch-pos-inf-bucket "]"
+ch-le-counts = (ch-neg-inf-bucket / ch-le-bucket) *("," ch-le-bucket)
+ch-pos-inf-bucket = "+" %s"Inf" ":" number
+ch-neg-inf-bucket = "-" %s"Inf" ":" number
+ch-le-bucket = realnumber ":" number
+
+; schema:3,zero_threshold:1e-128,zero_count:2,negative_spans:[1:1],negative_buckets:[2],positive_spanes:[-3:1,2:2],positive_buckets:[3,1,0]
+native-buckets = nh-schema "," nh-zero-threshold "," nh-zero-count [ "," nh-negative-spans "," nh-negative-buckets ] [ "," nh-positive-spans "," nh-positive-buckets ]
+
+; schema:i
+nh-schema = %s"schema" ":" integer
+; zero_threshold:f
+nh-zero-threshold = %s"zero_threshold" ":" realnumber
+; zero_count:x
+nh-zero-count = %s"zero_count" ":" number
+; negative_spans:[1:2,3:4] and positive_spans:[-3:1,2:2]
+nh-negative-spans = %s"negative_spans" ":" "[" [nh-spans] "]"
+nh-positive-spans = %s"positive_spans" ":" "[" [nh-spans] "]"
+; Spans hold offset and length. The offset can start from any index, even
+; negative, however subsequent spans can only advance the index, not decrease it.
+nh-spans = nh-start-span *("," nh-span)
+nh-start-span = integer ":" non-negative-integer
+nh-span = non-negative-integer ":" non-negative-integer
+
+; negative_buckets:[1,2,3] and positive_buckets:[1,2,3]
+nh-negative-buckets = %s"negative_buckets" ":" "[" [nh-buckets] "]"
+nh-positive-buckets = %s"positive_buckets" ":" "[" [nh-buckets] "]"
+
+nh-buckets = number *("," number)
+
+; Summary
+
+; count:12.0,sum:100.0,quantile:[0.9:2.0,0.95:3.0,0.99:20.0]
+summary-value = cs-count "," cs-sum "," cs-quantile
+
+; count:x where x is a number
+cs-count = %s"count" ":" number
+; sum:x where x is a real number or +-Inf or NaN
+cs-sum = %s"sum" ":" number
+; quantile:[...]
+cs-quantile = %s"quantile" ":" "[" [ cs-q-counts ] "]"
+cs-q-counts = cs-q-count *("," cs-q-count)
+cs-q-count = realnumber ":" number

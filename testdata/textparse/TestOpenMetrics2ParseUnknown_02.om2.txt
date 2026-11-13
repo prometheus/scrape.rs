@@ -1,0 +1,4 @@
+# TYPE un_seconds unknown
+# UNIT un_seconds seconds
+un_seconds 1.5
+# EOF
