@@ -803,6 +803,53 @@ impl StalenessTracker {
         Ok(())
     }
 
+    /// Synchronizes an existing tracked family's active batch row ID and pending `# HELP` /
+    /// `# UNIT` metadata when a family emits a sample in the current batch that is not itself
+    /// recorded in the tracker (e.g. an explicit-timestamp sample when
+    /// `!opts.track_timestamps_staleness`). Does not insert a new family if it is not already
+    /// tracked.
+    #[inline]
+    pub(super) fn sync_existing_family(
+        &mut self,
+        current_family: &mut CurrentFamily,
+    ) -> Result<(), DecodeError> {
+        let (name, metric_type, saw_total_suffix) = canonical_family_key(current_family);
+        if let Some(idx) = current_family.tracker_family_idx {
+            let fam = &mut self.families[idx as usize];
+            if fam.metric_type == metric_type && fam.saw_total_suffix == saw_total_suffix {
+                fam.current_batch_id = current_family.batch_id;
+                return Ok(());
+            }
+        }
+
+        if self.family_buckets.is_empty() {
+            return Ok(());
+        }
+        let hash = hash_family_key(name, metric_type, saw_total_suffix);
+        let mask = self.family_buckets.len() - 1;
+        let mut slot = (hash as usize) & mask;
+
+        loop {
+            let bucket = self.family_buckets[slot];
+            if bucket.family_idx == NONE_IDX {
+                return Ok(());
+            }
+            if bucket.hash == hash {
+                let idx = bucket.family_idx as usize;
+                let fam = self.families[idx];
+                if fam.metric_type == metric_type
+                    && fam.saw_total_suffix == saw_total_suffix
+                    && &self.family_bytes[fam.name_start as usize..fam.name_end as usize] == name
+                {
+                    self.update_existing_family(idx, current_family)?;
+                    current_family.tracker_family_idx = Some(bucket.family_idx);
+                    return Ok(());
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
     #[inline]
     fn find_or_insert_family(
         &mut self,
