@@ -22,11 +22,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
-use super::{ADDRESS_LABEL, DiscoveryError, LabelSet, TargetGroup, join_host_port, serde_duration};
+use super::{
+    ADDRESS_LABEL, DiscoveryError, LabelSet, TargetGroup, deserialize_null_default, join_host_port,
+    serde_duration,
+};
 
 /// Meta label storing the queried record name.
 pub const DNS_NAME_LABEL: &str = "__meta_dns_name";
@@ -136,21 +139,43 @@ pub enum DnsRecord {
     Cname(String),
 }
 
+fn deserialize_refresh_interval<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Duration, D::Error> {
+    serde_duration::deserialize_or(deserializer, default_refresh_interval())
+}
+
+fn deserialize_record_type<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_else(default_record_type))
+}
+
 /// DNS service discovery configuration matching Prometheus `discovery/dns.SDConfig`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DnsSdConfig {
     /// DNS domain names to query.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub names: Vec<String>,
     /// Refresh interval between DNS lookups (defaults to `30s`).
-    #[serde(default = "default_refresh_interval", with = "serde_duration")]
+    #[serde(
+        default = "default_refresh_interval",
+        serialize_with = "serde_duration::serialize",
+        deserialize_with = "deserialize_refresh_interval"
+    )]
     pub refresh_interval: Duration,
     /// DNS record type to query: `"SRV"` (default), `"A"`, `"AAAA"`, `"MX"`, or `"NS"`.
-    #[serde(rename = "type", default = "default_record_type")]
+    #[serde(
+        rename = "type",
+        default = "default_record_type",
+        deserialize_with = "deserialize_record_type"
+    )]
     pub record_type: String,
     /// Port number used for record types other than `"SRV"` (ignored for `"SRV"`).
-    #[serde(default, skip_serializing_if = "is_zero_port")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "is_zero_port"
+    )]
     pub port: u16,
 }
 
@@ -176,9 +201,6 @@ impl DnsSdConfig {
             return Err(DiscoveryError::InvalidConfig(
                 "DNS-SD config must contain at least one SRV record name".to_owned(),
             ));
-        }
-        if self.record_type.is_empty() {
-            self.record_type = default_record_type();
         }
         let parsed = DnsRecordType::parse(&self.record_type)?;
         if parsed != DnsRecordType::Srv && self.port == 0 {
