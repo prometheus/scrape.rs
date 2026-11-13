@@ -145,7 +145,6 @@ impl DecodeCursor {
 trait ScrapeParser<'input>: Parser<'input> {
     const IS_OPENMETRICS: bool;
 
-    fn parser_pos(&self) -> usize;
     fn name_offset(&self) -> usize;
     fn raw_help(&self) -> (&'input [u8], &'input [u8]);
     fn raw_series_parts(&self) -> (&'input [u8], &[LabelSpan], &'input [u8], Option<i64>, f64);
@@ -154,11 +153,6 @@ trait ScrapeParser<'input>: Parser<'input> {
 
 impl<'input> ScrapeParser<'input> for PromParser<'input> {
     const IS_OPENMETRICS: bool = false;
-
-    #[inline]
-    fn parser_pos(&self) -> usize {
-        self.pos()
-    }
 
     #[inline]
     fn name_offset(&self) -> usize {
@@ -183,11 +177,6 @@ impl<'input> ScrapeParser<'input> for PromParser<'input> {
 
 impl<'input> ScrapeParser<'input> for OpenMetricsParser<'input> {
     const IS_OPENMETRICS: bool = true;
-
-    #[inline]
-    fn parser_pos(&self) -> usize {
-        self.pos()
-    }
 
     #[inline]
     fn name_offset(&self) -> usize {
@@ -522,7 +511,7 @@ impl ArrowDecoder {
                 let mut parser = PromParser::from_state(input, state);
                 let res =
                     self.run_cursor_step::<_, BUDGETED>(&mut parser, input.len(), cursor, budget);
-                cursor.pos = parser.parser_pos();
+                cursor.pos = parser.pos();
                 self.prom_state = parser.into_state();
                 match res {
                     Ok(step) => {
@@ -546,7 +535,7 @@ impl ArrowDecoder {
                 let mut parser = OpenMetricsParser::from_state(input, state);
                 let res =
                     self.run_cursor_step::<_, BUDGETED>(&mut parser, input.len(), cursor, budget);
-                cursor.pos = parser.parser_pos();
+                cursor.pos = parser.pos();
                 self.om_state = parser.into_state();
                 match res {
                     Ok(step) => {
@@ -813,7 +802,7 @@ impl ArrowDecoder {
         pending_series: &mut bool,
         done: &mut bool,
     ) -> Result<DecodeStep, DecodeError> {
-        let start_pos = if BUDGETED { parser.parser_pos() } else { 0 };
+        let start_pos = if BUDGETED { parser.pos() } else { 0 };
         let (max_entries, byte_limit, max_duration, check_every_entry, started) = if let Some(b) =
             budget.filter(|_| BUDGETED)
         {
@@ -952,7 +941,7 @@ impl ArrowDecoder {
 
             if BUDGETED {
                 entries += 1;
-                if entries >= max_entries || parser.parser_pos() >= byte_limit {
+                if entries >= max_entries || parser.pos() >= byte_limit {
                     return Ok(DecodeStep::Pending);
                 }
                 if (check_every_entry
