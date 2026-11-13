@@ -1440,18 +1440,19 @@ impl ArrowDecoder {
             self.num_dp.values.push_null(dp_index);
         }
 
-        if TRACKED
-            && (sample_ts_ms.is_none() || opts.track_timestamps_staleness)
-            && let Some(tr) = tracker.as_deref_mut()
-        {
-            tr.record_series(
-                &mut self.current_family,
-                DpKind::Number,
-                &self.temp_attrs,
-                &self.key_interner,
-                &self.val_interner,
-                is_stale,
-            )?;
+        if TRACKED && let Some(tr) = tracker.as_deref_mut() {
+            if sample_ts_ms.is_none() || opts.track_timestamps_staleness {
+                tr.record_series(
+                    &mut self.current_family,
+                    DpKind::Number,
+                    &self.temp_attrs,
+                    &self.key_interner,
+                    &self.val_interner,
+                    is_stale,
+                )?;
+            } else {
+                tr.sync_existing_family(&mut self.current_family)?;
+            }
         }
         Ok(())
     }

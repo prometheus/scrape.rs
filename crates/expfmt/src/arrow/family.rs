@@ -691,17 +691,19 @@ impl FamilyAssembly {
                     })?;
                     sum_dp.quantile_offsets.push(q_off);
 
-                    if (group.ts_ns.is_none() || opts.track_timestamps_staleness)
-                        && let Some(tr) = tracker.as_deref_mut()
-                    {
-                        tr.record_series(
-                            current_family,
-                            DpKind::Summary,
-                            &self.group_attrs[attr_start..attr_end],
-                            key_interner,
-                            val_interner,
-                            group.is_stale,
-                        )?;
+                    if let Some(tr) = tracker.as_deref_mut() {
+                        if group.ts_ns.is_none() || opts.track_timestamps_staleness {
+                            tr.record_series(
+                                current_family,
+                                DpKind::Summary,
+                                &self.group_attrs[attr_start..attr_end],
+                                key_interner,
+                                val_interner,
+                                group.is_stale,
+                            )?;
+                        } else {
+                            tr.sync_existing_family(current_family)?;
+                        }
                     }
                 }
             }
@@ -801,17 +803,19 @@ impl FamilyAssembly {
                     hist_dp.bucket_offsets.push(bucket_off);
                     hist_dp.bounds_offsets.push(bounds_off);
 
-                    if (group.ts_ns.is_none() || opts.track_timestamps_staleness)
-                        && let Some(tr) = tracker.as_deref_mut()
-                    {
-                        tr.record_series(
-                            current_family,
-                            DpKind::Histogram,
-                            &self.group_attrs[attr_start..attr_end],
-                            key_interner,
-                            val_interner,
-                            group.is_stale,
-                        )?;
+                    if let Some(tr) = tracker.as_deref_mut() {
+                        if group.ts_ns.is_none() || opts.track_timestamps_staleness {
+                            tr.record_series(
+                                current_family,
+                                DpKind::Histogram,
+                                &self.group_attrs[attr_start..attr_end],
+                                key_interner,
+                                val_interner,
+                                group.is_stale,
+                            )?;
+                        } else {
+                            tr.sync_existing_family(current_family)?;
+                        }
                     }
                 }
             }
