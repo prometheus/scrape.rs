@@ -37,5 +37,9 @@ name = "decode"
 harness = false
 required-features = ["arrow"]
 
+[[bench]]
+name = "parse"
+harness = false
+
 [lints]
 workspace = true
