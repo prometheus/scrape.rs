@@ -768,6 +768,8 @@ fn decode_dns_response(
 
     let qdcount = u16::from_be_bytes([msg[4], msg[5]]) as usize;
     let ancount = u16::from_be_bytes([msg[6], msg[7]]) as usize;
+    let nscount = u16::from_be_bytes([msg[8], msg[9]]) as usize;
+    let arcount = u16::from_be_bytes([msg[10], msg[11]]) as usize;
     if qdcount != 1 {
         return Err(DiscoveryError::Dns(format!(
             "unexpected DNS question count {qdcount}, expected 1"
@@ -894,6 +896,30 @@ fn decode_dns_response(
         offset = rdata_end;
     }
 
+    for _ in 0..nscount.saturating_add(arcount) {
+        let (_, next) = decode_dns_name(msg, offset)?;
+        if next + 10 > msg.len() {
+            return Err(DiscoveryError::Dns(
+                "truncated DNS resource record header".to_owned(),
+            ));
+        }
+        let rtype = u16::from_be_bytes([msg[next], msg[next + 1]]);
+        let rdlength = u16::from_be_bytes([msg[next + 8], msg[next + 9]]) as usize;
+        let rdata_end = next + 10 + rdlength;
+        if rdata_end > msg.len() {
+            return Err(DiscoveryError::Dns(
+                "truncated DNS resource record rdata".to_owned(),
+            ));
+        }
+        if rtype == QTYPE_OPT && msg[next + 4] != 0 {
+            let ext_rcode = ((msg[next + 4] as u16) << 4) | (rcode as u16);
+            return Err(DiscoveryError::Dns(format!(
+                "DNS response returned non-zero extended RCODE {ext_rcode}"
+            )));
+        }
+        offset = rdata_end;
+    }
+
     Ok(DecodedDnsMessage::Records(records))
 }
 
@@ -909,7 +935,7 @@ fn decode_dns_name_bounded(
     let mut labels = Vec::new();
     let mut end_offset = None;
     let mut jumps = 0usize;
-    let mut total_len = 0usize;
+    let mut total_len = 1usize;
 
     loop {
         let active_bound = if end_offset.is_none() {
@@ -944,7 +970,7 @@ fn decode_dns_name_bounded(
                 end_offset = Some(offset + 2);
             }
             let ptr = (((len & 0x3F) as usize) << 8) | (msg[offset + 1] as usize);
-            if ptr >= msg.len() {
+            if ptr < 12 || ptr >= msg.len() {
                 return Err(DiscoveryError::Dns(
                     "DNS name compression pointer out of bounds".to_owned(),
                 ));
