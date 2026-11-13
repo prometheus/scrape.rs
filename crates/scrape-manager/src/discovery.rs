@@ -18,14 +18,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Reserved Prometheus label holding the `<host>:<port>` scrape target address.
-pub const ADDRESS_LABEL: &str = "__address__";
-
-/// Ordered map of label names to label values matching Prometheus `model.LabelSet`.
-pub type LabelSet = BTreeMap<String, String>;
+pub use prometheus_relabel::{ADDRESS_LABEL, LabelSet};
 
 /// Error returned when validating or running target discovery.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DiscoveryError {
     /// Configuration validation failed.
     #[error("{0}")]
@@ -112,7 +109,7 @@ impl<'de> Deserialize<'de> for TargetGroup {
 }
 
 /// Resolves a slice of [`StaticConfig`] entries into [`TargetGroup`]s with sequential
-/// `"0"`, `"1"`, ... source identifiers matching Prometheus `discovery.NewStaticProvider`.
+/// `"0"`, `"1"`, ... source identifiers matching Prometheus `discovery.StaticConfig`.
 pub fn resolve_static_configs(configs: &[StaticConfig]) -> Vec<TargetGroup> {
     configs
         .iter()
