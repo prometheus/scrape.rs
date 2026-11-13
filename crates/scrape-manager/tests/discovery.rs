@@ -104,7 +104,7 @@ fn prometheus_duration_parsing_and_formatting() {
     );
 
     assert_eq!(format_duration(Duration::ZERO), "0s");
-    assert_eq!(format_duration(Duration::from_micros(500)), "1ms");
+    assert_eq!(format_duration(Duration::from_micros(500)), "0s");
     assert_eq!(format_duration(Duration::from_secs(30)), "30s");
     assert_eq!(format_duration(Duration::from_secs(90)), "1m30s");
     assert_eq!(format_duration(Duration::from_secs(7 * 24 * 3600)), "1w");

@@ -256,10 +256,10 @@ pub fn parse_duration(s: &str) -> Result<Duration, DiscoveryError> {
 /// Formats a [`Duration`] as a canonical Prometheus duration string (such as `"30s"` or `"1m30s"`),
 /// matching `prometheus/common/model.Duration.String`.
 pub fn format_duration(d: Duration) -> String {
-    if d.is_zero() {
+    let mut ms: u128 = d.as_millis();
+    if ms == 0 {
         return "0s".to_owned();
     }
-    let mut ms: u128 = d.as_millis().max(1);
 
     let mut out = String::new();
     let mut append_unit = |unit: &str, mult: u128, exact: bool| {
