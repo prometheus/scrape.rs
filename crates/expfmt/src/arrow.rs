@@ -703,9 +703,7 @@ impl ArrowDecoder {
         cursor: &mut DecodeCursor,
         tracker: &mut StalenessTracker,
     ) {
-        if !cursor.done
-            && cursor.tracker_started
-            && tracker.active_scrape_id() == cursor.scrape_id
+        if !cursor.done && cursor.tracker_started && tracker.active_scrape_id() == cursor.scrape_id
         {
             tracker.abort_scrape();
         }
