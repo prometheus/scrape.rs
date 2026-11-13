@@ -35,15 +35,31 @@ pub enum DiscoveryError {
     Json(#[from] serde_json::Error),
 }
 
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// Static target group configuration matching Prometheus `static_configs` entries.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StaticConfig {
     /// List of target `"<host>:<port>"` addresses.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub targets: Vec<String>,
     /// Labels assigned to all targets in the group.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub labels: LabelSet,
 }
 
@@ -124,7 +140,11 @@ pub fn resolve_static_configs(configs: &[StaticConfig]) -> Vec<TargetGroup> {
 #[serde(deny_unknown_fields)]
 pub struct DiscoveryConfigs {
     /// Static target group configurations (`static_configs`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub static_configs: Vec<StaticConfig>,
 }
 
