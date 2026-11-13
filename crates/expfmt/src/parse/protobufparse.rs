@@ -711,7 +711,8 @@ fn collect_nhcb_buckets(
 
 /// Go's `TempHistogram.Convert` returns an integer histogram when every count is a whole number.
 fn is_integer_histogram(count: f64, buckets: &[(f64, f64)]) -> bool {
-    let is_integer = |value: f64| value == (value.round() as i64) as f64;
+    // Go's int64 conversion does not saturate on amd64, so 2^63 and above are not integers.
+    let is_integer = |value: f64| value < i64::MAX as f64 && value == (value.round() as i64) as f64;
     count == (count.round() as u64) as f64
         && buckets
             .iter()
@@ -721,7 +722,7 @@ fn is_integer_histogram(count: f64, buckets: &[(f64, f64)]) -> bool {
 /// Each value minus the value before it, starting from zero.
 fn differences<B: Bucket>(values: impl Iterator<Item = B>) -> impl Iterator<Item = B> {
     values.scan(B::ZERO, |previous, value| {
-        let difference = value.add(previous.neg());
+        let difference = value.sub(*previous);
         *previous = value;
         Some(difference)
     })
@@ -779,6 +780,14 @@ fn insert_nhcb_bucket(
     ensure(cumulative_count >= 0.0 || cumulative_count.is_nan(), || {
         format!("bucket count must be non-negative: le={upper_bound}, count={cumulative_count}")
     })?;
+    // Go's happy case: buckets usually arrive sorted, so append without a search.
+    if buckets
+        .last()
+        .is_none_or(|&(bound, previous)| bound < upper_bound && previous <= cumulative_count)
+    {
+        buckets.push((upper_bound, cumulative_count));
+        return Ok(());
+    }
     let index = buckets.partition_point(|&(bound, _)| bound < upper_bound);
     let repeated = buckets
         .get(index)
@@ -831,6 +840,8 @@ trait Bucket: Copy + PartialEq {
     const DELTA: bool;
     fn add(self, other: Self) -> Self;
     fn neg(self) -> Self;
+    /// Plain subtraction: `add(other.neg())` flips the sign bit of a NaN `other`, Go's `-` does not.
+    fn sub(self, other: Self) -> Self;
 }
 
 impl Bucket for i64 {
@@ -842,6 +853,9 @@ impl Bucket for i64 {
     fn neg(self) -> Self {
         self.wrapping_neg()
     }
+    fn sub(self, other: Self) -> Self {
+        self.wrapping_sub(other)
+    }
 }
 
 impl Bucket for f64 {
@@ -852,6 +866,9 @@ impl Bucket for f64 {
     }
     fn neg(self) -> Self {
         -self
+    }
+    fn sub(self, other: Self) -> Self {
+        self - other
     }
 }
 
@@ -1154,5 +1171,31 @@ mod tests {
             }
         }
         assert_eq!(ids, ["e1", "e2"]);
+    }
+    #[test]
+    fn converts_count_of_two_to_the_63_to_float_nhcb() {
+        // Go's int64(2^63) on amd64 is not 2^63, so Go returns a FloatHistogram.
+        let count = 1u64 << 63;
+        let source = dto::Histogram {
+            sample_count: count,
+            bucket: vec![dto::Bucket {
+                cumulative_count: count,
+                upper_bound: 1.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut float_target = Histogram::default();
+        let is_float = convert_to_nhcb(
+            &source,
+            &mut Vec::new(),
+            &mut Histogram::default(),
+            &mut float_target,
+            CounterResetHint::Unknown,
+        )
+        .unwrap();
+        assert!(is_float);
+        assert_eq!(float_target.count, count as f64);
+        assert_eq!(float_target.positive_buckets, [count as f64]);
     }
 }

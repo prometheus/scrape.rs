@@ -25,3 +25,13 @@ exemplar 4010000000000000 2000 "id"="classic"
 st 0
 histogram "mixedÿkindÿnative-again" - int schema=0 count=1 sum=3ff0000000000000 zero_threshold=3f50624dd2f1a9fc zero_count=1 hint=0 pos_spans=[] pos=[] neg_spans=[] neg=[] custom=[] "__name__"="mixed" "kind"="native-again"
 st 0
+histogram "mixedÿkindÿfloat-native" - float schema=0 count=400c000000000000 sum=4000000000000000 zero_threshold=3f50624dd2f1a9fc zero_count=0000000000000000 hint=0 pos_spans=[0:1] pos=[3ff8000000000000] neg_spans=[1:1] neg=[4000000000000000] custom=[] "__name__"="mixed" "kind"="float-native"
+st 0
+histogram "mixedÿkindÿfloat-classic" - float schema=-53 count=4004000000000000 sum=4008000000000000 zero_threshold=0000000000000000 zero_count=0000000000000000 hint=0 pos_spans=[0:2] pos=[3ff8000000000000,3ff0000000000000] neg_spans=[] neg=[] custom=[3ff0000000000000,4014000000000000] "__name__"="mixed" "kind"="float-classic"
+st 0
+histogram "mixedÿkindÿfloat-native-again" - float schema=0 count=3ff8000000000000 sum=3ff0000000000000 zero_threshold=3f50624dd2f1a9fc zero_count=3ff8000000000000 hint=0 pos_spans=[] pos=[] neg_spans=[] neg=[] custom=[] "__name__"="mixed" "kind"="float-native-again"
+st 0
+help "float_nan_count" "A NaN cumulative count followed by a finite one."
+type "float_nan_count" histogram
+histogram "float_nan_count" - float schema=-53 count=400c000000000000 sum=3ff0000000000000 zero_threshold=0000000000000000 zero_count=0000000000000000 hint=0 pos_spans=[0:3] pos=[7ff8000000000001,7ff8000000000001,3ff0000000000000] neg_spans=[] neg=[] custom=[3ff0000000000000,4000000000000000] "__name__"="float_nan_count"
+st 0

@@ -100,3 +100,47 @@ metric: <
     zero_count: 1
   >
 >
+metric: <
+  label: < name: "kind" value: "float-native" >
+  histogram: <
+    sample_count_float: 3.5
+    sample_sum: 2
+    schema: 0
+    zero_threshold: 0.001
+    positive_span: < offset: 0 length: 1 >
+    positive_count: 1.5
+    negative_span: < offset: 1 length: 1 >
+    negative_count: 2
+  >
+>
+metric: <
+  label: < name: "kind" value: "float-classic" >
+  histogram: <
+    sample_count_float: 2.5
+    sample_sum: 3
+    bucket: < cumulative_count_float: 1.5 upper_bound: 1 >
+    bucket: < cumulative_count_float: 2.5 upper_bound: 5 >
+  >
+>
+metric: <
+  label: < name: "kind" value: "float-native-again" >
+  histogram: <
+    sample_count_float: 1.5
+    sample_sum: 1
+    schema: 0
+    zero_threshold: 0.001
+    zero_count_float: 1.5
+  >
+>
+---
+name: "float_nan_count"
+help: "A NaN cumulative count followed by a finite one."
+type: HISTOGRAM
+metric: <
+  histogram: <
+    sample_count_float: 3.5
+    sample_sum: 1
+    bucket: < cumulative_count_float: nan upper_bound: 1 >
+    bucket: < cumulative_count_float: 2.5 upper_bound: 2 >
+  >
+>

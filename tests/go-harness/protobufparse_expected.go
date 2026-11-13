@@ -26,21 +26,34 @@ import (
 	dto "github.com/prometheus/prometheus/prompb/io/prometheus/client"
 )
 
-const protobufParseInput = "textparse/TestProtobufParse.pb"
+// protobufParseTests maps each upstream test function to the delimited fixture
+// built from its testMetricFamilies, relative to testdata/.
+var protobufParseTests = map[string]string{
+	"createTestProtoBuf":        "textparse/TestProtobufParse.pb",
+	"TestProtobufParseWithNHCB": "textparse/TestProtobufParseWithNHCB.pb",
+}
 
 // protobufParseInputs are the delimited protobuf fixtures, relative to testdata/.
 var protobufParseInputs = []string{
-	protobufParseInput,
+	"textparse/TestProtobufParse.pb",
+	"textparse/TestProtobufParseWithNHCB.pb",
 	"expfmt/protobuf",
 	"expfmt/protobuf-multimessage",
 }
 
-func writeProtobufParseInput(outRoot, srcFile string) (string, error) {
-	families, err := extractFuncStringSlice(srcFile, "createTestProtoBuf", "testMetricFamilies")
-	if err != nil {
-		return "", err
+func writeProtobufParseInputs(outRoot, srcFile string) ([]string, error) {
+	var written []string
+	for funcName, input := range protobufParseTests {
+		families, err := extractFuncStringSlice(srcFile, funcName, "testMetricFamilies")
+		if err != nil {
+			return nil, err
+		}
+		if err := writeDelimited(filepath.Join(outRoot, input), families); err != nil {
+			return nil, err
+		}
+		written = append(written, input)
 	}
-	return protobufParseInput, writeDelimited(filepath.Join(outRoot, protobufParseInput), families)
+	return written, nil
 }
 
 // writeNHCBInputs marshals each hand-written tests/go-harness/testdata/nhcb/*.prototxt file,
