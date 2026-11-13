@@ -584,17 +584,50 @@ impl ArrowDecoder {
             return Ok(DecodeStep::Done);
         }
         if cursor.scrape_id != self.scrape_id {
+            if TRACKED
+                && cursor.tracker_started
+                && let Some(tr) = tracker.as_deref_mut()
+                && tr.active_scrape_id() == cursor.scrape_id
+            {
+                tr.abort_scrape();
+            }
             cursor.done = true;
             cursor.parser_state.take_scratch_into(self);
             return Err(DecodeError::InvalidCursor(
                 "cursor does not belong to current decoder scrape",
             ));
         }
+        if cursor.input_len.is_some() {
+            if TRACKED != cursor.tracker_started {
+                if let Some(tr) = tracker.as_deref_mut()
+                    && tr.active_scrape_id() == cursor.scrape_id
+                {
+                    tr.abort_scrape();
+                }
+                self.finish_decode(cursor);
+                return Err(DecodeError::InvalidCursor(
+                    "cannot mix tracked and untracked decode steps on the same cursor",
+                ));
+            }
+            if TRACKED
+                && let Some(tr) = tracker.as_deref_mut()
+                && tr.active_scrape_id() != cursor.scrape_id
+            {
+                self.finish_decode(cursor);
+                return Err(DecodeError::InvalidCursor(
+                    "staleness tracker does not match active cursor scrape",
+                ));
+            }
+        } else if TRACKED && let Some(tr) = tracker.as_deref_mut() {
+            tr.begin_scrape(cursor.scrape_id);
+            cursor.tracker_started = true;
+        }
         let expected_len = *cursor.input_len.get_or_insert(input.len());
         if input.len() != expected_len {
             if TRACKED
                 && cursor.tracker_started
                 && let Some(tr) = tracker.as_deref_mut()
+                && tr.active_scrape_id() == cursor.scrape_id
             {
                 tr.abort_scrape();
             }
@@ -602,13 +635,6 @@ impl ArrowDecoder {
             return Err(DecodeError::InvalidCursor(
                 "scrape input buffer length changed across decode steps",
             ));
-        }
-        if TRACKED
-            && !cursor.tracker_started
-            && let Some(tr) = tracker.as_deref_mut()
-        {
-            tr.begin_scrape();
-            cursor.tracker_started = true;
         }
         let state = std::mem::replace(&mut cursor.parser_state, ActiveParserState::Invalid);
         let mut parser = state.into_parser(input);
@@ -677,7 +703,10 @@ impl ArrowDecoder {
         cursor: &mut DecodeCursor,
         tracker: &mut StalenessTracker,
     ) {
-        if !cursor.done && cursor.scrape_id == self.scrape_id && cursor.tracker_started {
+        if !cursor.done
+            && cursor.tracker_started
+            && tracker.active_scrape_id() == cursor.scrape_id
+        {
             tracker.abort_scrape();
         }
         self.finish_decode(cursor);
@@ -704,7 +733,7 @@ impl ArrowDecoder {
         tracker: &mut StalenessTracker,
     ) -> Result<OtapMetricRecords, DecodeError> {
         self.reset_scrape();
-        tracker.begin_scrape();
+        tracker.begin_scrape(self.scrape_id);
         let (mut parser, default_ts_ns) = match self.init_scrape_parser(input, format, opts) {
             Ok(v) => v,
             Err(err) => {
@@ -804,7 +833,7 @@ impl ArrowDecoder {
             Some(ms) => Some(ms_to_ns(ms)?),
             None => None,
         };
-        tracker.begin_scrape();
+        tracker.begin_scrape(self.scrape_id);
         let res = tracker.finish_scrape_step(
             &mut self.metrics,
             &mut self.num_dp,
@@ -845,7 +874,7 @@ impl ArrowDecoder {
         match self.start_decode_stream(format, opts) {
             Ok(mut cursor) => {
                 if let Some(tr) = tracker.as_deref_mut() {
-                    tr.begin_scrape();
+                    tr.begin_scrape(cursor.scrape_id);
                     cursor.tracker_started = true;
                 }
                 cursor.input_len = Some(input.len());
