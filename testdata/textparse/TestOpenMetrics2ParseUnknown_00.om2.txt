@@ -1,0 +1,4 @@
+# HELP un Some unknown metric.
+# TYPE un unknown
+un 1
+# EOF

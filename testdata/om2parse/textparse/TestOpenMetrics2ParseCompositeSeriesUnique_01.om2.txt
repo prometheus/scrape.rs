@@ -1,0 +1,17 @@
+type "foo" histogram
+series "foo_countÿpathÿ/a" 3ff0000000000000 - "__name__"="foo_count" "path"="/a"
+st 0
+series "foo_sumÿpathÿ/a" 3ff0000000000000 - "__name__"="foo_sum" "path"="/a"
+st 0
+series "foo_bucketÿleÿ1.0ÿpathÿ/a" 3ff0000000000000 - "__name__"="foo_bucket" "le"="1.0" "path"="/a"
+st 0
+series "foo_bucketÿleÿ+Infÿpathÿ/a" 3ff0000000000000 - "__name__"="foo_bucket" "le"="+Inf" "path"="/a"
+st 0
+series "foo_countÿpathÿ/b" 4000000000000000 - "__name__"="foo_count" "path"="/b"
+st 0
+series "foo_sumÿpathÿ/b" 4000000000000000 - "__name__"="foo_sum" "path"="/b"
+st 0
+series "foo_bucketÿleÿ1.0ÿpathÿ/b" 3ff0000000000000 - "__name__"="foo_bucket" "le"="1.0" "path"="/b"
+st 0
+series "foo_bucketÿleÿ+Infÿpathÿ/b" 4000000000000000 - "__name__"="foo_bucket" "le"="+Inf" "path"="/b"
+st 0

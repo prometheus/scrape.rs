@@ -344,14 +344,17 @@ impl<'a> OpenMetrics2Parser<'a> {
                 Token::Eof => return Err(ParseError::MissingEof),
                 Token::Linebreak => return Ok(()),
                 Token::Timestamp => {
-                    if self.timestamp.is_some() || self.start_timestamp.is_some() {
-                        return Err(self.unexpected("timestamp before start timestamp"));
+                    if self.timestamp.is_some() {
+                        return Err(self.unexpected("duplicate timestamp"));
+                    }
+                    if self.start_timestamp.is_some() {
+                        return Err(self.unexpected("timestamp must precede start timestamp"));
                     }
                     self.timestamp = Some(self.timestamp_value(1)?);
                 }
                 Token::StartTimestamp => {
                     if self.start_timestamp.is_some() {
-                        return Err(self.unexpected("one start timestamp"));
+                        return Err(self.unexpected("duplicate start timestamp"));
                     }
                     self.start_timestamp = Some(self.timestamp_value(4)?);
                 }
@@ -444,7 +447,7 @@ impl<'a> OpenMetrics2Parser<'a> {
                     .split_once(':')
                     .ok_or_else(|| format!("quantile missing ':': {part:?}"))?;
                 let value = go_float(value.trim())?;
-                let quantile = sorted_float_label(quantile.trim(), &mut previous)?;
+                let quantile = sorted_float_label(quantile.trim(), &mut previous, "quantiles")?;
                 self.push_pending(
                     family.to_string(),
                     &extra,
@@ -461,7 +464,8 @@ impl<'a> OpenMetrics2Parser<'a> {
                     .rsplit_once(':')
                     .ok_or_else(|| format!("bucket missing ':': {part:?}"))?;
                 let count = go_float(count.trim())?;
-                let bound = sorted_float_label(bound.trim(), &mut previous)?;
+                let bound =
+                    sorted_float_label(bound.trim(), &mut previous, "classic histogram buckets")?;
                 has_infinity |= bound == "+Inf";
                 self.push_pending(
                     format!("{family}_bucket"),
@@ -935,13 +939,17 @@ fn absolute_to_deltas(buckets: &mut [i64]) {
 
 /// Formats a parsable `le` or `quantile` value like Go's `FormatOpenMetricsFloat`, after
 /// checking it is greater than `previous`. Other values are kept as they are.
-fn sorted_float_label<'v>(text: &'v str, previous: &mut f64) -> Result<Cow<'v, str>, String> {
+fn sorted_float_label<'v>(
+    text: &'v str,
+    previous: &mut f64,
+    what: &str,
+) -> Result<Cow<'v, str>, String> {
     let Some(value) = parse_go_float(text) else {
         return Ok(Cow::Borrowed(text));
     };
     if value <= *previous {
         return Err(format!(
-            "values must be sorted in increasing order: {text:?}"
+            "{what} must be sorted in increasing order: {text:?}"
         ));
     }
     *previous = value;

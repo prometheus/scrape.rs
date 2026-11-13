@@ -1,0 +1,4 @@
+# TYPE foo histogram
+foo{path="/a"} {count:1,sum:1.0,bucket:[1.0:1,+Inf:1]}
+foo{path="/b"} {count:2,sum:2.0,bucket:[1.0:1,+Inf:2]}
+# EOF

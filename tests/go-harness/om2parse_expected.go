@@ -35,10 +35,17 @@ var om2ParseInputGlobs = []string{
 	"om2errors/*.om2.txt",
 }
 
-// writeOM2Cases writes the top-level input literal of every TestOpenMetrics2Parse*
-// function to testdata/textparse/<func>.om2.txt, and each input of
-// TestOpenMetrics2ParseErrors to testdata/om2errors/<index>.om2.txt. Functions
-// without a top-level input literal are skipped.
+// om2Unextractable lists the TestOpenMetrics2Parse* functions whose input is not a
+// string literal, with the reason. Any other function without an input fails the sync,
+// so a new upstream test cannot go untested without a decision here.
+var om2Unextractable = map[string]string{
+	"TestOpenMetrics2ParseEOFHandling":             "the input is passed inline to NewOpenMetrics2Parser",
+	"TestOpenMetrics2ParseExemplarExceedsOM1Limit": "the input is built with strings.Repeat",
+}
+
+// writeOM2Cases writes the inputs of every TestOpenMetrics2Parse* function to
+// testdata/textparse/, one file per table case. TestOpenMetrics2ParseErrors inputs go
+// to testdata/om2errors/<index>.om2.txt, next to the error text Go asserts in <index>.err.
 func writeOM2Cases(outRoot, srcFile string) ([]string, error) {
 	fset := token.NewFileSet()
 	fileNode, err := parser.ParseFile(fset, srcFile, nil, 0)
@@ -64,19 +71,39 @@ func writeOM2Cases(outRoot, srcFile string) ([]string, error) {
 			continue
 		}
 		if fn.Name.Name == om2TestPrefix+"Errors" {
-			for index, input := range keyedStrings(fn.Body, "input") {
+			inputs := keyedStrings(fn.Body, "input")
+			errs := keyedStrings(fn.Body, "err")
+			if len(inputs) != len(errs) {
+				return nil, fmt.Errorf("%s: %d inputs but %d errors", fn.Name.Name, len(inputs), len(errs))
+			}
+			for index, input := range inputs {
 				if err := write(fmt.Sprintf("om2errors/%02d.om2.txt", index), input); err != nil {
+					return nil, err
+				}
+				if err := write(fmt.Sprintf("om2errors/%02d.err", index), errs[index]); err != nil {
 					return nil, err
 				}
 			}
 			continue
 		}
-		input, err := extractFuncInputLiteral(srcFile, fn.Name.Name)
-		if err != nil {
+		if _, ok := om2Unextractable[fn.Name.Name]; ok {
 			continue
 		}
-		if err := write("textparse/"+fn.Name.Name+".om2.txt", input); err != nil {
-			return nil, err
+		input, err := extractFuncInputLiteral(srcFile, fn.Name.Name)
+		if err == nil {
+			if err := write("textparse/"+fn.Name.Name+".om2.txt", input); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		inputs := keyedStrings(fn.Body, "input")
+		if len(inputs) == 0 {
+			return nil, fmt.Errorf("%s: no input to extract, add it to om2Unextractable if that is expected: %w", fn.Name.Name, err)
+		}
+		for index, input := range inputs {
+			if err := write(fmt.Sprintf("textparse/%s_%02d.om2.txt", fn.Name.Name, index), input); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return written, nil
