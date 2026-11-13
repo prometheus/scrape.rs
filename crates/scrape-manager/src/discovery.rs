@@ -137,8 +137,21 @@ impl Serialize for TargetGroup {
 
 impl<'de> Deserialize<'de> for TargetGroup {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = StaticConfig::deserialize(deserializer)?;
-        Ok(raw.into_target_group(String::new()))
+        #[derive(Deserialize)]
+        #[serde(rename = "TargetGroup", deny_unknown_fields)]
+        struct TargetGroupWire {
+            #[serde(default, deserialize_with = "deserialize_null_default")]
+            targets: Vec<String>,
+            #[serde(default, deserialize_with = "deserialize_label_set")]
+            labels: LabelSet,
+        }
+
+        let raw = TargetGroupWire::deserialize(deserializer)?;
+        Ok(StaticConfig {
+            targets: raw.targets,
+            labels: raw.labels,
+        }
+        .into_target_group(String::new()))
     }
 }
 
