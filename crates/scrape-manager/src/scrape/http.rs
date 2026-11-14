@@ -91,7 +91,7 @@ pub struct FetchedScrape {
     pub body: PooledBodyBuffer,
     /// Negotiated exposition wire [`Format`].
     pub format: Format,
-    /// Unix epoch timestamp in milliseconds recorded immediately after the body finished reading.
+    /// Unix epoch timestamp in milliseconds recorded when the scrape started, before the request was sent.
     pub scrape_timestamp_ms: i64,
     /// End-to-end HTTP request + body read wall-clock duration.
     pub fetch_duration: Duration,
@@ -264,6 +264,7 @@ impl TargetFetcher for ReqwestFetcher {
         pool: &BodyBufferPool,
     ) -> Result<FetchedScrape, ScrapeError> {
         let started = Instant::now();
+        let scrape_timestamp_ms = current_timestamp_ms();
         let timeout = self.scrape_timeout;
 
         let accept_encoding = if self.enable_compression {
@@ -372,7 +373,6 @@ impl TargetFetcher for ReqwestFetcher {
         .await
         .map_err(|_| ScrapeError::TimedOut { timeout })??;
 
-        let scrape_timestamp_ms = current_timestamp_ms();
         let fetch_duration = header_elapsed.saturating_add(body_started.elapsed());
 
         Ok(FetchedScrape {
@@ -776,6 +776,51 @@ demo_requests_total{instance=\"b\",method=\"POST\"} 40\n\
         drop(fetched);
 
         release.await.expect("release join");
+        server.await.expect("server join");
+    }
+
+    #[tokio::test]
+    async fn scrape_timestamp_is_taken_before_a_slow_body_is_read() {
+        const BODY_DELAY: Duration = Duration::from_millis(250);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut req_buf = [0u8; 1024];
+            let _ = sock.read(&mut req_buf).await.expect("read");
+            let body = b"up_metric 1\n";
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(hdr.as_bytes()).await.expect("write hdr");
+            sock.flush().await.expect("flush hdr");
+            tokio::time::sleep(BODY_DELAY).await;
+            sock.write_all(body).await.expect("write body");
+        });
+
+        let cfg = ScrapeConfig::new("slow-body")
+            .with_scrape_interval(Duration::from_secs(5))
+            .with_scrape_timeout(Duration::from_secs(2));
+        let fetcher = ReqwestFetcher::new(&cfg).expect("fetcher");
+        let pool = BodyBufferPool::new(NonZeroUsize::MIN, cfg.max_retained_body_bytes);
+        let target = ScrapeTarget::parse(&format!("http://{addr}/metrics")).expect("target");
+
+        let before_ms = current_timestamp_ms();
+        let fetched = fetcher.fetch(&target, &pool).await.expect("fetch");
+        let after_ms = current_timestamp_ms();
+
+        assert_eq!(fetched.body.as_slice(), b"up_metric 1\n");
+        assert!(fetched.scrape_timestamp_ms >= before_ms);
+        let body_delay_ms = i64::try_from(BODY_DELAY.as_millis()).expect("delay ms");
+        assert!(
+            after_ms - fetched.scrape_timestamp_ms >= body_delay_ms,
+            "scrape timestamp {} must precede the {body_delay_ms}ms body delay (fetch ended at {after_ms})",
+            fetched.scrape_timestamp_ms
+        );
+
         server.await.expect("server join");
     }
 
