@@ -226,7 +226,10 @@ pub struct ResolvConf {
     pub search: Vec<String>,
     /// Threshold of dots in a query name before initial absolute lookup (`ndots`, default `1`).
     pub ndots: usize,
-    /// Per-query timeout (default `5s`).
+    /// Per-server query timeout parsed from `options timeout:<secs>` (default `5s`, clamped to
+    /// `1..=30s` per `resolv.conf(5)`). Unlike Prometheus `lookupFromAnyServer`, which leaves
+    /// `miekg/dns`'s `Client.Timeout` at its `2s` default, `DnsDiscovery` applies this configured
+    /// timeout directly to each nameserver query.
     pub timeout: Duration,
 }
 
