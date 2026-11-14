@@ -177,9 +177,10 @@ fn dns_discovery_records_match_prometheus_dns_test() {
     let groups = sd
         .refresh_with(|_, qtype| {
             assert_eq!(qtype, DnsRecordType::Aaaa);
-            Ok(vec![DnsRecord::Aaaa(
-                "2001:db8::2".parse::<Ipv6Addr>().unwrap(),
-            )])
+            Ok(vec![
+                DnsRecord::Aaaa("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+                DnsRecord::Aaaa("::ffff:10.0.0.1".parse::<Ipv6Addr>().unwrap()),
+            ])
         })
         .unwrap();
     assert_eq!(
@@ -187,14 +188,24 @@ fn dns_discovery_records_match_prometheus_dns_test() {
         vec![TargetGroup {
             source: "web.example.com.".to_owned(),
             labels: BTreeMap::new(),
-            targets: vec![label_set(&[
-                ("__address__", "[2001:db8::2]:80"),
-                ("__meta_dns_name", "web.example.com."),
-                ("__meta_dns_srv_record_target", ""),
-                ("__meta_dns_srv_record_port", ""),
-                ("__meta_dns_mx_record_target", ""),
-                ("__meta_dns_ns_record_target", ""),
-            ])],
+            targets: vec![
+                label_set(&[
+                    ("__address__", "[2001:db8::2]:80"),
+                    ("__meta_dns_name", "web.example.com."),
+                    ("__meta_dns_srv_record_target", ""),
+                    ("__meta_dns_srv_record_port", ""),
+                    ("__meta_dns_mx_record_target", ""),
+                    ("__meta_dns_ns_record_target", ""),
+                ]),
+                label_set(&[
+                    ("__address__", "10.0.0.1:80"),
+                    ("__meta_dns_name", "web.example.com."),
+                    ("__meta_dns_srv_record_target", ""),
+                    ("__meta_dns_srv_record_port", ""),
+                    ("__meta_dns_mx_record_target", ""),
+                    ("__meta_dns_ns_record_target", ""),
+                ]),
+            ],
         }]
     );
 
