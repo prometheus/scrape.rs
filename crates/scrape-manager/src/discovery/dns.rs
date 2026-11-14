@@ -252,6 +252,10 @@ impl ResolvConf {
     }
 
     /// Parses the textual contents of an `/etc/resolv.conf` file.
+    ///
+    /// In addition to bare IPv4/IPv6 (and zoned IPv6) `nameserver` entries on port `53`, this
+    /// parser also accepts `ip:port` and `[ipv6]:port` socket addresses so callers and tests can
+    /// target custom per-server ports.
     pub fn parse(content: &str) -> Self {
         let mut servers = Vec::new();
         let mut search = Vec::new();
@@ -590,6 +594,8 @@ fn records_to_target_group(
     }
 }
 
+// Search-path candidates whose encoded wire QNAME exceeds the 255-octet RFC 1035 limit are skipped
+// up front rather than failing later during packet encoding as in `miekg/dns` `ClientConfig.NameList`.
 fn candidate_query_names(name: &str, conf: &ResolvConf) -> Vec<String> {
     if name.ends_with('.') {
         return vec![name.to_owned()];
