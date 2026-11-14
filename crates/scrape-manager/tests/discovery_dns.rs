@@ -646,14 +646,76 @@ fn dns_multi_server_fallback_search_path_and_localset() {
         assert_eq!(groups[3].source, "nodata");
         assert!(groups[3].targets.is_empty());
 
+        let queries = srv2_queries.borrow().clone();
+        let rec_one = queries
+            .iter()
+            .position(|q| q == "recover.one.local.")
+            .expect("recover.one.local. queried on srv2");
+        let rec_two = queries
+            .iter()
+            .position(|q| q == "recover.two.local.")
+            .expect("recover.two.local. queried on srv2");
+        assert!(rec_one < rec_two);
+        let mut sorted_queries = queries;
+        sorted_queries.sort();
         assert_eq!(
-            *srv2_queries.borrow(),
+            sorted_queries,
             vec![
+                "flaky.one.local.".to_owned(),
                 "hit.two.local.".to_owned(),
                 "recover.one.local.".to_owned(),
                 "recover.two.local.".to_owned(),
-                "flaky.one.local.".to_owned(),
             ]
         );
+
+        // Verify that multiple names in a single refresh resolve concurrently rather than waiting
+        // sequentially for each name to finish.
+        let barrier_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let barrier_addr = barrier_udp.local_addr().unwrap();
+        tokio::task::spawn_local(async move {
+            let mut buf1 = [0u8; 512];
+            let mut buf2 = [0u8; 512];
+            // Wait until both queries arrive before answering either one.
+            let (len1, peer1) = barrier_udp.recv_from(&mut buf1).await.unwrap();
+            let (len2, peer2) = barrier_udp.recv_from(&mut buf2).await.unwrap();
+            for (pkt, peer) in [(&buf1[..len1], peer1), (&buf2[..len2], peer2)] {
+                let (_, qend) = decode_qname_from_query(pkt);
+                let mut resp = Vec::new();
+                resp.extend_from_slice(&pkt[0..2]);
+                resp.extend_from_slice(&0x8180u16.to_be_bytes());
+                resp.extend_from_slice(&1u16.to_be_bytes());
+                resp.extend_from_slice(&1u16.to_be_bytes());
+                resp.extend_from_slice(&0u16.to_be_bytes());
+                resp.extend_from_slice(&0u16.to_be_bytes());
+                resp.extend_from_slice(&pkt[12..qend]);
+                resp.push(0);
+                resp.extend_from_slice(&1u16.to_be_bytes());
+                resp.extend_from_slice(&1u16.to_be_bytes());
+                resp.extend_from_slice(&60u32.to_be_bytes());
+                resp.extend_from_slice(&4u16.to_be_bytes());
+                resp.extend_from_slice(&[10, 9, 8, 7]);
+                let _ = barrier_udp.send_to(&resp, peer).await;
+            }
+        });
+
+        let concurrent_sd = DnsDiscovery::with_resolv_conf(
+            DnsSdConfig {
+                names: vec!["first.local.".to_owned(), "second.local.".to_owned()],
+                refresh_interval: Duration::from_secs(15),
+                record_type: "A".to_owned(),
+                port: 8080,
+            },
+            ResolvConf {
+                servers: vec![barrier_addr],
+                search: Vec::new(),
+                ndots: 1,
+                timeout: Duration::from_millis(500),
+            },
+        )
+        .unwrap();
+        let concurrent_groups = concurrent_sd.refresh().await.unwrap();
+        assert_eq!(concurrent_groups.len(), 2);
+        assert_eq!(concurrent_groups[0].source, "first.local.");
+        assert_eq!(concurrent_groups[1].source, "second.local.");
     });
 }
