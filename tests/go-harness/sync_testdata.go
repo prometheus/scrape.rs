@@ -14,9 +14,10 @@
 //go:generate go run .
 
 // Command sync_testdata resolves the pinned github.com/prometheus/common and
-// github.com/prometheus/prometheus modules from go.mod, copies their expfmt and
-// model/textparse testdata files, and extracts canonical parser test inputs from
-// model/textparse/*_test.go into the repository's top-level testdata/ directory.
+// github.com/prometheus/prometheus modules from go.mod, copies their expfmt,
+// model/textparse, config, and common/config testdata files, and extracts
+// canonical parser and config test inputs and expectations into the
+// repository's top-level testdata/ directory.
 // It also writes the entries textparse.NewPromParser returns for each Prometheus
 // text fixture to testdata/promparse/, and the entries
 // textparse.NewOpenMetricsParser returns for each OpenMetrics fixture to
@@ -175,6 +176,32 @@ func run() error {
 	}
 	synced = append(synced, protobufParseFiles...)
 
+	configFiles, err := copyDirFilesRecursive(
+		filepath.Join(promMod.Dir, "config", "testdata"),
+		filepath.Join(outRoot, "config"),
+		outRoot,
+	)
+	if err != nil {
+		return err
+	}
+	synced = append(synced, configFiles...)
+
+	httpConfigFiles, err := copyDirFilesRecursive(
+		filepath.Join(commonMod.Dir, "config", "testdata"),
+		filepath.Join(outRoot, "http_config"),
+		outRoot,
+	)
+	if err != nil {
+		return err
+	}
+	synced = append(synced, httpConfigFiles...)
+
+	configExpectedFiles, err := writeConfigExpected(outRoot, promMod.Dir, commonMod.Dir)
+	if err != nil {
+		return err
+	}
+	synced = append(synced, configExpectedFiles...)
+
 	sort.Strings(synced)
 	m := manifest{
 		Modules: map[string]string{
@@ -241,6 +268,46 @@ func copyDirFiles(srcDir, dstDir, outRoot string) ([]string, error) {
 			return nil, err
 		}
 		copied = append(copied, filepath.ToSlash(rel))
+	}
+	return copied, nil
+}
+
+func copyDirFilesRecursive(srcDir, dstDir, outRoot string) ([]string, error) {
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir %s: %w", dstDir, err)
+	}
+	var copied []string
+	err := filepath.WalkDir(srcDir, func(srcPath string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !d.Type().IsRegular() {
+			return nil
+		}
+		relToSrc, err := filepath.Rel(srcDir, srcPath)
+		if err != nil {
+			return err
+		}
+		dstPath := filepath.Join(dstDir, relToSrc)
+		if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", filepath.Dir(dstPath), err)
+		}
+		data, err := os.ReadFile(srcPath)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", srcPath, err)
+		}
+		if err := os.WriteFile(dstPath, data, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", dstPath, err)
+		}
+		rel, err := filepath.Rel(outRoot, dstPath)
+		if err != nil {
+			return err
+		}
+		copied = append(copied, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("walk %s: %w", srcDir, err)
 	}
 	return copied, nil
 }
