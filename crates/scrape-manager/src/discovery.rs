@@ -11,7 +11,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Prometheus-compatible target discovery configuration and target group types.
+//! Prometheus-compatible target discovery (`static_configs` and `dns_sd_configs`).
+
+pub mod dns;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -19,6 +21,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+pub use dns::{DnsDiscovery, DnsRecord, DnsRecordType, DnsSdConfig, ResolvConf};
 pub use prometheus_relabel::{ADDRESS_LABEL, LabelSet, ValidationScheme};
 
 /// Error returned when validating or running target discovery.
@@ -31,12 +34,15 @@ pub enum DiscoveryError {
     /// I/O or filesystem error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// DNS protocol or lookup error.
+    #[error("DNS error: {0}")]
+    Dns(String),
     /// JSON payload decoding error.
     #[error("JSON decode error: {0}")]
     Json(#[from] serde_json::Error),
 }
 
-fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub(crate) fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: Default + Deserialize<'de>,
@@ -177,17 +183,36 @@ pub struct DiscoveryConfigs {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub static_configs: Vec<StaticConfig>,
+    /// DNS service discovery configurations (`dns_sd_configs`).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub dns_sd_configs: Vec<DnsSdConfig>,
 }
 
 impl DiscoveryConfigs {
     /// Validates all configured service discovery sections according to Prometheus rules.
     pub fn validate(&mut self) -> Result<(), DiscoveryError> {
+        for dns_cfg in &mut self.dns_sd_configs {
+            dns_cfg.validate()?;
+        }
         Ok(())
     }
 
     /// Resolves the configured `static_configs` into [`TargetGroup`]s.
     pub fn resolve_static(&self) -> Vec<TargetGroup> {
         resolve_static_configs(&self.static_configs)
+    }
+}
+
+/// Joins a host and port into `"host:port"` or `"[ipv6]:port"`, matching Go `net.JoinHostPort`.
+pub(crate) fn join_host_port(host: &str, port: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -229,4 +254,26 @@ pub fn format_duration(d: Duration) -> String {
     append_unit("ms", 1, false);
 
     out
+}
+
+pub(crate) mod serde_duration {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::{format_duration, parse_duration};
+
+    pub fn serialize<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format_duration(*duration))
+    }
+
+    pub fn deserialize_or<'de, D: Deserializer<'de>>(
+        deserializer: D,
+        default: Duration,
+    ) -> Result<Duration, D::Error> {
+        match Option::<String>::deserialize(deserializer)? {
+            Some(s) => parse_duration(&s).map_err(serde::de::Error::custom),
+            None => Ok(default),
+        }
+    }
 }
