@@ -14,7 +14,7 @@
 //! Integration tests for Prometheus DNS service discovery (`dns_sd_configs`).
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::time::Duration;
 
 use prometheus_scrape_manager::discovery::{
@@ -525,6 +525,22 @@ fn dns_multi_server_fallback_search_path_and_localset() {
     assert_eq!(min_and_override.servers, ResolvConf::default().servers);
     assert!(min_and_override.search.is_empty());
     assert_eq!(min_and_override.timeout, Duration::from_secs(1));
+
+    // Zoned IPv6 nameservers (e.g. `fe80::1%eth0` or `fe80::1%2`) are preserved rather than
+    // falling back to 127.0.0.1:53.
+    let zoned = ResolvConf::parse(
+        "nameserver fe80::1%eth0\nnameserver fe80::1%2\nnameserver [fe80::1%eth0]:5353\n",
+    );
+    let fe80_1 = "fe80::1".parse::<Ipv6Addr>().unwrap();
+    assert_eq!(zoned.servers.len(), 3);
+    assert_eq!(zoned.servers[0].ip(), IpAddr::V6(fe80_1));
+    assert_eq!(zoned.servers[0].port(), 53);
+    assert_eq!(
+        zoned.servers[1],
+        SocketAddr::V6(SocketAddrV6::new(fe80_1, 53, 0, 2))
+    );
+    assert_eq!(zoned.servers[2].ip(), IpAddr::V6(fe80_1));
+    assert_eq!(zoned.servers[2].port(), 5353);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

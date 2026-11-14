@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::collections::hash_map::RandomState;
 use std::fs;
 use std::hash::BuildHasher;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -266,12 +266,10 @@ impl ResolvConf {
             };
             match directive {
                 "nameserver" => {
-                    if let Some(addr_str) = parts.next() {
-                        if let Ok(ip) = addr_str.parse::<IpAddr>() {
-                            servers.push(SocketAddr::new(ip, 53));
-                        } else if let Ok(sa) = addr_str.parse::<SocketAddr>() {
-                            servers.push(sa);
-                        }
+                    if let Some(addr_str) = parts.next()
+                        && let Some(sa) = parse_nameserver(addr_str)
+                    {
+                        servers.push(sa);
                     }
                 }
                 "domain" => {
@@ -320,6 +318,42 @@ impl ResolvConf {
             timeout,
         }
     }
+}
+
+fn parse_nameserver(addr_str: &str) -> Option<SocketAddr> {
+    if let Ok(ip) = addr_str.parse::<IpAddr>() {
+        return Some(SocketAddr::new(ip, 53));
+    }
+    if let Ok(sa) = addr_str.parse::<SocketAddr>() {
+        return Some(sa);
+    }
+    let (ip_zone, port) = if let Some(rest) = addr_str.strip_prefix('[') {
+        let (inner, port_str) = rest.split_once("]:")?;
+        (inner, port_str.parse::<u16>().ok()?)
+    } else {
+        (addr_str, 53)
+    };
+    let (ip_str, zone) = ip_zone.split_once('%')?;
+    if zone.is_empty() {
+        return None;
+    }
+    let ip = ip_str.parse::<Ipv6Addr>().ok()?;
+    let scope_id = if let Ok(id) = zone.parse::<u32>() {
+        id
+    } else {
+        let host = format!("{ip_str}%{zone}");
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addrs| {
+                addrs.find_map(|sa| match sa {
+                    SocketAddr::V6(v6) => Some(v6.scope_id()),
+                    SocketAddr::V4(_) => None,
+                })
+            })
+            .unwrap_or(0)
+    };
+    Some(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, scope_id)))
 }
 
 /// DNS service discovery runner matching Prometheus `discovery/dns.Discovery`.
