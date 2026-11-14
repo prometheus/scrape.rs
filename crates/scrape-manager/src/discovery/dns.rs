@@ -381,9 +381,15 @@ impl DnsDiscovery {
                 &owned_conf
             }
         };
+        let lookups = self
+            .config
+            .names
+            .iter()
+            .map(|name| self.lookup_with_search_path(name, conf));
+        let results = futures_util::future::join_all(lookups).await;
         let mut groups = Vec::with_capacity(self.config.names.len());
-        for name in &self.config.names {
-            if let Ok(records) = self.lookup_with_search_path(name, conf).await {
+        for (name, res) in self.config.names.iter().zip(results) {
+            if let Ok(records) = res {
                 groups.push(records_to_target_group(
                     name,
                     self.record_type,
