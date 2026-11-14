@@ -19,5 +19,11 @@ pub mod arrow;
 pub mod dto;
 pub mod format;
 // Layer 0 parsers remain crate-internal; `arrow` and `dto` expose the public decoding APIs.
+// `bench-internals` exposes them to the parser benchmarks only, with no stability guarantees.
+#[cfg(not(feature = "bench-internals"))]
 #[allow(dead_code, unused_imports)]
 pub(crate) mod parse;
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[allow(dead_code, unused_imports)]
+pub mod parse;
