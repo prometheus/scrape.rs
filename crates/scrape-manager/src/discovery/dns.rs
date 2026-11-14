@@ -1009,12 +1009,11 @@ fn decode_dns_name_bounded(
         }
         let label = std::str::from_utf8(&msg[start..end])
             .map_err(|e| DiscoveryError::Dns(format!("non-UTF-8 DNS label: {e}")))?;
-        if !is_safe_dns_label(label) {
-            return Err(DiscoveryError::Dns(format!(
-                "unsafe character in DNS label {label:?}"
-            )));
+        if label.contains('.') {
+            labels.push(label.replace('.', "\\."));
+        } else {
+            labels.push(label.to_owned());
         }
-        labels.push(label.to_owned());
         offset = end;
     }
 }
@@ -1138,17 +1137,20 @@ mod tests {
         oob_pkt[13] = 0xFF;
         assert!(decode_dns_response(0x5052, "example.com.", QTYPE_A, &oob_pkt).is_err());
 
-        // Unsafe characters in decoded SRV/NS target hostnames are rejected.
+        // Owner names (e.g. `My Printer.x.` in answer or additional records) do not fail the
+        // response, while unsafe characters in SRV/MX/NS targets are filtered out by
+        // `records_to_target_group` (`is_safe_domain_target`).
         let mut unsafe_ns = Vec::new();
         unsafe_ns.extend_from_slice(&0x5052u16.to_be_bytes());
         unsafe_ns.extend_from_slice(&0x8180u16.to_be_bytes());
         unsafe_ns.extend_from_slice(&1u16.to_be_bytes());
+        unsafe_ns.extend_from_slice(&2u16.to_be_bytes());
+        unsafe_ns.extend_from_slice(&0u16.to_be_bytes());
         unsafe_ns.extend_from_slice(&1u16.to_be_bytes());
-        unsafe_ns.extend_from_slice(&0u16.to_be_bytes());
-        unsafe_ns.extend_from_slice(&0u16.to_be_bytes());
         unsafe_ns.push(0);
         unsafe_ns.extend_from_slice(&QTYPE_NS.to_be_bytes());
         unsafe_ns.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        // Answer 1: bad target `bad@evil.com.`
         unsafe_ns.push(0);
         unsafe_ns.extend_from_slice(&QTYPE_NS.to_be_bytes());
         unsafe_ns.extend_from_slice(&QCLASS_IN.to_be_bytes());
@@ -1156,7 +1158,32 @@ mod tests {
         let bad_target = b"\x0bad@evil.com\x00";
         unsafe_ns.extend_from_slice(&(bad_target.len() as u16).to_be_bytes());
         unsafe_ns.extend_from_slice(bad_target);
-        assert!(decode_dns_response(0x5052, ".", QTYPE_NS, &unsafe_ns).is_err());
+        // Answer 2: valid target `ns1.example.com.` with owner name `My Printer.x.`
+        unsafe_ns.extend_from_slice(b"\x0aMy Printer\x01x\x00");
+        unsafe_ns.extend_from_slice(&QTYPE_NS.to_be_bytes());
+        unsafe_ns.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        unsafe_ns.extend_from_slice(&60u32.to_be_bytes());
+        let good_target = b"\x03ns1\x07example\x03com\x00";
+        unsafe_ns.extend_from_slice(&(good_target.len() as u16).to_be_bytes());
+        unsafe_ns.extend_from_slice(good_target);
+        // Additional 1: TXT record with owner name `My Printer.x.`
+        unsafe_ns.extend_from_slice(b"\x0aMy Printer\x01x\x00");
+        unsafe_ns.extend_from_slice(&16u16.to_be_bytes());
+        unsafe_ns.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        unsafe_ns.extend_from_slice(&60u32.to_be_bytes());
+        unsafe_ns.extend_from_slice(&1u16.to_be_bytes());
+        unsafe_ns.push(0);
+        let DecodedDnsMessage::Records(ns_records) =
+            decode_dns_response(0x5052, ".", QTYPE_NS, &unsafe_ns).unwrap()
+        else {
+            panic!("expected decoded NS records");
+        };
+        let ns_group = records_to_target_group(".", DnsRecordType::Ns, 53, &ns_records);
+        assert_eq!(ns_group.targets.len(), 1);
+        assert_eq!(
+            ns_group.targets[0].get(ADDRESS_LABEL),
+            Some(&"ns1.example.com:53".to_owned())
+        );
 
         // Trailing extra byte inside NS RDATA is rejected.
         let mut trailing_ns = Vec::new();
