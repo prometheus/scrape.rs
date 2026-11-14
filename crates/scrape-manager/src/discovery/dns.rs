@@ -557,7 +557,10 @@ fn records_to_target_group(
                 addr_port = default_port;
             }
             (DnsRecordType::Aaaa, DnsRecord::Aaaa(ip)) => {
-                target_host_raw = ip.to_string();
+                target_host_raw = match ip.to_ipv4_mapped() {
+                    Some(v4) => v4.to_string(),
+                    None => ip.to_string(),
+                };
                 addr_port = default_port;
             }
             _ => continue,
