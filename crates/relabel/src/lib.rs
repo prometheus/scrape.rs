@@ -66,7 +66,7 @@ pub enum RelabelError {
     #[error("{0}")]
     InvalidConfig(String),
     /// Invalid regular expression pattern.
-    #[error("invalid regex: {0}")]
+    #[error("error parsing regexp: {0}")]
     InvalidRegex(String),
     /// Target population error after relabeling.
     #[error("{0}")]
@@ -156,7 +156,7 @@ impl<'de> Deserialize<'de> for Action {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = Option::<String>::deserialize(deserializer)?;
         match s {
-            None => Ok(Self::Replace),
+            None => Err(serde::de::Error::custom("relabel action cannot be empty")),
             Some(val) => Self::parse(&val).map_err(serde::de::Error::custom),
         }
     }
@@ -304,8 +304,56 @@ impl Serialize for Regexp {
 
 impl<'de> Deserialize<'de> for Regexp {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let opt = Option::<String>::deserialize(deserializer)?;
-        let pattern = opt.unwrap_or_default();
+        struct RegexpVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for RegexpVisitor {
+            type Value = String;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a regular expression string or scalar")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(v.to_owned())
+            }
+
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(v)
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(v.to_string())
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(v.to_string())
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                Ok(v.to_string())
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(v.to_string())
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(String::new())
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(String::new())
+            }
+
+            fn visit_some<D2: Deserializer<'de>>(
+                self,
+                deserializer: D2,
+            ) -> Result<Self::Value, D2::Error> {
+                deserializer.deserialize_any(RegexpVisitor)
+            }
+        }
+
+        let pattern = deserializer.deserialize_any(RegexpVisitor)?;
         Self::new(&pattern).map_err(serde::de::Error::custom)
     }
 }
