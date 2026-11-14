@@ -36,6 +36,10 @@ benchfmt = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [[bench]]
+name = "discovery_dns"
+harness = false
+
+[[bench]]
 name = "scrape"
 harness = false
 required-features = ["arrow"]
