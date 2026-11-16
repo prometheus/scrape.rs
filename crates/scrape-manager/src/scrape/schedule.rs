@@ -14,7 +14,7 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::time::Instant;
 
@@ -23,7 +23,8 @@ use crate::scrape::ScrapeTarget;
 const FNV_OFFSET_BASIS_64: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME_64: u64 = 0x0000_0100_0000_01b3;
 
-/// Computes the deterministic initial phase offset in `[0, interval)` for `target`.
+/// Computes the deterministic phase offset in `[0, interval)` for `target`, measured from the
+/// wall-clock multiples of `interval`.
 ///
 /// Mirrors Go Prometheus `Target.offset` by hashing `jitter_seed`, the target URL, and sorted
 /// target labels with 64-bit FNV-1a without heap allocations. Identical targets always map to the
@@ -51,6 +52,36 @@ fn hash_target_identity(target: &ScrapeTarget, jitter_seed: u64) -> u64 {
         h = fnv1a_byte(h, 0xff);
     }
     h
+}
+
+/// Returns the delay after a wall-clock instant `base_unix_nanos` until the next time whose
+/// position within `interval` equals `offset`, in `(0, interval]`.
+///
+/// Example: with `interval = 15s` and `offset = 3s`, a base at `:07` gives `8s` (`:15`) to the next
+/// boundary, plus `3s` equals `11s` (`:18`). A base at `:01` gives `14s + 3s = 17s`, which
+/// exceeds the interval and wraps to `2s` (`:03`).
+fn wall_clock_anchored_delay(
+    offset: Duration,
+    interval: Duration,
+    base_unix_nanos: u128,
+) -> Duration {
+    let interval_ns = interval.as_nanos();
+    if interval_ns == 0 {
+        return Duration::ZERO;
+    }
+    let offset_ns = offset.as_nanos() % interval_ns;
+    let mut next_ns = interval_ns - base_unix_nanos % interval_ns + offset_ns;
+    if next_ns > interval_ns {
+        next_ns -= interval_ns;
+    }
+    u64::try_from(next_ns).map_or(offset, Duration::from_nanos)
+}
+
+/// Returns the current wall-clock time in nanoseconds since the Unix epoch, or `0` before it.
+pub(crate) fn unix_nanos_now() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
 }
 
 #[inline]
@@ -110,7 +141,7 @@ pub(crate) struct DueTarget {
 /// Single-structure min-heap target timer queue (`O(N)` memory, `O(log N)` per scrape tick).
 ///
 /// Replaces spawning one sleeping task per target with a compact slot table and priority queue,
-/// preserving exact per-target periodic grids (`t_0 + offset + k * interval`) and skipping
+/// preserving exact per-target periodic grids (wall-clock `offset + k * interval`) and skipping
 /// overlapping scrapes of an already in-flight target.
 #[derive(Debug)]
 pub(crate) struct TargetSchedule {
@@ -142,13 +173,20 @@ impl TargetSchedule {
         }
     }
 
-    /// Reconciles the active target list against `targets` at `base_instant`.
+    /// Reconciles the active target list against `targets` at `base_instant`, which corresponds
+    /// to the wall-clock time `base_unix_nanos`.
     ///
     /// Unchanged targets preserve their existing `next_due` phase and `in_flight` state without
-    /// cloning URL or label allocations; newly discovered targets are scheduled at
-    /// `base_instant + target_offset(target)`. Duplicate targets within `targets` are deduplicated
-    /// automatically.
-    pub(crate) fn sync_targets(&mut self, targets: Vec<ScrapeTarget>, base_instant: Instant) {
+    /// cloning URL or label allocations. A newly discovered target is first due at the earliest
+    /// instant in `(base_instant, base_instant + interval]` whose wall-clock time is
+    /// `target_offset(target)` past a multiple of the interval, so its phase does not depend on
+    /// when the manager started. Duplicate targets within `targets` are deduplicated automatically.
+    pub(crate) fn sync_targets(
+        &mut self,
+        targets: Vec<ScrapeTarget>,
+        base_instant: Instant,
+        base_unix_nanos: u128,
+    ) {
         self.sync_epoch = self.sync_epoch.wrapping_add(1);
         let epoch = self.sync_epoch;
 
@@ -183,7 +221,8 @@ impl TargetSchedule {
             let generation = self.next_generation;
             self.next_generation = self.next_generation.wrapping_add(1);
             let offset = target_offset(&target, self.interval, self.jitter_seed);
-            let due = base_instant.checked_add(offset).unwrap_or(base_instant);
+            let delay = wall_clock_anchored_delay(offset, self.interval, base_unix_nanos);
+            let due = base_instant.checked_add(delay).unwrap_or(base_instant);
             let target_arc = Arc::new(target);
 
             let slot = TargetSlot {
@@ -390,6 +429,80 @@ pub(crate) fn advance_grid_deadline(
 mod tests {
     use super::*;
 
+    const WALL_NANOS: u128 = 1_700_000_000_123_456_789;
+
+    #[test]
+    fn wall_clock_anchored_delay_matches_go_target_offset() {
+        let interval = Duration::from_secs(10);
+        let on_grid = 1_700_000_000_000_000_000_u128;
+        let two_secs_past = on_grid + 2_000_000_000;
+        let secs = Duration::from_secs;
+
+        assert_eq!(
+            wall_clock_anchored_delay(secs(0), interval, on_grid),
+            interval
+        );
+        assert_eq!(
+            wall_clock_anchored_delay(secs(3), interval, on_grid),
+            secs(3)
+        );
+        assert_eq!(
+            wall_clock_anchored_delay(secs(1), interval, two_secs_past),
+            secs(9)
+        );
+        assert_eq!(
+            wall_clock_anchored_delay(secs(5), interval, two_secs_past),
+            secs(3)
+        );
+        assert_eq!(
+            wall_clock_anchored_delay(secs(2), interval, two_secs_past),
+            interval
+        );
+        assert_eq!(
+            wall_clock_anchored_delay(secs(1), Duration::ZERO, two_secs_past),
+            Duration::ZERO
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_due_phase_is_anchored_to_wall_clock_not_start_time() {
+        let interval = Duration::from_secs(15);
+        let interval_ns = interval.as_nanos();
+        let targets: Vec<ScrapeTarget> = (0..8)
+            .map(|i| ScrapeTarget::parse(&format!("http://10.0.0.{i}:9100/metrics")).expect("url"))
+            .collect();
+
+        // Two runs that start at unrelated monotonic instants and wall-clock times, like a
+        // process before and after a restart.
+        let runs = [
+            (Instant::now(), WALL_NANOS),
+            (
+                Instant::now() + Duration::from_secs(1_000),
+                WALL_NANOS + 37_250_000_123,
+            ),
+        ];
+
+        for target in &targets {
+            let offset_ns = target_offset(target, interval, 5).as_nanos();
+            for (base, base_wall) in runs {
+                let mut sched = TargetSchedule::new(interval, 5);
+                sched.sync_targets(vec![target.clone()], base, base_wall);
+                let delay = sched.peek_next_due().expect("due") - base;
+
+                assert!(
+                    delay > Duration::ZERO && delay <= interval,
+                    "delay {delay:?}"
+                );
+                assert_eq!(
+                    (base_wall + delay.as_nanos()) % interval_ns,
+                    offset_ns,
+                    "{} must be due at its offset past a wall-clock interval boundary",
+                    target.url()
+                );
+            }
+        }
+    }
+
     #[test]
     fn target_offset_is_deterministic_and_bounded_by_interval() {
         let interval = Duration::from_secs(15);
@@ -419,12 +532,13 @@ mod tests {
         let t2 = ScrapeTarget::parse("http://127.0.0.1:8082/metrics").expect("t2");
 
         let mut sched = TargetSchedule::new(interval, 7);
-        sched.sync_targets(vec![t1.clone()], base);
+        sched.sync_targets(vec![t1.clone()], base, WALL_NANOS);
 
         let first_due = sched.peek_next_due().expect("has due");
         // Re-syncing t1 plus adding t2 right after first_due must keep t1's original first_due intact.
         let later = first_due + Duration::from_nanos(1);
-        sched.sync_targets(vec![t1.clone(), t2.clone()], later);
+        let later_wall = WALL_NANOS + (later - base).as_nanos();
+        sched.sync_targets(vec![t1.clone(), t2.clone()], later, later_wall);
 
         let due_at_first = first_due;
         let popped = sched.pop_due(due_at_first).expect("t1 due");
@@ -462,17 +576,20 @@ mod tests {
         let t1 = ScrapeTarget::parse("http://127.0.0.1:8090/metrics").expect("t1");
 
         let mut sched = TargetSchedule::new(interval, 11);
-        sched.sync_targets(vec![t1.clone()], base);
+        sched.sync_targets(vec![t1.clone()], base, WALL_NANOS);
 
         let first_due = sched.peek_next_due().expect("due");
         let active = sched.pop_due(first_due).expect("pop first");
+        let wall_at = |at: Instant| WALL_NANOS + (at - base).as_nanos();
 
         // Flap SD: remove `t1` while in flight, peek (which drops its heap entry), then re-add `t1`.
-        sched.sync_targets(Vec::new(), first_due + Duration::from_secs(1));
+        let removed_at = first_due + Duration::from_secs(1);
+        sched.sync_targets(Vec::new(), removed_at, wall_at(removed_at));
         assert!(sched.is_empty());
         assert!(sched.peek_next_due().is_none());
 
-        sched.sync_targets(vec![t1.clone()], first_due + Duration::from_secs(2));
+        let readded_at = first_due + Duration::from_secs(2);
+        sched.sync_targets(vec![t1.clone()], readded_at, wall_at(readded_at));
         assert!(!sched.is_empty());
 
         // At the next grid tick while the first scrape is still running, `pop_due` must skip `t1`
@@ -499,7 +616,7 @@ mod tests {
         let t1 = ScrapeTarget::parse("http://127.0.0.1:8091/metrics").expect("t1");
 
         let mut sched = TargetSchedule::new(interval, 19);
-        sched.sync_targets(vec![t1.clone()], base);
+        sched.sync_targets(vec![t1.clone()], base, WALL_NANOS);
 
         let first_due = sched.peek_next_due().expect("due");
         let active = sched.pop_due(first_due).expect("pop first");
@@ -526,7 +643,7 @@ mod tests {
 
         for batch in 0..200 {
             let t = ScrapeTarget::parse(&format!("http://127.0.0.1:9100/m/{batch}")).expect("url");
-            sched.sync_targets(vec![t], base);
+            sched.sync_targets(vec![t], base, WALL_NANOS);
         }
         assert!(
             sched.heap.len() <= 64,

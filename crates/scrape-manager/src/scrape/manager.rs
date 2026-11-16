@@ -30,7 +30,7 @@ use tokio::time::{Instant, sleep_until};
 use crate::scrape::DecoderPool;
 #[cfg(feature = "arrow")]
 use crate::scrape::http::current_timestamp_ms;
-use crate::scrape::schedule::{TargetSchedule, advance_grid_deadline};
+use crate::scrape::schedule::{TargetSchedule, advance_grid_deadline, unix_nanos_now};
 use crate::scrape::{
     BodyBufferPool, FetchedScrape, ReqwestFetcher, SchedulingMode, ScrapeConfig, ScrapeError,
     ScrapeTarget, SequentialSchedule, TargetFetcher,
@@ -808,9 +808,11 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         let start_base = start_now
             .checked_add(self.config.initial_delay)
             .unwrap_or(start_now);
+        let start_base_unix_nanos =
+            unix_nanos_now().saturating_add(self.config.initial_delay.as_nanos());
         let mut schedule =
             TargetSchedule::new(self.config.scrape_interval, self.config.jitter_seed);
-        schedule.sync_targets(initial_targets, start_base);
+        schedule.sync_targets(initial_targets, start_base, start_base_unix_nanos);
 
         let mut in_flight = FuturesUnordered::new();
 
@@ -844,7 +846,13 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                 cmd = ctrl_rx.recv() => {
                     match cmd {
                         Some(ScrapeCommand::UpdateTargets(new_targets)) => {
-                            schedule.sync_targets(new_targets, Instant::now().max(start_base));
+                            let now = Instant::now();
+                            let (base, base_unix_nanos) = if now >= start_base {
+                                (now, unix_nanos_now())
+                            } else {
+                                (start_base, start_base_unix_nanos)
+                            };
+                            schedule.sync_targets(new_targets, base, base_unix_nanos);
                         }
                         Some(ScrapeCommand::Shutdown) | None => return,
                     }
