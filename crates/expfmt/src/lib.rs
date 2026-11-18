@@ -18,6 +18,8 @@ pub mod arrow;
 #[cfg(feature = "dto")]
 pub mod dto;
 pub mod format;
+#[cfg(feature = "arrow")]
+pub use prometheus_relabel as relabel;
 // Layer 0 parsers remain crate-internal; `arrow` and `dto` expose the public decoding APIs.
 #[allow(dead_code, unused_imports)]
 pub(crate) mod parse;

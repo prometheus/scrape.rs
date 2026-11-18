@@ -24,6 +24,7 @@ mod family;
 mod intern;
 mod options;
 mod records;
+mod relabel;
 mod schema;
 #[cfg(test)]
 mod tests;
@@ -53,6 +54,8 @@ pub use self::options::{
     UnitSuffixPolicy, UntypedPolicy,
 };
 pub use self::records::{MetricPayloadType, OtapMetricRecords};
+pub use self::relabel::MetricRelabelPlan;
+use self::relabel::{Stage2Scratch, apply_stage2_relabeling};
 pub use self::schema::{PROMETHEUS_TYPE_METADATA_KEY, SERVICE_INSTANCE_ID_ATTR, SERVICE_NAME_ATTR};
 
 /// Maximum distinct `UnivariateMetrics` rows representable in a single OTAP batch (`u16` IDs).
@@ -313,6 +316,10 @@ pub struct ArrowDecoder {
     hist_dp: HistogramDpTable,
     temp_attrs: Vec<(u32, u32)>,
     scratch: ScratchBuffers,
+    stage1_last_raw_name: Vec<u8>,
+    stage1_last_kept: bool,
+    stage1_cache_valid: bool,
+    stage2_scratch: Stage2Scratch,
 }
 
 impl Default for ArrowDecoder {
@@ -357,6 +364,10 @@ impl ArrowDecoder {
             hist_dp: HistogramDpTable::default(),
             temp_attrs: Vec::new(),
             scratch: ScratchBuffers::with_capacity(metrics, data_points, attrs),
+            stage1_last_raw_name: Vec::new(),
+            stage1_last_kept: true,
+            stage1_cache_valid: false,
+            stage2_scratch: Stage2Scratch::default(),
         }
     }
 
@@ -378,6 +389,8 @@ impl ArrowDecoder {
             + self.hist_dp.retained_memory_bytes()
             + self.temp_attrs.capacity() * size_of::<(u32, u32)>()
             + self.scratch.retained_memory_bytes()
+            + self.stage1_last_raw_name.capacity()
+            + self.stage2_scratch.retained_memory_bytes()
     }
 
     /// Decodes a single exposition scrape buffer of `format` into OTAP metric
@@ -730,6 +743,9 @@ impl ArrowDecoder {
         self.scrape_id = next_scrape_id();
         self.current_family.clear();
         self.assembly.clear();
+        self.stage1_last_raw_name.clear();
+        self.stage1_last_kept = true;
+        self.stage1_cache_valid = false;
         self.reset_batch();
     }
 
@@ -848,6 +864,9 @@ impl ArrowDecoder {
                         if CHUNKED {
                             self.reset_batch();
                         }
+                        if batch.is_empty() {
+                            return Ok(DecodeStep::Done);
+                        }
                         return Ok(DecodeStep::Batch(batch));
                     }
                 }
@@ -869,67 +888,87 @@ impl ArrowDecoder {
                             offset: name_offset,
                         });
                     }
-                    let role = if self.current_family.active
-                        && self.current_family.raw_name.as_slice() == raw_name
-                        && !matches!(
-                            self.current_family.metric_type,
-                            MetricType::Histogram | MetricType::GaugeHistogram
-                        ) {
-                        if self.current_family.metric_type == MetricType::Summary {
-                            SeriesRole::SummaryQuantile
-                        } else {
-                            SeriesRole::Scalar
+                    let mut stage1_kept = true;
+                    if let Some(plan) = opts.metric_relabel_plan.as_deref() {
+                        let stage1 = plan.stage1_configs();
+                        if !stage1.is_empty() {
+                            stage1_kept =
+                                self.check_stage1_metric_name(raw_name, name_offset, stage1)?;
                         }
-                    } else {
-                        let unescaped = unescape_bytes_into(raw_name, true, &mut self.unescape_buf);
-                        if let Some(r) = self.current_family.classify_series(unescaped) {
-                            r
+                    }
+                    if stage1_kept {
+                        let role = if self.current_family.active
+                            && self.current_family.raw_name.as_slice() == raw_name
+                            && !matches!(
+                                self.current_family.metric_type,
+                                MetricType::Histogram | MetricType::GaugeHistogram
+                            ) {
+                            if self.current_family.metric_type == MetricType::Summary {
+                                SeriesRole::SummaryQuantile
+                            } else {
+                                SeriesRole::Scalar
+                            }
                         } else {
-                            self.series_name_buf.clear();
-                            self.series_name_buf.extend_from_slice(unescaped);
-                            self.flush_pending_family(opts, default_ts_ns)?;
-                            if CHUNKED && self.total_data_points() >= max_data_points {
+                            let unescaped =
+                                unescape_bytes_into(raw_name, true, &mut self.unescape_buf);
+                            if let Some(r) = self.current_family.classify_series(unescaped) {
+                                r
+                            } else {
+                                self.series_name_buf.clear();
+                                self.series_name_buf.extend_from_slice(unescaped);
+                                self.flush_pending_family(opts, default_ts_ns)?;
+                                if CHUNKED && self.total_data_points() >= max_data_points {
+                                    self.current_family
+                                        .start_new(raw_name, &self.series_name_buf);
+                                    *pending_series = true;
+                                    let batch =
+                                        self.finish_batches(opts, default_ts_ns.is_some())?;
+                                    self.reset_batch();
+                                    if !batch.is_empty() {
+                                        return Ok(DecodeStep::Batch(batch));
+                                    }
+                                    continue;
+                                }
                                 self.current_family
                                     .start_new(raw_name, &self.series_name_buf);
+                                SeriesRole::Scalar
+                            }
+                        };
+
+                        if CHUNKED {
+                            let split_assembled = !self.assembly.is_empty()
+                                && self.batch_data_points() >= max_data_points
+                                && !self.series_matches_staged_group(parser, role);
+                            let split_scalar = self.assembly.is_empty()
+                                && (self.total_data_points() >= max_data_points
+                                    || (self.current_family.batch_id.is_none()
+                                        && self.metrics.len() >= MAX_METRICS_PER_BATCH));
+                            if split_assembled || split_scalar {
+                                if split_assembled {
+                                    self.flush_pending_family(opts, default_ts_ns)?;
+                                }
                                 *pending_series = true;
                                 let batch = self.finish_batches(opts, default_ts_ns.is_some())?;
                                 self.reset_batch();
-                                return Ok(DecodeStep::Batch(batch));
+                                if !batch.is_empty() {
+                                    return Ok(DecodeStep::Batch(batch));
+                                }
+                                continue;
                             }
-                            self.current_family
-                                .start_new(raw_name, &self.series_name_buf);
-                            SeriesRole::Scalar
                         }
-                    };
 
-                    if CHUNKED {
-                        let split_assembled = !self.assembly.is_empty()
-                            && self.batch_data_points() >= max_data_points
-                            && !self.series_matches_staged_group(parser, role);
-                        let split_scalar = self.assembly.is_empty()
-                            && (self.total_data_points() >= max_data_points
-                                || (self.current_family.batch_id.is_none()
-                                    && self.metrics.len() >= MAX_METRICS_PER_BATCH));
-                        if split_assembled || split_scalar {
-                            if split_assembled {
-                                self.flush_pending_family(opts, default_ts_ns)?;
-                            }
-                            *pending_series = true;
+                        self.ingest_series_entry(parser, role, opts, default_ts_ns)?;
+
+                        if CHUNKED
+                            && self.assembly.is_empty()
+                            && self.total_data_points() >= max_data_points
+                        {
                             let batch = self.finish_batches(opts, default_ts_ns.is_some())?;
                             self.reset_batch();
-                            return Ok(DecodeStep::Batch(batch));
+                            if !batch.is_empty() {
+                                return Ok(DecodeStep::Batch(batch));
+                            }
                         }
-                    }
-
-                    self.ingest_series_entry(parser, role, opts, default_ts_ns)?;
-
-                    if CHUNKED
-                        && self.assembly.is_empty()
-                        && self.total_data_points() >= max_data_points
-                    {
-                        let batch = self.finish_batches(opts, default_ts_ns.is_some())?;
-                        self.reset_batch();
-                        return Ok(DecodeStep::Batch(batch));
                     }
                 }
             }
@@ -1549,6 +1588,28 @@ impl ArrowDecoder {
         Ok(())
     }
 
+    #[inline]
+    fn check_stage1_metric_name(
+        &mut self,
+        raw_name: &[u8],
+        name_offset: usize,
+        stage1: &[prometheus_relabel::Config],
+    ) -> Result<bool, DecodeError> {
+        if self.stage1_cache_valid && self.stage1_last_raw_name.as_slice() == raw_name {
+            return Ok(self.stage1_last_kept);
+        }
+        let unescaped = unescape_bytes_into(raw_name, true, &mut self.unescape_buf);
+        let name_str = std::str::from_utf8(unescaped).map_err(|_| DecodeError::InvalidUtf8 {
+            offset: name_offset,
+        })?;
+        let kept = prometheus_relabel::keep_metric_name(name_str, stage1);
+        self.stage1_last_raw_name.clear();
+        self.stage1_last_raw_name.extend_from_slice(raw_name);
+        self.stage1_last_kept = kept;
+        self.stage1_cache_valid = true;
+        Ok(kept)
+    }
+
     fn finish_batches(
         &mut self,
         opts: &DecodeOptions,
@@ -1558,9 +1619,33 @@ impl ArrowDecoder {
             return Ok(OtapMetricRecords::default());
         }
 
-        let resource_attrs = match opts.target_attributes.as_deref() {
-            Some(target) => target.resource_attrs_batch()?,
-            None => None,
+        let target_attrs = opts.target_attributes.as_deref();
+        let has_target_labels = target_attrs.is_some_and(|t| !t.target_labels().is_empty());
+        let has_stage2 = opts
+            .metric_relabel_plan
+            .as_deref()
+            .is_some_and(|p| !p.stage2_configs().is_empty());
+
+        let resource_attrs = if (!opts.honor_labels && has_target_labels) || has_stage2 {
+            let res = apply_stage2_relabeling(
+                opts,
+                &mut self.metrics,
+                &mut self.key_interner,
+                &mut self.val_interner,
+                &mut self.num_dp,
+                &mut self.sum_dp,
+                &mut self.hist_dp,
+                &mut self.stage2_scratch,
+            )?;
+            if self.metrics.is_empty() {
+                return Ok(OtapMetricRecords::default());
+            }
+            res
+        } else {
+            match target_attrs {
+                Some(target) => target.resource_attrs_batch()?,
+                None => None,
+            }
         };
         let univariate_metrics = Some(self.metrics.build_univariate_metrics(&mut self.scratch)?);
         let number_data_points = self.num_dp.build_batch(has_default_ts, &mut self.scratch)?;

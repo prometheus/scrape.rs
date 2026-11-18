@@ -24,6 +24,7 @@ use arrow_schema::ArrowError;
 use crate::parse::ParseError;
 
 use super::columns::build_resource_attrs_batch;
+use super::relabel::MetricRelabelPlan;
 use super::schema::{SERVICE_INSTANCE_ID_ATTR, SERVICE_NAME_ATTR};
 
 /// Default upper bound on data points emitted per [`super::OtapMetricRecords`] chunk in
@@ -312,6 +313,10 @@ impl TargetAttributes {
         &self.resolved_resource_attrs
     }
 
+    pub(super) fn explicit_resource_attributes(&self) -> &BTreeMap<String, String> {
+        &self.explicit_resource_attrs
+    }
+
     /// Returns `true` when neither Prometheus target labels nor explicit resource attributes are
     /// configured.
     #[must_use]
@@ -340,27 +345,42 @@ impl TargetAttributes {
     }
 
     fn rebuild_resolved(&mut self) {
-        self.resolved_resource_attrs.clear();
-        for (k, v) in &self.target_labels {
-            if k != JOB_LABEL && k != INSTANCE_LABEL {
-                self.resolved_resource_attrs.insert(k.clone(), v.clone());
-            }
-        }
-        if let Some(job) = self.target_labels.get(JOB_LABEL) {
-            self.resolved_resource_attrs
-                .entry(SERVICE_NAME_ATTR.to_owned())
-                .or_insert_with(|| job.clone());
-        }
-        if let Some(instance) = self.target_labels.get(INSTANCE_LABEL) {
-            self.resolved_resource_attrs
-                .entry(SERVICE_INSTANCE_ID_ATTR.to_owned())
-                .or_insert_with(|| instance.clone());
-        }
-        for (k, v) in &self.explicit_resource_attrs {
-            self.resolved_resource_attrs.insert(k.clone(), v.clone());
-        }
+        self.resolved_resource_attrs =
+            resolve_resource_attributes(&self.target_labels, &self.explicit_resource_attrs);
         self.cached_batch = OnceLock::new();
     }
+}
+
+/// Maps public Prometheus `target_labels` (`job` -> `service.name`, `instance` ->
+/// `service.instance.id`, plus extra labels) and overlays `explicit_resource_attrs`.
+pub(super) fn resolve_resource_attributes(
+    target_labels: &BTreeMap<String, String>,
+    explicit_resource_attrs: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut resolved = BTreeMap::new();
+    for (k, v) in target_labels {
+        if k != JOB_LABEL
+            && k != INSTANCE_LABEL
+            && !k.starts_with(RESERVED_LABEL_PREFIX)
+            && !v.is_empty()
+        {
+            resolved.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(job) = target_labels.get(JOB_LABEL).filter(|v| !v.is_empty()) {
+        resolved
+            .entry(SERVICE_NAME_ATTR.to_owned())
+            .or_insert_with(|| job.clone());
+    }
+    if let Some(instance) = target_labels.get(INSTANCE_LABEL).filter(|v| !v.is_empty()) {
+        resolved
+            .entry(SERVICE_INSTANCE_ID_ATTR.to_owned())
+            .or_insert_with(|| instance.clone());
+    }
+    for (k, v) in explicit_resource_attrs {
+        resolved.insert(k.clone(), v.clone());
+    }
+    resolved
 }
 
 /// Options controlling [`super::ArrowDecoder::decode`] and [`super::ArrowDecoder::decode_stream`].
@@ -382,6 +402,16 @@ pub struct DecodeOptions {
     /// Optional target labels and OpenTelemetry resource attributes attached to every non-empty
     /// decoded batch as `ResourceAttrs` (`ArrowPayloadType = 1`).
     pub target_attributes: Option<Arc<TargetAttributes>>,
+    /// Controls how exposed sample labels colliding with public target labels in
+    /// [`Self::target_attributes`] are resolved, matching Prometheus `scrape_config.honor_labels`.
+    ///
+    /// When `false` (the default), colliding exposed sample label keys are prefixed with
+    /// `"exported_"` in the batch key dictionary. When `true`, exposed sample labels take
+    /// precedence without renaming.
+    pub honor_labels: bool,
+    /// Optional compiled `metric_relabel_configs` plan executed as Stage 1 wire-series `__name__`
+    /// pushdown during parsing and Stage 2 dictionary-vectorized relabeling at batch finalization.
+    pub metric_relabel_plan: Option<Arc<MetricRelabelPlan>>,
 }
 
 impl Default for DecodeOptions {
@@ -393,7 +423,7 @@ impl Default for DecodeOptions {
 impl DecodeOptions {
     /// Creates default [`DecodeOptions`] with no fallback timestamp,
     /// [`DEFAULT_MAX_DATA_POINTS_PER_BATCH`] data points per streamed batch, default translation
-    /// policies, and no target resource attributes.
+    /// policies, `honor_labels = false`, and no target resource attributes or relabel rules.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -403,6 +433,8 @@ impl DecodeOptions {
             unit_suffix_policy: UnitSuffixPolicy::Keep,
             untyped_policy: UntypedPolicy::Gauge,
             target_attributes: None,
+            honor_labels: false,
+            metric_relabel_plan: None,
         }
     }
 
@@ -446,6 +478,31 @@ impl DecodeOptions {
     #[must_use]
     pub fn with_target_attributes(mut self, target_attributes: Arc<TargetAttributes>) -> Self {
         self.target_attributes = Some(target_attributes);
+        self
+    }
+
+    /// Sets [`Self::honor_labels`] (`false` by default, matching Go Prometheus).
+    #[must_use]
+    pub fn with_honor_labels(mut self, honor_labels: bool) -> Self {
+        self.honor_labels = honor_labels;
+        self
+    }
+
+    /// Sets a pre-compiled [`MetricRelabelPlan`] shared across scrapes and chunks.
+    #[must_use]
+    pub fn with_metric_relabel_plan(mut self, plan: Arc<MetricRelabelPlan>) -> Self {
+        self.metric_relabel_plan = if plan.is_empty() { None } else { Some(plan) };
+        self
+    }
+
+    /// Compiles and attaches Prometheus `metric_relabel_configs` rules.
+    #[must_use]
+    pub fn with_metric_relabel_configs(mut self, configs: Vec<prometheus_relabel::Config>) -> Self {
+        self.metric_relabel_plan = if configs.is_empty() {
+            None
+        } else {
+            Some(Arc::new(MetricRelabelPlan::new(configs)))
+        };
         self
     }
 }
@@ -501,6 +558,11 @@ pub enum DecodeError {
         /// Byte offset of the start of the offending series line.
         offset: usize,
     },
+
+    /// A `metric_relabel_configs` rule stripped `__name__` while leaving other labels on a series,
+    /// matching Prometheus `errNameLabelMandatory`.
+    #[error("missing metric name (__name__ label) after relabeling")]
+    MissingMetricName,
 
     /// OpenMetrics payload did not end with `# EOF`.
     #[error("data does not end with # EOF")]

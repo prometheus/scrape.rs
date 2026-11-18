@@ -16,13 +16,14 @@ exclude = [
 
 [features]
 default = ["arrow", "dto"]
-arrow = ["dep:arrow-array", "dep:arrow-buffer", "dep:arrow-schema"]
+arrow = ["dep:arrow-array", "dep:arrow-buffer", "dep:arrow-schema", "dep:prometheus-relabel"]
 dto = ["dep:prost", "dep:prost-types"]
 
 [dependencies]
 arrow-array = { workspace = true, optional = true }
 arrow-buffer = { workspace = true, optional = true }
 arrow-schema = { workspace = true, optional = true }
+prometheus-relabel = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 prost-types = { workspace = true, optional = true }
 thiserror = { workspace = true }

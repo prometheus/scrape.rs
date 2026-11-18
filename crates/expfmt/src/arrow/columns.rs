@@ -270,6 +270,67 @@ impl OptionalStringCol {
             .then(|| NullBuffer::new(BooleanBuffer::from_iter(self.valid.iter().copied())));
         Arc::new(string_array_from_slices(&self.offsets, &self.bytes, nulls))
     }
+
+    pub(super) fn get(&self, idx: usize) -> Option<&[u8]> {
+        if !self.any {
+            return None;
+        }
+        if !self.all && !self.valid[idx] {
+            return None;
+        }
+        let start = self.offsets[idx] as usize;
+        let end = self.offsets[idx + 1] as usize;
+        Some(&self.bytes[start..end])
+    }
+
+    pub(super) fn compact(&mut self, keep: &[bool]) {
+        if !self.any {
+            return;
+        }
+        let mut write_row = 0usize;
+        let mut write_byte = 0usize;
+        let mut any_present = false;
+        let mut all_present = true;
+        let was_all = self.all;
+
+        for (i, &k) in keep.iter().enumerate() {
+            if !k {
+                continue;
+            }
+            let is_valid = was_all || self.valid[i];
+            if is_valid {
+                let start = self.offsets[i] as usize;
+                let end = self.offsets[i + 1] as usize;
+                let len = end - start;
+                if start != write_byte && len > 0 {
+                    self.bytes.copy_within(start..end, write_byte);
+                }
+                write_byte += len;
+                any_present = true;
+            } else {
+                all_present = false;
+            }
+            if !was_all {
+                self.valid[write_row] = is_valid;
+            }
+            write_row += 1;
+            self.offsets[write_row] = write_byte as i32;
+        }
+
+        if !any_present {
+            self.clear();
+            return;
+        }
+        self.bytes.truncate(write_byte);
+        self.offsets.truncate(write_row + 1);
+        self.any = true;
+        self.all = all_present;
+        if all_present {
+            self.valid.clear();
+        } else {
+            self.valid.truncate(write_row);
+        }
+    }
 }
 
 /// Staging buffers for `UnivariateMetrics` and `MetricAttrs`.
@@ -339,6 +400,120 @@ impl MetricTable {
     #[inline]
     pub(super) fn is_empty(&self) -> bool {
         self.metric_types.is_empty()
+    }
+
+    #[inline]
+    pub(super) fn name(&self, id: u16) -> &str {
+        let idx = usize::from(id);
+        let start = self.name_offsets[idx] as usize;
+        let end = self.name_offsets[idx + 1] as usize;
+        std::str::from_utf8(&self.name_bytes[start..end]).unwrap_or_default()
+    }
+
+    /// Clones metric descriptor `src_id` under `new_name`, returning the newly allocated metric
+    /// ID. Used when a Stage 2 `metric_relabel_configs` rule rewrites `__name__`.
+    pub(super) fn clone_with_name(
+        &mut self,
+        src_id: u16,
+        new_name: &str,
+    ) -> Result<u16, DecodeError> {
+        let m_idx = self.metric_types.len();
+        let id = u16::try_from(m_idx).map_err(|_| DecodeError::CapacityOverflow {
+            table: "UnivariateMetrics",
+            count: m_idx + 1,
+        })?;
+        let next_name_len = self.name_bytes.len().saturating_add(new_name.len());
+        let name_end_off =
+            i32::try_from(next_name_len).map_err(|_| DecodeError::CapacityOverflow {
+                table: "UnivariateMetrics.name",
+                count: next_name_len,
+            })?;
+
+        let src = usize::from(src_id);
+        let desc_copy = self.desc.get(src).map(<[u8]>::to_vec);
+        let unit_copy = self.unit.get(src).map(<[u8]>::to_vec);
+        let next_desc = self.desc.check_next_offset(
+            desc_copy.is_some(),
+            desc_copy.as_deref().unwrap_or(&[]),
+            "UnivariateMetrics.description",
+        )?;
+        let next_unit = self.unit.check_next_offset(
+            unit_copy.is_some(),
+            unit_copy.as_deref().unwrap_or(&[]),
+            "UnivariateMetrics.unit",
+        )?;
+
+        let otap_type = self.metric_types[src];
+        let is_monotonic = self.is_monotonic[src];
+        let attr_type_key = self.attr_type_keys[src];
+        let has_temporality =
+            otap_type == OTAP_METRIC_TYPE_SUM || otap_type == OTAP_METRIC_TYPE_HISTOGRAM;
+        let has_sum = otap_type == OTAP_METRIC_TYPE_SUM;
+
+        self.name_bytes.extend_from_slice(new_name.as_bytes());
+        self.name_offsets.push(name_end_off);
+        self.metric_types.push(otap_type);
+        self.is_monotonic.push(is_monotonic);
+        self.attr_type_keys.push(attr_type_key);
+        self.any_temporality |= has_temporality;
+        self.all_temporality &= has_temporality;
+        self.any_sum |= has_sum;
+        self.all_sum &= has_sum;
+        self.desc
+            .append_checked(m_idx, next_desc, desc_copy.as_deref().unwrap_or(&[]));
+        self.unit
+            .append_checked(m_idx, next_unit, unit_copy.as_deref().unwrap_or(&[]));
+        Ok(id)
+    }
+
+    /// Compacts the metric table to retain only rows where `keep[id]` is `true`, writing old-to-new
+    /// IDs into `remap`.
+    pub(super) fn compact(&mut self, keep: &[bool], remap: &mut Vec<u16>) {
+        remap.clear();
+        remap.resize(keep.len(), u16::MAX);
+        let mut write_row = 0usize;
+        let mut write_byte = 0usize;
+        self.any_temporality = false;
+        self.all_temporality = true;
+        self.any_sum = false;
+        self.all_sum = true;
+
+        for (i, &k) in keep.iter().enumerate() {
+            if !k {
+                continue;
+            }
+            remap[i] = write_row as u16;
+            let otap_type = self.metric_types[i];
+            self.metric_types[write_row] = otap_type;
+            self.is_monotonic[write_row] = self.is_monotonic[i];
+            self.attr_type_keys[write_row] = self.attr_type_keys[i];
+
+            let has_temporality =
+                otap_type == OTAP_METRIC_TYPE_SUM || otap_type == OTAP_METRIC_TYPE_HISTOGRAM;
+            let has_sum = otap_type == OTAP_METRIC_TYPE_SUM;
+            self.any_temporality |= has_temporality;
+            self.all_temporality &= has_temporality;
+            self.any_sum |= has_sum;
+            self.all_sum &= has_sum;
+
+            let start = self.name_offsets[i] as usize;
+            let end = self.name_offsets[i + 1] as usize;
+            let len = end - start;
+            if start != write_byte && len > 0 {
+                self.name_bytes.copy_within(start..end, write_byte);
+            }
+            write_byte += len;
+            write_row += 1;
+            self.name_offsets[write_row] = write_byte as i32;
+        }
+
+        self.metric_types.truncate(write_row);
+        self.is_monotonic.truncate(write_row);
+        self.attr_type_keys.truncate(write_row);
+        self.name_bytes.truncate(write_byte);
+        self.name_offsets.truncate(write_row + 1);
+        self.desc.compact(keep);
+        self.unit.compact(keep);
     }
 
     pub(super) fn build_univariate_metrics(
@@ -519,6 +694,47 @@ impl SparseTimestampCol {
             .with_timezone(UTC_TIME_ZONE);
         Arc::new(arr)
     }
+
+    pub(super) fn compact(&mut self, keep: &[bool]) {
+        if self.values.is_empty() {
+            return;
+        }
+        let mut write = 0usize;
+        if self.valid.is_empty() {
+            for (i, &k) in keep.iter().enumerate() {
+                if k {
+                    self.values[write] = self.values[i];
+                    write += 1;
+                }
+            }
+            self.values.truncate(write);
+            return;
+        }
+
+        let mut any_present = false;
+        let mut all_present = true;
+        for (i, &k) in keep.iter().enumerate() {
+            if !k {
+                continue;
+            }
+            let ok = self.valid[i];
+            self.values[write] = self.values[i];
+            self.valid[write] = ok;
+            any_present |= ok;
+            all_present &= ok;
+            write += 1;
+        }
+        if !any_present {
+            self.clear();
+            return;
+        }
+        self.values.truncate(write);
+        if all_present {
+            self.valid.clear();
+        } else {
+            self.valid.truncate(write);
+        }
+    }
 }
 
 /// Shared leading columns (`id`, `parent_id`, `start_time_unix_nano`, `time_unix_nano`) across
@@ -611,6 +827,19 @@ impl DpBaseCols {
             cols.push(self.time.to_array(time_nullable));
         }
     }
+
+    pub(super) fn compact(&mut self, keep: &[bool]) {
+        let mut write = 0usize;
+        for (i, &k) in keep.iter().enumerate() {
+            if k {
+                self.parent_ids[write] = self.parent_ids[i];
+                write += 1;
+            }
+        }
+        self.parent_ids.truncate(write);
+        self.start_time.compact(keep);
+        self.time.compact(keep);
+    }
 }
 
 /// Staging buffer for a dense column (`count` or `sum` on summaries and histograms) whose validity
@@ -659,6 +888,37 @@ impl<T: Copy + Default> OptionalValueCol<T> {
     fn nulls(&self) -> Option<NullBuffer> {
         (!self.valid.is_empty())
             .then(|| NullBuffer::new(BooleanBuffer::from_iter(self.valid.iter().copied())))
+    }
+
+    pub(super) fn compact(&mut self, keep: &[bool]) {
+        let mut write = 0usize;
+        if self.valid.is_empty() {
+            for (i, &k) in keep.iter().enumerate() {
+                if k {
+                    self.values[write] = self.values[i];
+                    write += 1;
+                }
+            }
+            self.values.truncate(write);
+            return;
+        }
+        let mut all_present = true;
+        for (i, &k) in keep.iter().enumerate() {
+            if !k {
+                continue;
+            }
+            let ok = self.valid[i];
+            self.values[write] = self.values[i];
+            self.valid[write] = ok;
+            all_present &= ok;
+            write += 1;
+        }
+        self.values.truncate(write);
+        if all_present {
+            self.valid.clear();
+        } else {
+            self.valid.truncate(write);
+        }
     }
 }
 
@@ -729,6 +989,50 @@ impl AttrTable {
         self.parent_ids
             .extend(std::iter::repeat_n(parent_id, attrs.len()));
         self.pairs.extend_from_slice(attrs);
+    }
+
+    /// Retains only attribute rows whose `parent_id` survives in `parent_keep`, rewriting
+    /// `parent_id` via `parent_remap`.
+    pub(super) fn compact_by_parent(&mut self, parent_keep: &[bool], parent_remap: &[u32]) {
+        if self.pairs.is_empty() {
+            return;
+        }
+        let mut write = 0usize;
+        for i in 0..self.pairs.len() {
+            let old_parent = self.parent_ids[i] as usize;
+            if parent_keep[old_parent] {
+                self.parent_ids[write] = parent_remap[old_parent];
+                self.pairs[write] = self.pairs[i];
+                write += 1;
+            }
+        }
+        self.parent_ids.truncate(write);
+        self.pairs.truncate(write);
+    }
+
+    /// Retains only attribute rows whose key passes `key_keep_mask`.
+    pub(super) fn filter_by_key_mask(&mut self, key_keep_mask: &[bool]) {
+        if self.pairs.is_empty() {
+            return;
+        }
+        let mut write = 0usize;
+        for i in 0..self.pairs.len() {
+            let pair = self.pairs[i];
+            if key_keep_mask[pair.0 as usize] {
+                self.parent_ids[write] = self.parent_ids[i];
+                self.pairs[write] = pair;
+                write += 1;
+            }
+        }
+        self.parent_ids.truncate(write);
+        self.pairs.truncate(write);
+    }
+
+    /// Remaps every attribute key ID through `remapped_key_ids`.
+    pub(super) fn remap_keys(&mut self, remapped_key_ids: &[u32]) {
+        for pair in &mut self.pairs {
+            pair.0 = remapped_key_ids[pair.0 as usize];
+        }
     }
 
     pub(super) fn build_batch(
@@ -861,6 +1165,49 @@ impl<const N: usize> SparseFixedBinaryCol<N> {
         )?;
         Ok(Arc::new(arr))
     }
+
+    pub(super) fn compact(&mut self, keep: &[bool]) {
+        if !self.any_present {
+            return;
+        }
+        let mut write = 0usize;
+        if self.valid.is_empty() {
+            for (i, &k) in keep.iter().enumerate() {
+                if k {
+                    self.values[write] = self.values[i];
+                    write += 1;
+                }
+            }
+            self.values.truncate(write);
+            if write == 0 {
+                self.any_present = false;
+            }
+            return;
+        }
+        let mut any = false;
+        let mut all = true;
+        for (i, &k) in keep.iter().enumerate() {
+            if !k {
+                continue;
+            }
+            let ok = self.valid[i];
+            self.values[write] = self.values[i];
+            self.valid[write] = ok;
+            any |= ok;
+            all &= ok;
+            write += 1;
+        }
+        if !any {
+            self.clear();
+            return;
+        }
+        self.values.truncate(write);
+        if all {
+            self.valid.clear();
+        } else {
+            self.valid.truncate(write);
+        }
+    }
 }
 
 /// Staging buffers for an OTAP exemplar table (`NumberDpExemplars` or `HistogramDpExemplars`) and
@@ -972,6 +1319,43 @@ impl ExemplarTable {
 
         Ok(Some(RecordBatch::try_new(schema, cols)?))
     }
+
+    pub(super) fn compact_by_parent(
+        &mut self,
+        dp_keep: &[bool],
+        dp_remap: &[u32],
+        ex_keep: &mut Vec<bool>,
+        ex_remap: &mut Vec<u32>,
+    ) {
+        if self.parent_ids.is_empty() {
+            return;
+        }
+        let n = self.parent_ids.len();
+        ex_keep.clear();
+        ex_keep.reserve(n);
+        ex_remap.clear();
+        ex_remap.resize(n, u32::MAX);
+
+        let mut write = 0usize;
+        for (i, remap_slot) in ex_remap.iter_mut().enumerate().take(n) {
+            let old_dp = self.parent_ids[i] as usize;
+            let keep = dp_keep[old_dp];
+            ex_keep.push(keep);
+            if keep {
+                *remap_slot = write as u32;
+                self.parent_ids[write] = dp_remap[old_dp];
+                self.timestamps[write] = self.timestamps[i];
+                self.values[write] = self.values[i];
+                write += 1;
+            }
+        }
+        self.parent_ids.truncate(write);
+        self.timestamps.truncate(write);
+        self.values.truncate(write);
+        self.span_ids.compact(ex_keep);
+        self.trace_ids.compact(ex_keep);
+        self.attrs.compact_by_parent(ex_keep, ex_remap);
+    }
 }
 
 /// Staging buffers for `NumberDataPoints`, `NumberDpAttrs`, `NumberDpExemplars`, and
@@ -1035,6 +1419,30 @@ impl NumberDpTable {
         )));
 
         Ok(Some(RecordBatch::try_new(schema, cols)?))
+    }
+
+    pub(super) fn compact(
+        &mut self,
+        keep: &[bool],
+        dp_remap: &mut Vec<u32>,
+        ex_keep: &mut Vec<bool>,
+        ex_remap: &mut Vec<u32>,
+    ) {
+        dp_remap.clear();
+        dp_remap.resize(keep.len(), u32::MAX);
+        let mut write = 0usize;
+        for (i, &k) in keep.iter().enumerate() {
+            if k {
+                dp_remap[i] = write as u32;
+                self.values[write] = self.values[i];
+                write += 1;
+            }
+        }
+        self.values.truncate(write);
+        self.base.compact(keep);
+        self.attrs.compact_by_parent(keep, dp_remap);
+        self.exemplars
+            .compact_by_parent(keep, dp_remap, ex_keep, ex_remap);
     }
 }
 
@@ -1123,6 +1531,40 @@ impl SummaryDpTable {
         cols.push(Arc::new(q_list));
 
         Ok(Some(RecordBatch::try_new(schema, cols)?))
+    }
+
+    pub(super) fn compact(&mut self, keep: &[bool], dp_remap: &mut Vec<u32>) {
+        dp_remap.clear();
+        dp_remap.resize(keep.len(), u32::MAX);
+        let mut write_row = 0usize;
+        let mut write_q = 0usize;
+        for (i, &k) in keep.iter().enumerate() {
+            if !k {
+                continue;
+            }
+            dp_remap[i] = write_row as u32;
+            let start = self.quantile_offsets[i] as usize;
+            let end = self.quantile_offsets[i + 1] as usize;
+            let len = end - start;
+            if start != write_q && len > 0 {
+                self.quantile_bounds.copy_within(start..end, write_q);
+                self.quantile_vals.copy_within(start..end, write_q);
+            }
+            write_q += len;
+            write_row += 1;
+            self.quantile_offsets[write_row] = write_q as i32;
+        }
+        if write_row == 0 {
+            self.clear();
+            return;
+        }
+        self.quantile_offsets.truncate(write_row + 1);
+        self.quantile_bounds.truncate(write_q);
+        self.quantile_vals.truncate(write_q);
+        self.base.compact(keep);
+        self.counts.compact(keep);
+        self.sums.compact(keep);
+        self.attrs.compact_by_parent(keep, dp_remap);
     }
 }
 
@@ -1218,6 +1660,60 @@ impl HistogramDpTable {
         cols.push(Arc::new(explicit_bounds_list));
 
         Ok(Some(RecordBatch::try_new(schema, cols)?))
+    }
+
+    pub(super) fn compact(
+        &mut self,
+        keep: &[bool],
+        dp_remap: &mut Vec<u32>,
+        ex_keep: &mut Vec<bool>,
+        ex_remap: &mut Vec<u32>,
+    ) {
+        dp_remap.clear();
+        dp_remap.resize(keep.len(), u32::MAX);
+        let mut write_row = 0usize;
+        let mut write_bucket = 0usize;
+        let mut write_bound = 0usize;
+        for (i, &k) in keep.iter().enumerate() {
+            if !k {
+                continue;
+            }
+            dp_remap[i] = write_row as u32;
+
+            let b_start = self.bucket_offsets[i] as usize;
+            let b_end = self.bucket_offsets[i + 1] as usize;
+            let b_len = b_end - b_start;
+            if b_start != write_bucket && b_len > 0 {
+                self.bucket_counts.copy_within(b_start..b_end, write_bucket);
+            }
+            write_bucket += b_len;
+
+            let e_start = self.bounds_offsets[i] as usize;
+            let e_end = self.bounds_offsets[i + 1] as usize;
+            let e_len = e_end - e_start;
+            if e_start != write_bound && e_len > 0 {
+                self.bounds_vals.copy_within(e_start..e_end, write_bound);
+            }
+            write_bound += e_len;
+
+            write_row += 1;
+            self.bucket_offsets[write_row] = write_bucket as i32;
+            self.bounds_offsets[write_row] = write_bound as i32;
+        }
+        if write_row == 0 {
+            self.clear();
+            return;
+        }
+        self.bucket_offsets.truncate(write_row + 1);
+        self.bucket_counts.truncate(write_bucket);
+        self.bounds_offsets.truncate(write_row + 1);
+        self.bounds_vals.truncate(write_bound);
+        self.base.compact(keep);
+        self.counts.compact(keep);
+        self.sums.compact(keep);
+        self.attrs.compact_by_parent(keep, dp_remap);
+        self.exemplars
+            .compact_by_parent(keep, dp_remap, ex_keep, ex_remap);
     }
 }
 
