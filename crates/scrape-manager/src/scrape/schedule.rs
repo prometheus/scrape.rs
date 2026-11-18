@@ -14,8 +14,12 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
+#[cfg(feature = "arrow")]
+use std::sync::OnceLock;
 use std::time::Duration;
 
+#[cfg(feature = "arrow")]
+use prometheus_expfmt::arrow::TargetAttributes;
 use tokio::time::Instant;
 
 use crate::scrape::ScrapeTarget;
@@ -67,9 +71,38 @@ fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Scheduled target handle keeping lazily-built [`TargetAttributes`] outside [`ScrapeTarget`] so
+/// [`ScrapeTarget`] remains pure immutable data usable as a `HashMap`/`HashSet` key.
+#[derive(Clone, Debug)]
+pub(crate) struct ScheduledTarget {
+    pub(crate) target: Arc<ScrapeTarget>,
+    #[cfg(feature = "arrow")]
+    target_attrs: Arc<OnceLock<Option<Arc<TargetAttributes>>>>,
+}
+
+impl ScheduledTarget {
+    pub(crate) fn new(target: Arc<ScrapeTarget>) -> Self {
+        Self {
+            target,
+            #[cfg(feature = "arrow")]
+            target_attrs: Arc::new(OnceLock::new()),
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn target_attributes(&self) -> Option<Arc<TargetAttributes>> {
+        if self.target.labels().is_empty() {
+            return None;
+        }
+        self.target_attrs
+            .get_or_init(|| self.target.to_target_attributes().map(Arc::new))
+            .clone()
+    }
+}
+
 #[derive(Debug)]
 struct TargetSlot {
-    target: Arc<ScrapeTarget>,
+    scheduled: ScheduledTarget,
     generation: u64,
     next_due: Instant,
     seen_epoch: u64,
@@ -104,7 +137,7 @@ impl PartialOrd for HeapEntry {
 pub(crate) struct DueTarget {
     pub(crate) slot_id: usize,
     pub(crate) generation: u64,
-    pub(crate) target: Arc<ScrapeTarget>,
+    pub(crate) scheduled: ScheduledTarget,
 }
 
 /// Single-structure min-heap target timer queue (`O(N)` memory, `O(log N)` per scrape tick).
@@ -170,7 +203,7 @@ impl TargetSchedule {
                 slot.seen_epoch = epoch;
                 let due = slot.next_due;
                 let generation = slot.generation;
-                let target_arc = Arc::clone(&slot.target);
+                let target_arc = Arc::clone(&slot.scheduled.target);
                 self.index_by_target.insert(target_arc, slot_id);
                 self.heap.push(Reverse(HeapEntry {
                     due,
@@ -187,7 +220,7 @@ impl TargetSchedule {
             let target_arc = Arc::new(target);
 
             let slot = TargetSlot {
-                target: Arc::clone(&target_arc),
+                scheduled: ScheduledTarget::new(Arc::clone(&target_arc)),
                 generation,
                 next_due: due,
                 seen_epoch: epoch,
@@ -311,7 +344,7 @@ impl TargetSchedule {
             return Some(DueTarget {
                 slot_id: entry.slot_id,
                 generation: slot.generation,
-                target: Arc::clone(&slot.target),
+                scheduled: slot.scheduled.clone(),
             });
         }
         None
@@ -328,7 +361,7 @@ impl TargetSchedule {
         {
             slot.in_flight = false;
             if slot.removed {
-                Some(Arc::clone(&slot.target))
+                Some(Arc::clone(&slot.scheduled.target))
             } else {
                 if slot.next_due <= now {
                     let (next_due, missed_ticks) =
@@ -428,14 +461,14 @@ mod tests {
 
         let due_at_first = first_due;
         let popped = sched.pop_due(due_at_first).expect("t1 due");
-        assert_eq!(popped.target.url(), t1.url());
+        assert_eq!(popped.scheduled.target.url(), t1.url());
         assert_eq!(sched.take_overruns(), 0);
 
         // Leave t1 `in_flight` across its next due tick (`first_due + 10s`) -> skips and records 1 overrun.
         let second_tick = first_due + interval;
         while let Some(other) = sched.pop_due(second_tick) {
             // Only t2 can pop while t1 is still in_flight.
-            assert_eq!(other.target.url(), t2.url());
+            assert_eq!(other.scheduled.target.url(), t2.url());
             sched.complete(other.slot_id, other.generation, second_tick);
         }
         assert_eq!(sched.take_overruns(), 1);
@@ -449,7 +482,7 @@ mod tests {
         let third_tick = first_due + interval * 2;
         let mut fired_urls = Vec::new();
         while let Some(d) = sched.pop_due(third_tick) {
-            fired_urls.push(d.target.url().as_str().to_owned());
+            fired_urls.push(d.scheduled.target.url().as_str().to_owned());
             sched.complete(d.slot_id, d.generation, third_tick);
         }
         assert!(fired_urls.iter().any(|u| u == t1.url().as_str()));
@@ -489,7 +522,7 @@ mod tests {
         let next = sched
             .pop_due(first_due + interval * 2)
             .expect("fires after completion");
-        assert_eq!(next.target.url(), t1.url());
+        assert_eq!(next.scheduled.target.url(), t1.url());
     }
 
     #[tokio::test(start_paused = true)]
@@ -515,7 +548,7 @@ mod tests {
         let resumed = sched
             .pop_due(first_due + interval * 2)
             .expect("fires on next grid tick");
-        assert_eq!(resumed.target.url(), t1.url());
+        assert_eq!(resumed.scheduled.target.url(), t1.url());
     }
 
     #[tokio::test(start_paused = true)]
