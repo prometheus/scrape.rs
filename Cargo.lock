@@ -1097,6 +1097,7 @@ dependencies = [
 name = "prometheus-scrape-manager"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
  "benchfmt",
  "flate2",
  "futures-util",

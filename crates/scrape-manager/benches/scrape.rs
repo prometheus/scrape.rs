@@ -31,6 +31,7 @@ use std::time::Duration;
 use benchfmt::{CountingAlloc, Suite};
 use prometheus_expfmt::arrow::OtapMetricRecords;
 use prometheus_expfmt::format::Format;
+use prometheus_relabel::{Action, Config as RelabelConfig, METRIC_NAME_LABEL, Regexp};
 use prometheus_scrape_manager::scrape::{
     ArrowScrapeSink, BodyBufferPool, FetchedScrape, SchedulingMode, ScrapeConfig, ScrapeError,
     ScrapeManager, ScrapeReport, ScrapeTarget, TargetFetcher,
@@ -187,6 +188,75 @@ fn main() {
                 },
             );
         }
+    }
+
+    // Exercise Stage 1 (`__name__` drop) + Stage 2 (`labeldrop` + single-label value transform)
+    // `metric_relabel_configs` compiled once inside `ScrapeManager::new`.
+    {
+        let payload = Arc::clone(&payload);
+        let targets = Arc::clone(&targets);
+        let scheduling = SchedulingMode::concurrent_with_pools(
+            NonZeroUsize::new(8).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        );
+        let metric_relabel_configs = vec![
+            RelabelConfig {
+                source_labels: vec![METRIC_NAME_LABEL.to_owned()],
+                regex: Regexp::must_new("go_.*"),
+                action: Action::Drop,
+                ..RelabelConfig::default()
+            },
+            RelabelConfig {
+                regex: Regexp::must_new("handler"),
+                action: Action::LabelDrop,
+                ..RelabelConfig::default()
+            },
+            RelabelConfig {
+                source_labels: vec!["code".to_owned()],
+                regex: Regexp::must_new("([0-9])[0-9]{2}"),
+                target_label: "code_class".to_owned(),
+                replacement: "${1}xx".to_owned(),
+                action: Action::Replace,
+                ..RelabelConfig::default()
+            },
+        ];
+
+        suite = suite.bench(
+            "ScrapeCycle/targets=16/header_wait=none/mode=concurrent_k8_b2_d1_relabel",
+            move |b| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .expect("current_thread runtime");
+
+                let fetcher = BenchFetcher {
+                    payload: Arc::clone(&payload),
+                    header_wait: Duration::ZERO,
+                };
+                let cfg = ScrapeConfig::new("bench")
+                    .with_scheduling(scheduling)
+                    .with_max_data_points_per_batch(256)
+                    .with_metric_relabel_configs(metric_relabel_configs.clone());
+                let manager = ScrapeManager::new(cfg, fetcher).expect("manager");
+                let sink = BlackBoxSink;
+
+                rt.block_on(async {
+                    let _ = manager.run_once_arrow(&targets, &sink).await;
+                });
+
+                b.set_bytes(total_bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    rt.block_on(async {
+                        let out = manager
+                            .run_once_arrow(black_box(targets.as_slice()), &sink)
+                            .await;
+                        let _ = black_box(out);
+                    });
+                }
+            },
+        );
     }
 
     suite.run();

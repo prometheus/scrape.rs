@@ -829,6 +829,18 @@ mod tests {
                 .with_scrape_interval(Duration::from_secs(5))
                 .with_scrape_timeout(Duration::from_secs(6)),
             ScrapeConfig::new("job").with_user_agent("bad\r\nheader"),
+            ScrapeConfig::new("job").with_scheme("ftp"),
+            ScrapeConfig::new("job").with_relabel_configs(vec![RelabelConfig {
+                action: prometheus_relabel::Action::HashMod,
+                target_label: "shard".to_owned(),
+                modulus: 0,
+                ..RelabelConfig::default()
+            }]),
+            ScrapeConfig::new("job").with_metric_relabel_configs(vec![RelabelConfig {
+                action: prometheus_relabel::Action::Replace,
+                target_label: String::new(),
+                ..RelabelConfig::default()
+            }]),
             ScrapeConfig::new("job")
                 .with_scheduling(SchedulingMode::concurrent_with_pools(one, two, one)),
             ScrapeConfig::new("job")
@@ -840,5 +852,155 @@ mod tests {
                 "case {idx} unexpectedly passed validate: {cfg:?}"
             );
         }
+    }
+
+    #[test]
+    fn populate_targets_applies_relabel_configs_params_and_url_rules() {
+        use crate::discovery::StaticConfig;
+        use prometheus_relabel::{Action, Regexp};
+
+        let group_a = StaticConfig {
+            targets: vec![
+                "10.0.0.1:9100".to_owned(),
+                "10.0.0.2:9100".to_owned(),
+                "[::1]:9443".to_owned(),
+            ],
+            labels: BTreeMap::from([
+                ("env".to_owned(), "prod".to_owned()),
+                ("__meta_role".to_owned(), "api".to_owned()),
+            ]),
+        }
+        .into_target_group("0");
+
+        let cfg = ScrapeConfig::new("api-pool")
+            .with_metrics_path("/custom")
+            .with_param("module", vec!["default".to_owned(), "extra".to_owned()])
+            .with_relabel_configs(vec![
+                // Drop 10.0.0.2.
+                RelabelConfig {
+                    source_labels: vec![ADDRESS_LABEL.to_owned()],
+                    regex: Regexp::must_new("10\\.0\\.0\\.2:.*"),
+                    action: Action::Drop,
+                    ..RelabelConfig::default()
+                },
+                // Override the first `module` query parameter while keeping secondary values.
+                RelabelConfig {
+                    source_labels: vec!["__meta_role".to_owned()],
+                    target_label: "__param_module".to_owned(),
+                    replacement: "http_$1".to_owned(),
+                    action: Action::Replace,
+                    ..RelabelConfig::default()
+                },
+                // Add a new `__param_target` query parameter and promote `__meta_role` to `role`.
+                RelabelConfig {
+                    source_labels: vec![ADDRESS_LABEL.to_owned()],
+                    target_label: "__param_target".to_owned(),
+                    action: Action::Replace,
+                    ..RelabelConfig::default()
+                },
+                RelabelConfig {
+                    source_labels: vec!["__meta_role".to_owned()],
+                    target_label: "role".to_owned(),
+                    action: Action::Replace,
+                    ..RelabelConfig::default()
+                },
+                // Switch IPv6 target to https and `/probe`.
+                RelabelConfig {
+                    source_labels: vec![ADDRESS_LABEL.to_owned()],
+                    regex: Regexp::must_new("\\[::1\\]:.*"),
+                    target_label: SCHEME_LABEL.to_owned(),
+                    replacement: "https".to_owned(),
+                    action: Action::Replace,
+                    ..RelabelConfig::default()
+                },
+                RelabelConfig {
+                    source_labels: vec![ADDRESS_LABEL.to_owned()],
+                    regex: Regexp::must_new("\\[::1\\]:.*"),
+                    target_label: METRICS_PATH_LABEL.to_owned(),
+                    replacement: "/probe".to_owned(),
+                    action: Action::Replace,
+                    ..RelabelConfig::default()
+                },
+            ]);
+
+        let targets = cfg.populate_targets(&[group_a]).expect("populate_targets");
+        assert_eq!(targets.len(), 2);
+
+        assert_eq!(
+            targets[0].url().as_str(),
+            "http://10.0.0.1:9100/custom?module=http_api&module=extra&target=10.0.0.1%3A9100"
+        );
+        assert_eq!(
+            targets[0].labels(),
+            &BTreeMap::from([
+                ("env".to_owned(), "prod".to_owned()),
+                ("instance".to_owned(), "10.0.0.1:9100".to_owned()),
+                ("job".to_owned(), "api-pool".to_owned()),
+                ("role".to_owned(), "api".to_owned()),
+            ])
+        );
+
+        assert_eq!(
+            targets[1].url().as_str(),
+            "https://[::1]:9443/probe?module=http_api&module=extra&target=%5B%3A%3A1%5D%3A9443"
+        );
+        assert_eq!(
+            targets[1].labels().get("instance").map(String::as_str),
+            Some("[::1]:9443")
+        );
+
+        #[cfg(feature = "arrow")]
+        {
+            let ta = targets[0]
+                .to_target_attributes()
+                .expect("non-empty target attributes");
+            assert_eq!(
+                ta.resource_attributes()
+                    .get("service.name")
+                    .map(String::as_str),
+                Some("api-pool")
+            );
+            assert_eq!(
+                ta.resource_attributes()
+                    .get("service.instance.id")
+                    .map(String::as_str),
+                Some("10.0.0.1:9100")
+            );
+            assert_eq!(
+                ta.resource_attributes().get("env").map(String::as_str),
+                Some("prod")
+            );
+            assert_eq!(
+                ta.resource_attributes().get("role").map(String::as_str),
+                Some("api")
+            );
+        }
+
+        // Relabeling that clears `__address__` or injects URL userinfo/query fails cleanly.
+        let bad_addr_group = StaticConfig {
+            targets: vec!["user:pass@127.0.0.1:9100".to_owned()],
+            labels: BTreeMap::new(),
+        }
+        .into_target_group("bad");
+        assert!(matches!(
+            ScrapeConfig::new("bad").populate_targets(&[bad_addr_group]),
+            Err(ScrapeError::InvalidConfig(_))
+        ));
+
+        let strip_addr = ScrapeConfig::new("strip").with_relabel_configs(vec![RelabelConfig {
+            target_label: ADDRESS_LABEL.to_owned(),
+            replacement: String::new(),
+            action: Action::Replace,
+            ..RelabelConfig::default()
+        }]);
+        let g = StaticConfig {
+            targets: vec!["127.0.0.1:9100".to_owned()],
+            labels: BTreeMap::new(),
+        }
+        .into_target_group("0");
+        assert!(matches!(
+            strip_addr.populate_targets(&[g]),
+            Err(ScrapeError::InvalidConfig(_))
+        ));
     }
 }

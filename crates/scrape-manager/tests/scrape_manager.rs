@@ -750,3 +750,367 @@ async fn cooperative_arrow_decode_reports_partial_errors_reclaims_pools_on_break
     assert_eq!(stats.scrapes_succeeded, 2);
     assert_eq!(stats.scrapes_failed, 2);
 }
+
+#[cfg(feature = "arrow")]
+#[tokio::test]
+async fn end_to_end_discovery_relabel_honor_labels_and_metric_relabeling_over_http() {
+    use std::collections::BTreeMap;
+
+    use arrow_array::types::{UInt8Type, UInt16Type};
+    use arrow_array::{Array, DictionaryArray, RecordBatch, StringArray};
+    use prometheus_expfmt::arrow::OtapMetricRecords;
+    use prometheus_relabel::{Action, Config as RelabelConfig, METRIC_NAME_LABEL, Regexp};
+    use prometheus_scrape_manager::discovery::{StaticConfig, resolve_static_configs};
+    use prometheus_scrape_manager::scrape::{ArrowScrapeSink, ScrapeReport};
+
+    fn read_str_col(batch: &RecordBatch, col_name: &str) -> Vec<String> {
+        let col = batch.column_by_name(col_name).expect("column exists");
+        if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+            return (0..arr.len()).map(|i| arr.value(i).to_owned()).collect();
+        }
+        if let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<UInt8Type>>() {
+            let vals = dict
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("utf8 dict values");
+            return (0..dict.len())
+                .map(|i| vals.value(usize::from(dict.keys().value(i))).to_owned())
+                .collect();
+        }
+        if let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<UInt16Type>>() {
+            let vals = dict
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("utf8 dict values");
+            return (0..dict.len())
+                .map(|i| vals.value(usize::from(dict.keys().value(i))).to_owned())
+                .collect();
+        }
+        panic!("unexpected string column encoding for {col_name}");
+    }
+
+    fn read_kv_map(batch: &RecordBatch) -> BTreeMap<String, String> {
+        let keys = read_str_col(batch, "key");
+        let vals = read_str_col(batch, "str");
+        keys.into_iter().zip(vals).collect()
+    }
+
+    struct CaptureSink {
+        batches: Mutex<Vec<OtapMetricRecords>>,
+        reports: Mutex<Vec<ScrapeReport>>,
+        stop_after_reports: Option<usize>,
+    }
+
+    impl CaptureSink {
+        fn new(stop_after_reports: Option<usize>) -> Self {
+            Self {
+                batches: Mutex::new(Vec::new()),
+                reports: Mutex::new(Vec::new()),
+                stop_after_reports,
+            }
+        }
+    }
+
+    impl ArrowScrapeSink for CaptureSink {
+        async fn on_batch(
+            &self,
+            _target: &ScrapeTarget,
+            _scrape_timestamp_ms: i64,
+            records: OtapMetricRecords,
+        ) -> ControlFlow<()> {
+            self.batches.lock().unwrap().push(records);
+            ControlFlow::Continue(())
+        }
+
+        async fn on_scrape_complete(
+            &self,
+            _target: &ScrapeTarget,
+            report: ScrapeReport,
+        ) -> ControlFlow<()> {
+            let mut reports = self.reports.lock().unwrap();
+            reports.push(report);
+            if self
+                .stop_after_reports
+                .is_some_and(|limit| reports.len() >= limit)
+            {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let received_reqs = Arc::new(Mutex::new(Vec::<String>::new()));
+    let received_reqs_srv = Arc::clone(&received_reqs);
+
+    let payload = concat!(
+        "# TYPE go_goroutines gauge\n",
+        "go_goroutines 42\n",
+        "# TYPE http_requests counter\n",
+        "http_requests_total{job=\"inner\",method=\"get\",tmp_debug=\"dropme\"} 7 # {trace_id=\"abc\",job=\"ex_job\"} 1.0\n",
+        "# EOF\n",
+    );
+
+    // Expect 5 HTTP scrapes: honor_labels=false (scrape_once), honor_labels=true (scrape_once),
+    // continuous run_arrow (1 scrape), drop-all metric relabel, and strip-__name__ error.
+    let server = tokio::spawn(async move {
+        for _ in 0..5 {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).await.expect("read");
+            let first_line = String::from_utf8_lossy(&buf[..n])
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            received_reqs_srv.lock().unwrap().push(first_line);
+
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/openmetrics-text; version=1.0.0; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            sock.write_all(resp.as_bytes()).await.expect("write");
+        }
+    });
+
+    let groups = resolve_static_configs(&[StaticConfig {
+        targets: vec![addr.to_string(), "127.0.0.1:1".to_owned()],
+        labels: BTreeMap::from([
+            ("cluster".to_owned(), "eu-west".to_owned()),
+            ("__meta_probe_target".to_owned(), "api".to_owned()),
+        ]),
+    }]);
+
+    let relabel_configs = vec![
+        // Drop the unreachable dummy target before scraping.
+        RelabelConfig {
+            source_labels: vec!["__address__".to_owned()],
+            regex: Regexp::must_new("127\\.0\\.0\\.1:1"),
+            action: Action::Drop,
+            ..RelabelConfig::default()
+        },
+        RelabelConfig {
+            target_label: "instance".to_owned(),
+            replacement: "api-1".to_owned(),
+            action: Action::Replace,
+            ..RelabelConfig::default()
+        },
+        RelabelConfig {
+            source_labels: vec!["__meta_probe_target".to_owned()],
+            target_label: "__param_target".to_owned(),
+            action: Action::Replace,
+            ..RelabelConfig::default()
+        },
+        RelabelConfig {
+            target_label: "__param_module".to_owned(),
+            replacement: "http_2xx".to_owned(),
+            action: Action::Replace,
+            ..RelabelConfig::default()
+        },
+    ];
+
+    let metric_relabel_configs = vec![
+        // Stage 1: drop `go_.*` before parsing.
+        RelabelConfig {
+            source_labels: vec![METRIC_NAME_LABEL.to_owned()],
+            regex: Regexp::must_new("go_.*"),
+            action: Action::Drop,
+            ..RelabelConfig::default()
+        },
+        // Stage 2: drop `tmp_.*` labels.
+        RelabelConfig {
+            regex: Regexp::must_new("tmp_.*"),
+            action: Action::LabelDrop,
+            ..RelabelConfig::default()
+        },
+        // Stage 2: uppercase `method`.
+        RelabelConfig {
+            source_labels: vec!["method".to_owned()],
+            target_label: "method".to_owned(),
+            action: Action::Uppercase,
+            ..RelabelConfig::default()
+        },
+        // Stage 2: read target label `cluster` into per-point `src_cluster`.
+        RelabelConfig {
+            source_labels: vec!["cluster".to_owned()],
+            target_label: "src_cluster".to_owned(),
+            action: Action::Replace,
+            ..RelabelConfig::default()
+        },
+    ];
+
+    let base_cfg = ScrapeConfig::new("api-job")
+        .with_scrape_interval(Duration::from_secs(5))
+        .with_scrape_timeout(Duration::from_secs(3))
+        .with_metrics_path("/probe")
+        .with_param("module", vec!["default".to_owned(), "extra".to_owned()])
+        .with_relabel_configs(relabel_configs)
+        .with_metric_relabel_configs(metric_relabel_configs);
+
+    let targets = base_cfg
+        .populate_targets(&groups)
+        .expect("populate targets");
+    assert_eq!(targets.len(), 1);
+
+    // 1. honor_labels = false (default): exposed `job="inner"` becomes `exported_job="inner"`,
+    // while exemplar `job="ex_job"` stays intact and ResourceAttrs carries target metadata.
+    let mgr_default = ScrapeManager::with_reqwest(base_cfg.clone()).expect("mgr default");
+    let sink_default = CaptureSink::new(None);
+    let rep = match mgr_default
+        .scrape_once_arrow(&targets[0], &sink_default)
+        .await
+    {
+        ControlFlow::Continue(r) => r,
+        ControlFlow::Break(()) => panic!("unexpected break"),
+    };
+    assert!(rep.up, "expected up report: {rep:?}");
+    assert_eq!(rep.data_points_decoded, 1);
+    assert_eq!(rep.batches_emitted, 1);
+
+    {
+        let batches = sink_default.batches.lock().unwrap();
+        let batch = &batches[0];
+        assert_eq!(
+            read_str_col(batch.univariate_metrics().unwrap(), "name"),
+            vec!["http_requests_total"]
+        );
+        assert_eq!(
+            read_kv_map(batch.resource_attrs().unwrap()),
+            BTreeMap::from([
+                ("cluster".to_owned(), "eu-west".to_owned()),
+                ("service.instance.id".to_owned(), "api-1".to_owned()),
+                ("service.name".to_owned(), "api-job".to_owned()),
+            ])
+        );
+        assert_eq!(
+            read_kv_map(batch.number_dp_attrs().unwrap()),
+            BTreeMap::from([
+                ("exported_job".to_owned(), "inner".to_owned()),
+                ("method".to_owned(), "GET".to_owned()),
+                ("src_cluster".to_owned(), "eu-west".to_owned()),
+            ])
+        );
+        assert_eq!(
+            read_kv_map(batch.number_dp_exemplar_attrs().unwrap()),
+            BTreeMap::from([
+                ("job".to_owned(), "ex_job".to_owned()),
+                ("trace_id".to_owned(), "abc".to_owned()),
+            ])
+        );
+    }
+
+    // 2. honor_labels = true: exposed `job="inner"` is preserved without `exported_` renaming.
+    let mgr_honor =
+        ScrapeManager::with_reqwest(base_cfg.clone().with_honor_labels(true)).expect("mgr honor");
+    let sink_honor = CaptureSink::new(None);
+    let rep_honor = match mgr_honor.scrape_once_arrow(&targets[0], &sink_honor).await {
+        ControlFlow::Continue(r) => r,
+        ControlFlow::Break(()) => panic!("unexpected break"),
+    };
+    assert!(rep_honor.up);
+    {
+        let batches = sink_honor.batches.lock().unwrap();
+        let batch_honor = &batches[0];
+        assert_eq!(
+            read_kv_map(batch_honor.number_dp_attrs().unwrap()),
+            BTreeMap::from([
+                ("job".to_owned(), "inner".to_owned()),
+                ("method".to_owned(), "GET".to_owned()),
+                ("src_cluster".to_owned(), "eu-west".to_owned()),
+            ])
+        );
+    }
+
+    // 3. Continuous `run_arrow` (via ScheduledTarget / TargetSchedule) emits the same ResourceAttrs.
+    let mgr_loop = ScrapeManager::with_reqwest(
+        base_cfg
+            .clone()
+            .with_scrape_interval(Duration::from_millis(50))
+            .with_scrape_timeout(Duration::from_millis(50))
+            .with_scheduling(SchedulingMode::sequential()),
+    )
+    .expect("mgr loop");
+    let sink_loop = CaptureSink::new(Some(1));
+    let (_ctrl, ctrl_rx) = ScrapeManager::control_channel();
+    mgr_loop
+        .run_arrow(targets.clone(), ctrl_rx, &sink_loop)
+        .await;
+    assert_eq!(sink_loop.reports.lock().unwrap().len(), 1);
+    assert_eq!(
+        read_kv_map(
+            sink_loop.batches.lock().unwrap()[0]
+                .resource_attrs()
+                .unwrap()
+        ),
+        BTreeMap::from([
+            ("cluster".to_owned(), "eu-west".to_owned()),
+            ("service.instance.id".to_owned(), "api-1".to_owned()),
+            ("service.name".to_owned(), "api-job".to_owned()),
+        ])
+    );
+
+    // 4. Metric relabeling dropping every series still succeeds (`up == true`, 0 batches).
+    let mgr_drop_all = ScrapeManager::with_reqwest(
+        ScrapeConfig::new("drop-all").with_metric_relabel_configs(vec![RelabelConfig {
+            source_labels: vec![METRIC_NAME_LABEL.to_owned()],
+            regex: Regexp::must_new(".*"),
+            action: Action::Drop,
+            ..RelabelConfig::default()
+        }]),
+    )
+    .expect("mgr drop all");
+    let sink_drop = CaptureSink::new(None);
+    let rep_drop = match mgr_drop_all
+        .scrape_once_arrow(&targets[0], &sink_drop)
+        .await
+    {
+        ControlFlow::Continue(r) => r,
+        ControlFlow::Break(()) => panic!("unexpected break"),
+    };
+    assert!(rep_drop.up);
+    assert_eq!(rep_drop.data_points_decoded, 0);
+    assert_eq!(rep_drop.batches_emitted, 0);
+
+    // 5. Dropping `__name__` while other labels remain fails the scrape (`up == false`).
+    let mgr_strip_name = ScrapeManager::with_reqwest(
+        ScrapeConfig::new("strip-name").with_metric_relabel_configs(vec![RelabelConfig {
+            target_label: METRIC_NAME_LABEL.to_owned(),
+            replacement: String::new(),
+            action: Action::Replace,
+            ..RelabelConfig::default()
+        }]),
+    )
+    .expect("mgr strip name");
+    let sink_strip = CaptureSink::new(None);
+    let rep_strip = match mgr_strip_name
+        .scrape_once_arrow(&targets[0], &sink_strip)
+        .await
+    {
+        ControlFlow::Continue(r) => r,
+        ControlFlow::Break(()) => panic!("unexpected break"),
+    };
+    assert!(!rep_strip.up);
+    assert!(
+        rep_strip
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("missing metric name")),
+        "expected MissingMetricName error, got {:?}",
+        rep_strip.error
+    );
+
+    server.await.expect("server join");
+    let reqs = received_reqs.lock().unwrap();
+    assert_eq!(reqs.len(), 5);
+    assert!(
+        reqs.iter()
+            .all(|line| line == "GET /probe?module=http_2xx&module=extra&target=api HTTP/1.1"),
+        "unexpected HTTP request lines: {reqs:?}"
+    );
+}
