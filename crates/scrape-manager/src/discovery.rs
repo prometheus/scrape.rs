@@ -207,15 +207,6 @@ impl DiscoveryConfigs {
     }
 }
 
-/// Joins a host and port into `"host:port"` or `"[ipv6]:port"`, matching Go `net.JoinHostPort`.
-pub(crate) fn join_host_port(host: &str, port: &str) -> String {
-    if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
-}
-
 /// Parses a Prometheus duration string (such as `"30s"`, `"1m"`, `"500ms"`, `"1h30m"`, `"7d"`,
 /// `"1w"`, `"1y"`, or `"0"`) into a [`Duration`], matching `prometheus/common/model.ParseDuration`.
 pub fn parse_duration(s: &str) -> Result<Duration, DiscoveryError> {

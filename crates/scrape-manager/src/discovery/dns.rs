@@ -27,8 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 use super::{
-    ADDRESS_LABEL, DiscoveryError, LabelSet, TargetGroup, deserialize_null_default, join_host_port,
-    serde_duration,
+    ADDRESS_LABEL, DiscoveryError, LabelSet, TargetGroup, deserialize_null_default, serde_duration,
 };
 
 /// Meta label storing the queried record name, matching `dnsNameLabel` in Prometheus `discovery/dns`.
@@ -525,57 +524,49 @@ fn records_to_target_group(
 ) -> TargetGroup {
     let mut targets = Vec::new();
     for record in records {
-        let mut target_host_raw = String::new();
         let mut srv_target = String::new();
         let mut srv_port = String::new();
         let mut mx_target = String::new();
         let mut ns_target = String::new();
-        let addr_port: u16;
 
-        match (record_type, record) {
+        // Remove the trailing dot from rooted DNS names to make them look more usual.
+        // `is_safe_domain_target` rejects `:`, so SRV/MX/NS hosts never need IPv6 bracketing.
+        let address = match (record_type, record) {
             (_, DnsRecord::CNAME(_)) => continue,
             (DnsRecordType::SRV, DnsRecord::SRV { port, target, .. }) => {
                 if !is_safe_domain_target(target) {
                     continue;
                 }
-                target_host_raw.clone_from(target);
                 srv_target.clone_from(target);
                 srv_port = port.to_string();
-                addr_port = *port;
+                let host = target.trim_end_matches('.');
+                format!("{host}:{port}")
             }
             (DnsRecordType::MX, DnsRecord::MX { target, .. }) => {
                 if !is_safe_domain_target(target) {
                     continue;
                 }
-                target_host_raw.clone_from(target);
                 mx_target.clone_from(target);
-                addr_port = default_port;
+                let host = target.trim_end_matches('.');
+                format!("{host}:{default_port}")
             }
             (DnsRecordType::NS, DnsRecord::NS { target }) => {
                 if !is_safe_domain_target(target) {
                     continue;
                 }
-                target_host_raw.clone_from(target);
                 ns_target.clone_from(target);
-                addr_port = default_port;
+                let host = target.trim_end_matches('.');
+                format!("{host}:{default_port}")
             }
             (DnsRecordType::A, DnsRecord::A(ip)) => {
-                target_host_raw = ip.to_string();
-                addr_port = default_port;
+                SocketAddr::new(IpAddr::V4(*ip), default_port).to_string()
             }
             (DnsRecordType::AAAA, DnsRecord::AAAA(ip)) => {
-                target_host_raw = match ip.to_ipv4_mapped() {
-                    Some(v4) => v4.to_string(),
-                    None => ip.to_string(),
-                };
-                addr_port = default_port;
+                let ip = ip.to_ipv4_mapped().map_or(IpAddr::V6(*ip), IpAddr::V4);
+                SocketAddr::new(ip, default_port).to_string()
             }
             _ => continue,
-        }
-
-        // Remove the trailing dot from rooted DNS names to make them look more usual.
-        let host = target_host_raw.trim_end_matches('.');
-        let address = join_host_port(host, &addr_port.to_string());
+        };
 
         let mut labels = LabelSet::new();
         labels.insert(ADDRESS_LABEL.to_owned(), address);
