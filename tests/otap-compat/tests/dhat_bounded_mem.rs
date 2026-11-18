@@ -254,7 +254,22 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
                 .with_instance("10.0.0.1:9090")
                 .with_target_label("env", "prod"),
         );
-        let om_opts = opts.with_target_attributes(target_attrs);
+        let relabel_plan = Arc::new(prometheus_expfmt::arrow::MetricRelabelPlan::new(vec![
+            prometheus_expfmt::relabel::Config {
+                source_labels: vec![prometheus_expfmt::relabel::METRIC_NAME_LABEL.to_owned()],
+                regex: prometheus_expfmt::relabel::Regexp::must_new("go_.*"),
+                action: prometheus_expfmt::relabel::Action::Drop,
+                ..prometheus_expfmt::relabel::Config::default()
+            },
+            prometheus_expfmt::relabel::Config {
+                regex: prometheus_expfmt::relabel::Regexp::must_new("ephemeral_.*"),
+                action: prometheus_expfmt::relabel::Action::LabelDrop,
+                ..prometheus_expfmt::relabel::Config::default()
+            },
+        ]));
+        let om_opts = opts
+            .with_target_attributes(target_attrs)
+            .with_metric_relabel_plan(relabel_plan);
         let om_handle = tokio::task::spawn_local(async move {
             let mut warmup_om_dec_mem = 0usize;
             let mut warmup_om_live_heap = 0usize;

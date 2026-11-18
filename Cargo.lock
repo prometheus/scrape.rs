@@ -1074,6 +1074,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-schema",
  "benchfmt",
+ "prometheus-relabel",
  "prost",
  "prost-build",
  "prost-types",

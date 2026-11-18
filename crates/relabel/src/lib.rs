@@ -1310,8 +1310,27 @@ pub fn resolve_conflicting_exposed_keys<K: AsRef<str>>(
     honor_labels: bool,
     renamed_keys: &mut Vec<Option<String>>,
 ) -> bool {
+    resolve_conflicting_exposed_keys_iter(
+        metric_keys.iter().map(AsRef::as_ref),
+        target_labels,
+        honor_labels,
+        renamed_keys,
+    )
+}
+
+/// Iterator variant of [`resolve_conflicting_exposed_keys`] that operates directly over borrowed
+/// `&str` entries (such as a contiguous arena string interner) without building a temporary slice.
+pub fn resolve_conflicting_exposed_keys_iter<'a, I>(
+    metric_keys: I,
+    target_labels: &LabelSet,
+    honor_labels: bool,
+    renamed_keys: &mut Vec<Option<String>>,
+) -> bool
+where
+    I: ExactSizeIterator<Item = &'a str> + Clone,
+{
     renamed_keys.clear();
-    if honor_labels || metric_keys.is_empty() || target_labels.is_empty() {
+    if honor_labels || metric_keys.len() == 0 || target_labels.is_empty() {
         return false;
     }
 
@@ -1320,7 +1339,7 @@ pub fn resolve_conflicting_exposed_keys<K: AsRef<str>>(
             && target_labels.get(key).is_some_and(|v| !v.is_empty())
     };
 
-    if !metric_keys.iter().any(|k| is_public_target_key(k.as_ref())) {
+    if !metric_keys.clone().any(is_public_target_key) {
         return false;
     }
 
@@ -1332,8 +1351,7 @@ pub fn resolve_conflicting_exposed_keys<K: AsRef<str>>(
         .collect();
 
     let mut conflicting: Vec<(usize, &str)> = Vec::new();
-    for (idx, key) in metric_keys.iter().enumerate() {
-        let key_str = key.as_ref();
+    for (idx, key_str) in metric_keys.enumerate() {
         if is_public_target_key(key_str) {
             conflicting.push((idx, key_str));
         } else {
@@ -1368,6 +1386,19 @@ pub fn eval_key_keep_mask<K: AsRef<str>>(
     cfg: &Config,
     keep_mask: &mut Vec<bool>,
 ) -> Option<usize> {
+    eval_key_keep_mask_iter(metric_keys.iter().map(AsRef::as_ref), cfg, keep_mask)
+}
+
+/// Iterator variant of [`eval_key_keep_mask`] that operates directly over borrowed `&str` entries
+/// without building a temporary slice.
+pub fn eval_key_keep_mask_iter<'a, I>(
+    metric_keys: I,
+    cfg: &Config,
+    keep_mask: &mut Vec<bool>,
+) -> Option<usize>
+where
+    I: ExactSizeIterator<Item = &'a str>,
+{
     if !matches!(cfg.action, Action::LabelDrop | Action::LabelKeep) {
         return None;
     }
@@ -1376,8 +1407,8 @@ pub fn eval_key_keep_mask<K: AsRef<str>>(
     let mut dropped = 0usize;
     for key in metric_keys {
         let keep = match cfg.action {
-            Action::LabelDrop => !cfg.regex.is_match(key.as_ref()),
-            Action::LabelKeep => cfg.regex.is_match(key.as_ref()),
+            Action::LabelDrop => !cfg.regex.is_match(key),
+            Action::LabelKeep => cfg.regex.is_match(key),
             _ => unreachable!(),
         };
         if !keep {
@@ -1477,6 +1508,12 @@ impl SingleLabelKeepCache {
         self.keep_when_absent
     }
 
+    /// Returns the heap buffer capacity in bytes retained by this cache.
+    #[must_use]
+    pub fn retained_memory_bytes(&self) -> usize {
+        self.states.capacity()
+    }
+
     /// Evaluates or returns the memoized keep decision for `metric_values[val_id]`.
     pub fn keep_value<V: AsRef<str>>(
         &mut self,
@@ -1484,11 +1521,16 @@ impl SingleLabelKeepCache {
         metric_values: &[V],
         cfg: &Config,
     ) -> bool {
+        self.keep_str(val_id, metric_values[val_id].as_ref(), cfg)
+    }
+
+    /// Evaluates or returns the memoized keep decision for dictionary index `val_id` with string
+    /// value `val_str`, avoiding an intermediate slice when values live in an arena interner.
+    pub fn keep_str(&mut self, val_id: usize, val_str: &str, cfg: &Config) -> bool {
         let cached = self.states[val_id];
         if cached != 0 {
             return cached == 2;
         }
-        let val_str = metric_values[val_id].as_ref();
         let keep = match cfg.action {
             Action::Keep => cfg.regex.is_match(val_str),
             Action::Drop => !cfg.regex.is_match(val_str),
@@ -1659,6 +1701,12 @@ impl SingleLabelTransformCache {
             .expect("SingleLabelTransformCache::prepare must succeed before calling when_absent")
     }
 
+    /// Returns the heap buffer capacity in bytes retained by this cache.
+    #[must_use]
+    pub fn retained_memory_bytes(&self) -> usize {
+        self.entries.capacity() * size_of::<Option<DictionaryValueTransform>>()
+    }
+
     /// Evaluates or returns the memoized transformation for `metric_values[val_id]`.
     pub fn transform_value<V: AsRef<str>>(
         &mut self,
@@ -1666,8 +1714,18 @@ impl SingleLabelTransformCache {
         metric_values: &[V],
         cfg: &Config,
     ) -> &DictionaryValueTransform {
+        self.transform_str(val_id, metric_values[val_id].as_ref(), cfg)
+    }
+
+    /// Evaluates or returns the memoized transformation for dictionary index `val_id` with string
+    /// value `val_str`, avoiding an intermediate slice when values live in an arena interner.
+    pub fn transform_str(
+        &mut self,
+        val_id: usize,
+        val_str: &str,
+        cfg: &Config,
+    ) -> &DictionaryValueTransform {
         if self.entries[val_id].is_none() {
-            let val_str = metric_values[val_id].as_ref();
             let xform = eval_value_transform_one(
                 val_str,
                 true,
@@ -1680,6 +1738,20 @@ impl SingleLabelTransformCache {
             self.entries[val_id] = Some(xform);
         }
         self.entries[val_id].as_ref().unwrap()
+    }
+
+    /// Evaluates `cfg` once for a single target-provided value `val_str` (outside the batch value
+    /// dictionary) using this cache's prepared `CaptureLocations`.
+    pub fn eval_single_str(&mut self, val_str: &str, cfg: &Config) -> DictionaryValueTransform {
+        eval_value_transform_one(
+            val_str,
+            !val_str.is_empty(),
+            cfg,
+            self.in_place,
+            self.target_valid,
+            self.single_capture_group,
+            &mut self.locs,
+        )
     }
 }
 
