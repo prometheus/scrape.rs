@@ -1095,6 +1095,125 @@ fn target_attributes_round_trip_through_otap_resource_attrs_and_downstream_upser
     assert!(res_attrs.contains(&kv_str("gcp.project_id", "gpe-test-1")));
 }
 
+#[test]
+fn honor_labels_and_two_stage_metric_relabeling_round_trip_through_otap_and_otlp() {
+    use std::sync::Arc;
+
+    use prometheus_expfmt::arrow::MetricRelabelPlan;
+    use prometheus_expfmt::relabel::{Action, Config, METRIC_NAME_LABEL, Regexp, ValidationScheme};
+
+    let target = Arc::new(
+        TargetAttributes::from_target_labels([
+            ("__address__", "10.0.0.9:9090"),
+            ("job", "checkout"),
+            ("instance", "10.0.0.9:9090"),
+            ("env", "prod"),
+            ("drop_me_target", "unused"),
+        ])
+        .with_resource_attribute("cloud.region", "us-central1"),
+    );
+
+    let plan = Arc::new(
+        MetricRelabelPlan::try_new(
+            vec![
+                Config {
+                    source_labels: vec![METRIC_NAME_LABEL.to_owned()],
+                    regex: Regexp::must_new("http_.*"),
+                    action: Action::Keep,
+                    ..Config::default()
+                },
+                Config {
+                    regex: Regexp::must_new("debug_.*|drop_me_target"),
+                    action: Action::LabelDrop,
+                    ..Config::default()
+                },
+                Config {
+                    source_labels: vec!["status".to_owned()],
+                    regex: Regexp::must_new("2.."),
+                    action: Action::Keep,
+                    ..Config::default()
+                },
+                Config {
+                    source_labels: vec!["pod".to_owned()],
+                    regex: Regexp::must_new("([a-z]+)-[0-9a-f]+"),
+                    target_label: "app".to_owned(),
+                    replacement: "$1".to_owned(),
+                    action: Action::Replace,
+                    ..Config::default()
+                },
+            ],
+            ValidationScheme::Utf8,
+        )
+        .expect("valid relabel plan"),
+    );
+
+    let payload = concat!(
+        "# TYPE go_goroutines gauge\n",
+        "go_goroutines{status=\"200\"} 10\n",
+        "# TYPE http_requests_total counter\n",
+        "http_requests_total{job=\"exporter\",status=\"500\",pod=\"web-aaaa\",debug_id=\"1\"} 1 # {job=\"ex\",trace_id=\"00112233445566778899aabbccddeeff\"} 1 1700000000\n",
+        "http_requests_total{job=\"exporter\",status=\"200\",pod=\"api-7f8b\",debug_id=\"2\"} 9 # {job=\"ex\",trace_id=\"ffeeddccbbaa99887766554433221100\"} 9 1700000000\n",
+        "# TYPE http_latency_seconds histogram\n",
+        "http_latency_seconds_bucket{status=\"200\",pod=\"api-7f8b\",le=\"0.5\"} 2\n",
+        "http_latency_seconds_bucket{status=\"200\",pod=\"api-7f8b\",le=\"+Inf\"} 2\n",
+        "http_latency_seconds_sum{status=\"200\",pod=\"api-7f8b\"} 0.4\n",
+        "http_latency_seconds_count{status=\"200\",pod=\"api-7f8b\"} 2\n",
+        "# EOF\n",
+    );
+
+    let mut decoder = ArrowDecoder::new();
+    let opts = DecodeOptions::new()
+        .with_timestamp_ms(1_700_000_000_000)
+        .with_target_attributes(target)
+        .with_honor_labels(false)
+        .with_metric_relabel_plan(plan);
+    let decoded = decoder
+        .decode(payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts)
+        .expect("relabeled decode succeeds");
+
+    let mut otap = to_otap_arrow_records(&decoded);
+    otap.encode_transport_optimized()
+        .expect("transport optimize succeeds");
+    otap.decode_transport_optimized_ids()
+        .expect("transport decode IDs succeeds");
+
+    let OtlpProtoMessage::Metrics(otlp) = otap_to_otlp(&otap) else {
+        panic!("expected OTLP MetricsData");
+    };
+    assert_eq!(otlp.resource_metrics.len(), 1);
+    let res_attrs = &otlp.resource_metrics[0]
+        .resource
+        .as_ref()
+        .expect("resource present")
+        .attributes;
+    assert!(res_attrs.contains(&kv_str(SERVICE_NAME_ATTR, "checkout")));
+    assert!(res_attrs.contains(&kv_str(SERVICE_INSTANCE_ID_ATTR, "10.0.0.9:9090")));
+    assert!(res_attrs.contains(&kv_str("env", "prod")));
+    assert!(res_attrs.contains(&kv_str("cloud.region", "us-central1")));
+    assert!(!res_attrs.iter().any(|kv| kv.key == "drop_me_target"));
+
+    let metrics = &otlp.resource_metrics[0].scope_metrics[0].metrics;
+    assert_eq!(metrics.len(), 2);
+    assert_eq!(metrics[0].name, "http_requests_total");
+    assert_eq!(metrics[1].name, "http_latency_seconds");
+
+    let Some(metric::Data::Sum(sum)) = &metrics[0].data else {
+        panic!("expected Sum for http_requests_total");
+    };
+    assert_eq!(sum.data_points.len(), 1);
+    let dp = &sum.data_points[0];
+    assert!(dp.attributes.contains(&kv_str("exported_job", "exporter")));
+    assert!(dp.attributes.contains(&kv_str("app", "api")));
+    assert!(dp.attributes.contains(&kv_str("status", "200")));
+    assert!(!dp.attributes.iter().any(|kv| kv.key == "debug_id"));
+    assert_eq!(dp.exemplars.len(), 1);
+    assert!(
+        dp.exemplars[0]
+            .filtered_attributes
+            .contains(&kv_str("job", "ex"))
+    );
+}
+
 async fn probe_scheduling_lateness(
     mut completed: tokio::sync::oneshot::Receiver<tokio::time::Instant>,
     period: Duration,

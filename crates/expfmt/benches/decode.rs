@@ -24,11 +24,15 @@ use std::future::Future;
 use std::hint::black_box;
 use std::path::Path;
 use std::pin::{Pin, pin};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use benchfmt::{CountingAlloc, Suite};
-use prometheus_expfmt::arrow::{ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep};
+use prometheus_expfmt::arrow::{
+    ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep, MetricRelabelPlan, TargetAttributes,
+};
 use prometheus_expfmt::format::Format;
+use prometheus_expfmt::relabel::{Action, Config, METRIC_NAME_LABEL, Regexp};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc::new();
@@ -231,6 +235,61 @@ fn main() {
                 },
             );
     }
+
+    let relabel_target = Arc::new(TargetAttributes::from_target_labels([
+        ("job", "prometheus"),
+        ("instance", "127.0.0.1:9090"),
+        ("env", "prod"),
+        ("handler", "target-handler"),
+    ]));
+    let relabel_plan = Arc::new(MetricRelabelPlan::new(vec![
+        Config {
+            source_labels: vec![METRIC_NAME_LABEL.to_owned()],
+            regex: Regexp::must_new("(prometheus|go)_.*"),
+            action: Action::Keep,
+            ..Config::default()
+        },
+        Config {
+            regex: Regexp::must_new("le_unused_.*"),
+            action: Action::LabelDrop,
+            ..Config::default()
+        },
+        Config {
+            source_labels: vec!["handler".to_owned()],
+            regex: Regexp::must_new("/.*"),
+            target_label: "route_group".to_owned(),
+            replacement: "http".to_owned(),
+            action: Action::Replace,
+            ..Config::default()
+        },
+    ]));
+    let relabel_opts = DecodeOptions::new()
+        .with_timestamp_ms(0)
+        .with_target_attributes(relabel_target)
+        .with_honor_labels(false)
+        .with_metric_relabel_plan(relabel_plan);
+    let full_bytes_len = full_bytes.len() as u64;
+
+    suite = suite.bench(
+        "Decode/case=alltypes.237mfs/mode=relabel_stage1_stage2",
+        move |b| {
+            let mut decoder = ArrowDecoder::new();
+            black_box(
+                decoder
+                    .decode(full_bytes, &Format::TEXT, &relabel_opts)
+                    .unwrap(),
+            );
+
+            b.set_bytes(full_bytes_len);
+            b.report_allocs();
+            while b.keep_running() {
+                let records = decoder
+                    .decode(black_box(full_bytes), &Format::TEXT, &relabel_opts)
+                    .unwrap();
+                black_box(records);
+            }
+        },
+    );
 
     suite.run();
 }

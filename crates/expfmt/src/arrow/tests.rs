@@ -1395,3 +1395,565 @@ fn target_attributes_emit_resource_attrs_and_map_job_and_instance() {
         &DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8))
     );
 }
+
+fn extract_attrs_by_parent_u32(
+    batch: Option<&arrow_array::RecordBatch>,
+) -> std::collections::BTreeMap<u32, std::collections::BTreeMap<String, String>> {
+    use std::collections::BTreeMap;
+
+    use arrow_array::UInt32Array;
+
+    let mut out: BTreeMap<u32, BTreeMap<String, String>> = BTreeMap::new();
+    let Some(batch) = batch else {
+        return out;
+    };
+    let parents = batch
+        .column_by_name("parent_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
+    let key_col = batch.column_by_name("key").unwrap();
+    let val_col = batch.column_by_name("str").unwrap();
+
+    let read_str = |col: &arrow_array::ArrayRef, row: usize| -> String {
+        if let Some(d) = col.as_any().downcast_ref::<DictionaryArray<UInt8Type>>() {
+            let vals = d.values().as_any().downcast_ref::<StringArray>().unwrap();
+            vals.value(usize::from(d.keys().value(row))).to_owned()
+        } else if let Some(d) = col.as_any().downcast_ref::<DictionaryArray<UInt16Type>>() {
+            let vals = d.values().as_any().downcast_ref::<StringArray>().unwrap();
+            vals.value(usize::from(d.keys().value(row))).to_owned()
+        } else {
+            col.as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row)
+                .to_owned()
+        }
+    };
+
+    for row in 0..batch.num_rows() {
+        out.entry(parents.value(row))
+            .or_default()
+            .insert(read_str(key_col, row), read_str(val_col, row));
+    }
+    out
+}
+
+fn extract_resource_attrs(
+    batch: Option<&arrow_array::RecordBatch>,
+) -> std::collections::BTreeMap<String, String> {
+    use std::collections::BTreeMap;
+
+    let mut out = BTreeMap::new();
+    let Some(batch) = batch else {
+        return out;
+    };
+    let key_col = batch.column_by_name("key").unwrap();
+    let val_col = batch.column_by_name("str").unwrap();
+    let read_str = |col: &arrow_array::ArrayRef, row: usize| -> String {
+        if let Some(d) = col.as_any().downcast_ref::<DictionaryArray<UInt8Type>>() {
+            let vals = d.values().as_any().downcast_ref::<StringArray>().unwrap();
+            vals.value(usize::from(d.keys().value(row))).to_owned()
+        } else if let Some(d) = col.as_any().downcast_ref::<DictionaryArray<UInt16Type>>() {
+            let vals = d.values().as_any().downcast_ref::<StringArray>().unwrap();
+            vals.value(usize::from(d.keys().value(row))).to_owned()
+        } else {
+            col.as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row)
+                .to_owned()
+        }
+    };
+    for row in 0..batch.num_rows() {
+        out.insert(read_str(key_col, row), read_str(val_col, row));
+    }
+    out
+}
+
+#[test]
+fn honor_labels_collision_resolution_and_exemplar_preservation() {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    let target = Arc::new(TargetAttributes::from_target_labels([
+        ("job", "prom-job"),
+        ("instance", "10.0.0.1:9090"),
+        ("foo", "target-foo"),
+        ("exported_foo", "target-exported-foo"),
+    ]));
+
+    let payload = concat!(
+        "# TYPE req_total counter\n",
+        "req_total{job=\"sample-job\",foo=\"1\",exported_foo=\"2\",method=\"GET\"} 7 # {job=\"ex-job\",trace_id=\"00112233445566778899aabbccddeeff\"} 1 1700000000\n",
+        "# EOF\n",
+    );
+
+    let mut dec = ArrowDecoder::new();
+
+    // `honor_labels = false` (default): colliding series keys get `exported_` prefixing in
+    // ascending key-length order, while exemplar attributes stay untouched.
+    let opts_false = DecodeOptions::new()
+        .with_timestamp_ms(1_700_000_000_000)
+        .with_target_attributes(Arc::clone(&target));
+    let rec_false = dec
+        .decode(payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts_false)
+        .unwrap();
+    let dp_attrs = extract_attrs_by_parent_u32(rec_false.number_dp_attrs());
+    assert_eq!(
+        dp_attrs.get(&0),
+        Some(&BTreeMap::from([
+            ("exported_exported_exported_foo".to_owned(), "2".to_owned()),
+            ("exported_exported_foo".to_owned(), "1".to_owned()),
+            ("exported_job".to_owned(), "sample-job".to_owned()),
+            ("method".to_owned(), "GET".to_owned()),
+        ]))
+    );
+    let ex_attrs = extract_attrs_by_parent_u32(rec_false.number_dp_exemplar_attrs());
+    assert_eq!(
+        ex_attrs.get(&0),
+        Some(&BTreeMap::from([("job".to_owned(), "ex-job".to_owned())]))
+    );
+
+    // `honor_labels = true`: exposed metric labels stay unprefixed.
+    let opts_true = opts_false.with_honor_labels(true);
+    let rec_true = dec
+        .decode(payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts_true)
+        .unwrap();
+    let dp_attrs_true = extract_attrs_by_parent_u32(rec_true.number_dp_attrs());
+    assert_eq!(
+        dp_attrs_true.get(&0),
+        Some(&BTreeMap::from([
+            ("exported_foo".to_owned(), "2".to_owned()),
+            ("foo".to_owned(), "1".to_owned()),
+            ("job".to_owned(), "sample-job".to_owned()),
+            ("method".to_owned(), "GET".to_owned()),
+        ]))
+    );
+}
+
+#[test]
+fn stage1_pushdown_filters_wire_series_across_scalar_histogram_and_cooperative_streaming() {
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    use prometheus_relabel::{Action, Config, METRIC_NAME_LABEL, Regexp};
+
+    let payload = concat!(
+        "# TYPE http_requests_total counter\n",
+        "http_requests_total{method=\"GET\"} 10\n",
+        "http_requests_total{method=\"POST\"} 20\n",
+        "# TYPE go_goroutines gauge\n",
+        "go_goroutines 42\n",
+        "# TYPE http_latency_seconds histogram\n",
+        "http_latency_seconds_bucket{le=\"0.5\"} 3\n",
+        "http_latency_seconds_bucket{le=\"+Inf\"} 5\n",
+        "http_latency_seconds_sum 2.5\n",
+        "http_latency_seconds_count 5\n",
+        "# TYPE rpc_latency_seconds summary\n",
+        "rpc_latency_seconds{quantile=\"0.5\"} 0.1\n",
+        "rpc_latency_seconds_sum 1.0\n",
+        "rpc_latency_seconds_count 10\n",
+    );
+
+    // Keep only `http_*` wire series and drop histogram `*_bucket` series at Stage 1.
+    let plan = MetricRelabelPlan::new(vec![
+        Config {
+            source_labels: vec![METRIC_NAME_LABEL.to_owned()],
+            regex: Regexp::must_new("http_.*"),
+            action: Action::Keep,
+            ..Config::default()
+        },
+        Config {
+            source_labels: vec![METRIC_NAME_LABEL.to_owned()],
+            regex: Regexp::must_new(".*_bucket"),
+            action: Action::Drop,
+            ..Config::default()
+        },
+    ]);
+    assert_eq!(plan.stage1_configs().len(), 2);
+    assert!(plan.stage2_configs().is_empty());
+
+    let opts = DecodeOptions::new()
+        .with_timestamp_ms(1_700_000_000_000)
+        .with_metric_relabel_plan(std::sync::Arc::new(plan));
+
+    let mut dec = ArrowDecoder::new();
+    let rec = dec
+        .decode(payload.as_bytes(), &Format::TEXT, &opts)
+        .unwrap();
+    let metrics = rec.univariate_metrics().unwrap();
+    let names = metrics
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let emitted_names: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    assert_eq!(
+        emitted_names,
+        vec!["http_requests_total", "http_latency_seconds"]
+    );
+    assert!(rec.summary_data_points().is_none());
+    let hist = rec.histogram_data_points().unwrap();
+    assert_eq!(hist.num_rows(), 1);
+    let bounds = hist
+        .column_by_name("explicit_bounds")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::ListArray>()
+        .unwrap();
+    assert_eq!(bounds.value(0).len(), 0);
+
+    // Cooperative decoding still respects budgets even when Stage 1 drops 100% of series.
+    let drop_all_opts = DecodeOptions::new().with_metric_relabel_configs(vec![Config {
+        source_labels: vec![METRIC_NAME_LABEL.to_owned()],
+        regex: Regexp::must_new(".*"),
+        action: Action::Drop,
+        ..Config::default()
+    }]);
+    let mut yields = 0usize;
+    let budget = DecodeBudget::new(2, 8 << 20, std::time::Duration::from_secs(60));
+    let dropped_res = {
+        let mut fut = pin!(dec.decode_cooperative(
+            payload.as_bytes(),
+            &Format::TEXT,
+            &drop_all_opts,
+            budget,
+            || {
+                yields += 1;
+                std::future::ready(())
+            },
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(res) = fut.as_mut().poll(&mut cx) {
+                break res.unwrap();
+            }
+        }
+    };
+    assert!(dropped_res.is_empty());
+    assert!(yields > 0);
+}
+
+#[test]
+fn stage2_dictionary_relabeling_covers_labeldrop_filters_transforms_targets_and_empty_chunks() {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use prometheus_relabel::{Action, Config, Regexp, ValidationScheme};
+
+    let target = Arc::new(
+        TargetAttributes::from_target_labels([
+            ("job", "api"),
+            ("instance", "10.0.0.1:9090"),
+            ("env", "prod"),
+            ("drop_target", "bye"),
+        ])
+        .with_resource_attribute("cloud.region", "us-east1"),
+    );
+
+    let payload = concat!(
+        "# TYPE drop_me_gauge gauge\n",
+        "drop_me_gauge{env_tag=\"DEV\",pod=\"worker-1111\",ephemeral_a=\"x\"} 1\n",
+        "# TYPE keep_me_total counter\n",
+        "keep_me_total{env_tag=\"DEV\",pod=\"api-dead\",ephemeral_a=\"x\"} 2 # {trace_id=\"00112233445566778899aabbccddeeff\",ex_k=\"dropped\"} 2 1700000000\n",
+        "keep_me_total{env_tag=\"PROD\",pod=\"api-7f8b\",ephemeral_a=\"x\"} 5 # {trace_id=\"ffeeddccbbaa99887766554433221100\",ex_k=\"kept\"} 5 1700000000\n",
+        "# EOF\n",
+    );
+
+    let plan = Arc::new(
+        MetricRelabelPlan::try_new(
+            vec![
+                Config {
+                    regex: Regexp::must_new("ephemeral_.*|drop_target"),
+                    action: Action::LabelDrop,
+                    ..Config::default()
+                },
+                Config {
+                    source_labels: vec!["env".to_owned()],
+                    regex: Regexp::must_new("prod"),
+                    action: Action::Keep,
+                    ..Config::default()
+                },
+                Config {
+                    source_labels: vec!["env_tag".to_owned()],
+                    regex: Regexp::must_new("PROD"),
+                    action: Action::Keep,
+                    ..Config::default()
+                },
+                Config {
+                    source_labels: vec!["env_tag".to_owned()],
+                    target_label: "env_tag".to_owned(),
+                    action: Action::Lowercase,
+                    ..Config::default()
+                },
+                Config {
+                    source_labels: vec!["pod".to_owned()],
+                    regex: Regexp::must_new("([a-z0-9-]+)-[0-9a-f]+"),
+                    target_label: "app".to_owned(),
+                    replacement: "$1".to_owned(),
+                    action: Action::Replace,
+                    ..Config::default()
+                },
+                Config {
+                    source_labels: vec!["job".to_owned()],
+                    target_label: "job".to_owned(),
+                    action: Action::Uppercase,
+                    ..Config::default()
+                },
+            ],
+            ValidationScheme::Utf8,
+        )
+        .unwrap(),
+    );
+
+    let opts = DecodeOptions::new()
+        .with_timestamp_ms(1_700_000_000_000)
+        .with_target_attributes(target)
+        .with_metric_relabel_plan(plan);
+
+    let mut dec = ArrowDecoder::new();
+    let rec = dec
+        .decode(payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts)
+        .unwrap();
+
+    // `drop_me_gauge` was completely pruned; only `keep_me_total` with `env_tag="prod"` survives.
+    let metrics = rec.univariate_metrics().unwrap();
+    assert_eq!(metrics.num_rows(), 1);
+    let names = metrics
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "keep_me_total");
+
+    let dps = rec.number_data_points().unwrap();
+    assert_eq!(dps.num_rows(), 1);
+    let dp_attrs = extract_attrs_by_parent_u32(rec.number_dp_attrs());
+    assert_eq!(
+        dp_attrs.get(&0),
+        Some(&BTreeMap::from([
+            ("app".to_owned(), "api".to_owned()),
+            ("env_tag".to_owned(), "prod".to_owned()),
+            ("pod".to_owned(), "api-7f8b".to_owned()),
+        ]))
+    );
+
+    // Only the surviving data point's exemplar remains, re-indexed to `parent_id = 0`.
+    let exemplars = rec.number_dp_exemplars().unwrap();
+    assert_eq!(exemplars.num_rows(), 1);
+    let ex_attrs = extract_attrs_by_parent_u32(rec.number_dp_exemplar_attrs());
+    assert_eq!(
+        ex_attrs.get(&0),
+        Some(&BTreeMap::from([("ex_k".to_owned(), "kept".to_owned())]))
+    );
+
+    // `drop_target` was removed and `job` was uppercased to `"API"` -> `service.name = "API"`.
+    let res_attrs = extract_resource_attrs(rec.resource_attrs());
+    assert_eq!(
+        res_attrs,
+        BTreeMap::from([
+            ("cloud.region".to_owned(), "us-east1".to_owned()),
+            ("env".to_owned(), "prod".to_owned()),
+            (
+                SERVICE_INSTANCE_ID_ATTR.to_owned(),
+                "10.0.0.1:9090".to_owned()
+            ),
+            (SERVICE_NAME_ATTR.to_owned(), "API".to_owned()),
+        ])
+    );
+
+    // Streaming with `max_data_points_per_batch = 1` skips chunks whose points are all dropped.
+    let stream_opts = opts.with_max_data_points_per_batch(1);
+    let chunks: Vec<_> = dec
+        .decode_stream(
+            payload.as_bytes(),
+            &Format::OPEN_METRICS_1_0_0,
+            &stream_opts,
+        )
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].num_data_points(), 1);
+}
+
+#[test]
+fn stage2_general_fallback_and_end_to_end_oracle_match_prometheus() {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use prometheus_relabel::{
+        Action, Config, LabelSet, METRIC_NAME_LABEL, Regexp, merge_target_and_metric_labels,
+        process_in_place,
+    };
+
+    // 1. General rules: metric rename splitting one family into two, `labelmap`, and multi-label `replace`.
+    let target_labels = LabelSet::from([
+        ("job".to_owned(), "checkout".to_owned()),
+        ("instance".to_owned(), "10.0.0.2:8080".to_owned()),
+        ("region".to_owned(), "eu".to_owned()),
+    ]);
+    let target = Arc::new(TargetAttributes::from_target_labels(&target_labels));
+
+    let cfgs = vec![
+        Config {
+            source_labels: vec![METRIC_NAME_LABEL.to_owned()],
+            regex: Regexp::must_new("(http|app)_.*"),
+            action: Action::Keep,
+            ..Config::default()
+        },
+        Config {
+            regex: Regexp::must_new("tmp_.*"),
+            action: Action::LabelDrop,
+            ..Config::default()
+        },
+        Config {
+            source_labels: vec!["region".to_owned(), "method".to_owned()],
+            separator: ":".to_owned(),
+            regex: Regexp::must_new("(.+):(.+)"),
+            target_label: "route".to_owned(),
+            replacement: "$1/$2".to_owned(),
+            action: Action::Replace,
+            ..Config::default()
+        },
+        Config {
+            regex: Regexp::must_new("meta_(.+)"),
+            replacement: "m_$1".to_owned(),
+            action: Action::LabelMap,
+            ..Config::default()
+        },
+        Config {
+            source_labels: vec![METRIC_NAME_LABEL.to_owned(), "v".to_owned()],
+            separator: "_".to_owned(),
+            regex: Regexp::must_new("app_events_(v[12])"),
+            target_label: METRIC_NAME_LABEL.to_owned(),
+            replacement: "app_events_$1".to_owned(),
+            action: Action::Replace,
+            ..Config::default()
+        },
+    ];
+
+    type OracleSample<'a> = (&'a str, &'a [(&'a str, &'a str)], f64);
+
+    let samples: &[OracleSample<'_>] = &[
+        (
+            "http_reqs_total",
+            &[
+                ("job", "inner"),
+                ("method", "GET"),
+                ("tmp_x", "1"),
+                ("meta_a", "z"),
+            ],
+            10.0,
+        ),
+        ("go_gc_seconds", &[("method", "GET")], 1.0),
+        ("app_events", &[("v", "v1"), ("method", "POST")], 3.0),
+        ("app_events", &[("v", "v2"), ("method", "PUT")], 4.0),
+    ];
+
+    let mut payload = String::new();
+    for (name, labels, val) in samples {
+        payload.push_str(name);
+        payload.push('{');
+        for (i, (k, v)) in labels.iter().enumerate() {
+            if i > 0 {
+                payload.push(',');
+            }
+            payload.push_str(&format!("{k}=\"{v}\""));
+        }
+        payload.push_str(&format!("}} {val}\n"));
+    }
+
+    for honor_labels in [false, true] {
+        let mut expected: Vec<LabelSet> = Vec::new();
+        for (name, labels, _) in samples {
+            let mut ls = LabelSet::new();
+            ls.insert(METRIC_NAME_LABEL.to_owned(), (*name).to_owned());
+            for (k, v) in *labels {
+                ls.insert((*k).to_owned(), (*v).to_owned());
+            }
+            merge_target_and_metric_labels(&mut ls, &target_labels, honor_labels);
+            if process_in_place(&mut ls, &cfgs) {
+                expected.push(ls);
+            }
+        }
+
+        let opts = DecodeOptions::new()
+            .with_target_attributes(Arc::clone(&target))
+            .with_honor_labels(honor_labels)
+            .with_metric_relabel_configs(cfgs.clone());
+        let mut dec = ArrowDecoder::new();
+        let rec = dec
+            .decode(payload.as_bytes(), &Format::TEXT, &opts)
+            .unwrap();
+
+        // Reconstruct each surviving data point's complete Prometheus label set from
+        // `UnivariateMetrics.name` + `ResourceAttrs` (reverse-mapping `service.name`/`service.instance.id`) + `NumberDpAttrs`.
+        let res_attrs = extract_resource_attrs(rec.resource_attrs());
+        let dp_attrs = extract_attrs_by_parent_u32(rec.number_dp_attrs());
+        let metrics = rec.univariate_metrics().unwrap();
+        let metric_names = metrics
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let dps = rec.number_data_points().unwrap();
+        let dp_parents = dps
+            .column_by_name("parent_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::UInt16Array>()
+            .unwrap();
+
+        let mut actual: Vec<LabelSet> = Vec::new();
+        for row in 0..dps.num_rows() {
+            let mut ls = BTreeMap::new();
+            ls.insert(
+                METRIC_NAME_LABEL.to_owned(),
+                metric_names
+                    .value(usize::from(dp_parents.value(row)))
+                    .to_owned(),
+            );
+            for (rk, rv) in &res_attrs {
+                let prom_key = if rk == SERVICE_NAME_ATTR {
+                    "job"
+                } else if rk == SERVICE_INSTANCE_ID_ATTR {
+                    "instance"
+                } else {
+                    rk.as_str()
+                };
+                ls.insert(prom_key.to_owned(), rv.clone());
+            }
+            if let Some(attrs) = dp_attrs.get(&(row as u32)) {
+                for (k, v) in attrs {
+                    ls.insert(k.clone(), v.clone());
+                }
+            }
+            actual.push(ls);
+        }
+        assert_eq!(actual, expected, "mismatch for honor_labels={honor_labels}");
+    }
+
+    // 2. Removing `__name__` while other labels remain returns `DecodeError::MissingMetricName`,
+    //    matching Go Prometheus `errNameLabelMandatory`.
+    let strip_name_opts = DecodeOptions::new().with_metric_relabel_configs(vec![Config {
+        regex: Regexp::must_new(METRIC_NAME_LABEL),
+        action: Action::LabelDrop,
+        ..Config::default()
+    }]);
+    let mut dec = ArrowDecoder::new();
+    let err = dec
+        .decode(b"foo{a=\"1\"} 1\n", &Format::TEXT, &strip_name_opts)
+        .unwrap_err();
+    assert!(matches!(err, DecodeError::MissingMetricName));
+
+    // Removing all labels (leaving an empty label set) drops the series cleanly like Go.
+    let drop_empty = dec
+        .decode(b"foo 1\n", &Format::TEXT, &strip_name_opts)
+        .unwrap();
+    assert!(drop_empty.is_empty());
+}
