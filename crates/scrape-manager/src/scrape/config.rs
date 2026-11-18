@@ -16,9 +16,14 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 #[cfg(feature = "arrow")]
-use prometheus_expfmt::arrow::{DecodeBudget, DecodeOptions};
+use prometheus_expfmt::arrow::{DecodeBudget, DecodeOptions, TargetAttributes};
 use prometheus_expfmt::format::EscapingScheme;
+use prometheus_relabel::{
+    ADDRESS_LABEL, Config as RelabelConfig, METRICS_PATH_LABEL, PARAM_LABEL_PREFIX,
+    PopulatedTarget, SCHEME_LABEL, TargetPopulateConfig, ValidationScheme, populate_labels,
+};
 
+use crate::discovery::{TargetGroup, format_duration};
 use crate::scrape::ScrapeError;
 
 /// Default interval between scrapes of the same target (`15s`).
@@ -26,6 +31,12 @@ pub const DEFAULT_SCRAPE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Default per-target HTTP scrape timeout (`10s`).
 pub const DEFAULT_SCRAPE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default HTTP request path scraped on each target (`"/metrics"`).
+pub const DEFAULT_METRICS_PATH: &str = "/metrics";
+
+/// Default URL scheme scraped on each target (`"http"`).
+pub const DEFAULT_SCHEME: &str = "http";
 
 /// Default maximum uncompressed HTTP response body size (`16 MiB`).
 pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -82,6 +93,101 @@ impl ScrapeTarget {
         Ok(Self::new(url))
     }
 
+    /// Builds a [`ScrapeTarget`] from a relabeled [`PopulatedTarget`], constructing the scrape URL
+    /// from `__scheme__`, `__address__`, `__metrics_path__`, and `__param_*` labels and storing
+    /// only the public (non-`__`-prefixed) target labels.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScrapeError::InvalidConfig`] if `__scheme__` is missing or not `http`/`https`,
+    /// or if `__address__` cannot form a valid target URL.
+    pub fn from_populated(populated: &PopulatedTarget) -> Result<Self, ScrapeError> {
+        Self::from_populated_with_params(populated, &BTreeMap::new())
+    }
+
+    /// Builds a [`ScrapeTarget`] from a relabeled [`PopulatedTarget`] and optional base
+    /// `scrape_config.params`, matching Prometheus `Target.URL()` query parameter merging
+    /// (`__param_<name>` replaces the first value of `config_params[name]` while preserving any
+    /// additional values).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScrapeError::InvalidConfig`] if `__scheme__` is missing or not `http`/`https`,
+    /// or if `__address__` cannot form a valid target URL.
+    pub fn from_populated_with_params(
+        populated: &PopulatedTarget,
+        config_params: &BTreeMap<String, Vec<String>>,
+    ) -> Result<Self, ScrapeError> {
+        let scheme = populated
+            .labels
+            .get(SCHEME_LABEL)
+            .map(String::as_str)
+            .unwrap_or("");
+        if !matches!(scheme, "http" | "https") {
+            return Err(ScrapeError::InvalidConfig(format!(
+                "unsupported scrape target scheme {scheme:?}"
+            )));
+        }
+
+        let address = populated
+            .labels
+            .get(ADDRESS_LABEL)
+            .map(String::as_str)
+            .unwrap_or("");
+        if address.is_empty() || address.contains('/') {
+            return Err(ScrapeError::InvalidConfig(format!(
+                "invalid scrape target address {address:?}"
+            )));
+        }
+
+        let mut url = reqwest::Url::parse(&format!("{scheme}://{address}")).map_err(|err| {
+            ScrapeError::InvalidConfig(format!(
+                "invalid scrape target URL from scheme {scheme:?} and address {address:?}: {err}"
+            ))
+        })?;
+        if url.host().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(ScrapeError::InvalidConfig(format!(
+                "invalid scrape target address {address:?}"
+            )));
+        }
+
+        if let Some(path) = populated.labels.get(METRICS_PATH_LABEL) {
+            url.set_path(path);
+        }
+
+        let mut params = config_params.clone();
+        for (key, value) in &populated.labels {
+            let Some(param_name) = key.strip_prefix(PARAM_LABEL_PREFIX) else {
+                continue;
+            };
+            if let Some(existing) = params.get_mut(param_name)
+                && !existing.is_empty()
+            {
+                existing[0].clone_from(value);
+            } else {
+                params.insert(param_name.to_owned(), vec![value.clone()]);
+            }
+        }
+        if !params.is_empty() {
+            let mut pairs = url.query_pairs_mut();
+            for (key, values) in &params {
+                for value in values {
+                    pairs.append_pair(key, value);
+                }
+            }
+        }
+
+        Ok(Self {
+            url,
+            labels: populated.public_labels(),
+        })
+    }
+
     /// Inserts or replaces a target metadata label (such as `instance` or `job`).
     #[must_use]
     pub fn with_label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -113,6 +219,18 @@ impl ScrapeTarget {
     #[must_use]
     pub const fn labels(&self) -> &BTreeMap<String, String> {
         &self.labels
+    }
+
+    /// Builds OpenTelemetry [`TargetAttributes`] derived from [`Self::labels`], returning `None`
+    /// when the target has no public non-empty labels.
+    #[cfg(feature = "arrow")]
+    #[must_use]
+    pub fn to_target_attributes(&self) -> Option<TargetAttributes> {
+        if self.labels.is_empty() {
+            return None;
+        }
+        let attrs = TargetAttributes::from_target_labels(&self.labels);
+        (!attrs.is_empty()).then_some(attrs)
     }
 }
 
@@ -286,6 +404,22 @@ pub struct ScrapeConfig {
     pub max_data_points_per_batch: usize,
     /// `User-Agent` header value sent on HTTP scrape requests.
     pub user_agent: String,
+    /// Default HTTP path populated into `__metrics_path__` during target discovery
+    /// (defaults to `"/metrics"`).
+    pub metrics_path: String,
+    /// Default URL scheme populated into `__scheme__` during target discovery (`"http"` or
+    /// `"https"`, defaults to `"http"`).
+    pub scheme: String,
+    /// Optional HTTP query parameters populated into `__param_<name>` and appended to target URLs.
+    pub params: BTreeMap<String, Vec<String>>,
+    /// Controls how exposed sample labels colliding with public target labels are resolved,
+    /// matching Prometheus `scrape_config.honor_labels` (defaults to `false`).
+    pub honor_labels: bool,
+    /// Target discovery relabeling rules applied by [`ScrapeConfig::populate_targets`].
+    pub relabel_configs: Vec<RelabelConfig>,
+    /// Post-scrape metric relabeling rules compiled once into a `MetricRelabelPlan` by
+    /// [`crate::scrape::ScrapeManager::new`] and executed in `ArrowDecoder`.
+    pub metric_relabel_configs: Vec<RelabelConfig>,
     /// Cooperative per-step parsing budget when the `arrow` feature is enabled.
     #[cfg(feature = "arrow")]
     pub decode_budget: DecodeBudget,
@@ -311,6 +445,12 @@ impl Default for ScrapeConfig {
             max_retained_decoder_bytes: DEFAULT_MAX_RETAINED_DECODER_BYTES,
             max_data_points_per_batch: DEFAULT_MAX_DATA_POINTS_PER_BATCH,
             user_agent: DEFAULT_USER_AGENT.to_owned(),
+            metrics_path: DEFAULT_METRICS_PATH.to_owned(),
+            scheme: DEFAULT_SCHEME.to_owned(),
+            params: BTreeMap::new(),
+            honor_labels: false,
+            relabel_configs: Vec::new(),
+            metric_relabel_configs: Vec::new(),
             #[cfg(feature = "arrow")]
             decode_budget: DecodeBudget::default(),
             #[cfg(feature = "arrow")]
@@ -420,6 +560,55 @@ impl ScrapeConfig {
         self
     }
 
+    /// Sets [`ScrapeConfig::metrics_path`].
+    #[must_use]
+    pub fn with_metrics_path(mut self, path: impl Into<String>) -> Self {
+        self.metrics_path = path.into();
+        self
+    }
+
+    /// Sets [`ScrapeConfig::scheme`].
+    #[must_use]
+    pub fn with_scheme(mut self, scheme: impl Into<String>) -> Self {
+        self.scheme = scheme.into();
+        self
+    }
+
+    /// Sets [`ScrapeConfig::params`].
+    #[must_use]
+    pub fn with_params(mut self, params: BTreeMap<String, Vec<String>>) -> Self {
+        self.params = params;
+        self
+    }
+
+    /// Inserts or replaces a single query parameter in [`ScrapeConfig::params`].
+    #[must_use]
+    pub fn with_param(mut self, key: impl Into<String>, values: Vec<String>) -> Self {
+        self.params.insert(key.into(), values);
+        self
+    }
+
+    /// Sets [`ScrapeConfig::honor_labels`].
+    #[must_use]
+    pub const fn with_honor_labels(mut self, honor_labels: bool) -> Self {
+        self.honor_labels = honor_labels;
+        self
+    }
+
+    /// Sets [`ScrapeConfig::relabel_configs`].
+    #[must_use]
+    pub fn with_relabel_configs(mut self, configs: Vec<RelabelConfig>) -> Self {
+        self.relabel_configs = configs;
+        self
+    }
+
+    /// Sets [`ScrapeConfig::metric_relabel_configs`].
+    #[must_use]
+    pub fn with_metric_relabel_configs(mut self, configs: Vec<RelabelConfig>) -> Self {
+        self.metric_relabel_configs = configs;
+        self
+    }
+
     /// Sets [`ScrapeConfig::decode_budget`].
     #[cfg(feature = "arrow")]
     #[must_use]
@@ -436,13 +625,66 @@ impl ScrapeConfig {
         self
     }
 
-    /// Validates interval, timeout, and pool invariants.
+    /// Builds the [`TargetPopulateConfig`] used to seed pre-relabel target discovery labels.
+    #[must_use]
+    pub fn target_populate_config(&self) -> TargetPopulateConfig {
+        TargetPopulateConfig {
+            job_name: self.job_name.clone(),
+            scrape_interval: format_duration(self.scrape_interval),
+            scrape_timeout: format_duration(self.scrape_timeout),
+            metrics_path: self.metrics_path.clone(),
+            scheme: self.scheme.clone(),
+            params: self.params.clone(),
+        }
+    }
+
+    /// Populates and relabels all discovered targets across `groups` using
+    /// [`Self::relabel_configs`], returning the kept [`ScrapeTarget`] endpoints ready for
+    /// [`crate::scrape::ScrapeManager`].
+    ///
+    /// Targets dropped by [`Self::relabel_configs`] are omitted from the returned vector. Pool
+    /// scheduling uses [`Self::scrape_interval`] and [`Self::scrape_timeout`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScrapeError::InvalidConfig`] if `self` fails validation, if `populate_labels`
+    /// rejects a relabeled target (for example missing `__address__` or invalid
+    /// `__scrape_interval__`/`__scrape_timeout__`), or if the relabeled target cannot form a
+    /// valid HTTP/HTTPS URL.
+    pub fn populate_targets(
+        &self,
+        groups: &[TargetGroup],
+    ) -> Result<Vec<ScrapeTarget>, ScrapeError> {
+        self.validate()?;
+        let validated_relabel = validate_relabel_configs(&self.relabel_configs)?;
+        let pop_cfg = self.target_populate_config();
+
+        let mut out = Vec::new();
+        for group in groups {
+            for target_labels in &group.targets {
+                let Some(populated) =
+                    populate_labels(target_labels, &group.labels, &pop_cfg, &validated_relabel)
+                        .map_err(|err| ScrapeError::InvalidConfig(err.to_string()))?
+                else {
+                    continue;
+                };
+                out.push(ScrapeTarget::from_populated_with_params(
+                    &populated,
+                    &self.params,
+                )?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Validates interval, timeout, scheme, relabel rules, and pool invariants.
     ///
     /// # Errors
     ///
     /// Returns [`ScrapeError::InvalidConfig`] if `job_name` is empty, `scrape_interval` or
-    /// `scrape_timeout` is zero, `scrape_timeout > scrape_interval`, or a concurrent pool size
-    /// exceeds `max_in_flight`.
+    /// `scrape_timeout` is zero, `scrape_timeout > scrape_interval`, `scheme` is not `"http"` or
+    /// `"https"`, any rule in `relabel_configs` or `metric_relabel_configs` is invalid, or a
+    /// concurrent pool size exceeds `max_in_flight`.
     pub fn validate(&self) -> Result<(), ScrapeError> {
         if self.job_name.trim().is_empty() {
             return Err(ScrapeError::InvalidConfig(
@@ -477,12 +719,20 @@ impl ScrapeConfig {
                 self.scrape_timeout, self.scrape_interval
             )));
         }
+        if !matches!(self.scheme.as_str(), "http" | "https") {
+            return Err(ScrapeError::InvalidConfig(format!(
+                "unsupported scrape scheme {:?} (expected \"http\" or \"https\")",
+                self.scheme
+            )));
+        }
         if reqwest::header::HeaderValue::from_str(&self.user_agent).is_err() {
             return Err(ScrapeError::InvalidConfig(format!(
                 "user_agent contains invalid HTTP header bytes: {:?}",
                 self.user_agent
             )));
         }
+        let _ = validate_relabel_configs(&self.relabel_configs)?;
+        let _ = validate_relabel_configs(&self.metric_relabel_configs)?;
         if let SchedulingMode::Concurrent {
             max_in_flight,
             max_buffered_bodies,
@@ -512,6 +762,18 @@ impl ScrapeConfig {
             self.max_body_bytes
         }
     }
+}
+
+fn validate_relabel_configs(cfgs: &[RelabelConfig]) -> Result<Vec<RelabelConfig>, ScrapeError> {
+    let mut validated = Vec::with_capacity(cfgs.len());
+    for cfg in cfgs {
+        let mut cloned = cfg.clone();
+        cloned
+            .validate(ValidationScheme::Utf8)
+            .map_err(|err| ScrapeError::InvalidConfig(err.to_string()))?;
+        validated.push(cloned);
+    }
+    Ok(validated)
 }
 
 #[cfg(test)]
@@ -567,6 +829,18 @@ mod tests {
                 .with_scrape_interval(Duration::from_secs(5))
                 .with_scrape_timeout(Duration::from_secs(6)),
             ScrapeConfig::new("job").with_user_agent("bad\r\nheader"),
+            ScrapeConfig::new("job").with_scheme("ftp"),
+            ScrapeConfig::new("job").with_relabel_configs(vec![RelabelConfig {
+                action: prometheus_relabel::Action::HashMod,
+                target_label: "shard".to_owned(),
+                modulus: 0,
+                ..RelabelConfig::default()
+            }]),
+            ScrapeConfig::new("job").with_metric_relabel_configs(vec![RelabelConfig {
+                action: prometheus_relabel::Action::Replace,
+                target_label: String::new(),
+                ..RelabelConfig::default()
+            }]),
             ScrapeConfig::new("job")
                 .with_scheduling(SchedulingMode::concurrent_with_pools(one, two, one)),
             ScrapeConfig::new("job")
@@ -578,5 +852,155 @@ mod tests {
                 "case {idx} unexpectedly passed validate: {cfg:?}"
             );
         }
+    }
+
+    #[test]
+    fn populate_targets_applies_relabel_configs_params_and_url_rules() {
+        use crate::discovery::StaticConfig;
+        use prometheus_relabel::{Action, Regexp};
+
+        let group_a = StaticConfig {
+            targets: vec![
+                "10.0.0.1:9100".to_owned(),
+                "10.0.0.2:9100".to_owned(),
+                "[::1]:9443".to_owned(),
+            ],
+            labels: BTreeMap::from([
+                ("env".to_owned(), "prod".to_owned()),
+                ("__meta_role".to_owned(), "api".to_owned()),
+            ]),
+        }
+        .into_target_group("0");
+
+        let cfg = ScrapeConfig::new("api-pool")
+            .with_metrics_path("/custom")
+            .with_param("module", vec!["default".to_owned(), "extra".to_owned()])
+            .with_relabel_configs(vec![
+                // Drop 10.0.0.2.
+                RelabelConfig {
+                    source_labels: vec![ADDRESS_LABEL.to_owned()],
+                    regex: Regexp::must_new("10\\.0\\.0\\.2:.*"),
+                    action: Action::Drop,
+                    ..RelabelConfig::default()
+                },
+                // Override the first `module` query parameter while keeping secondary values.
+                RelabelConfig {
+                    source_labels: vec!["__meta_role".to_owned()],
+                    target_label: "__param_module".to_owned(),
+                    replacement: "http_$1".to_owned(),
+                    action: Action::Replace,
+                    ..RelabelConfig::default()
+                },
+                // Add a new `__param_target` query parameter and promote `__meta_role` to `role`.
+                RelabelConfig {
+                    source_labels: vec![ADDRESS_LABEL.to_owned()],
+                    target_label: "__param_target".to_owned(),
+                    action: Action::Replace,
+                    ..RelabelConfig::default()
+                },
+                RelabelConfig {
+                    source_labels: vec!["__meta_role".to_owned()],
+                    target_label: "role".to_owned(),
+                    action: Action::Replace,
+                    ..RelabelConfig::default()
+                },
+                // Switch IPv6 target to https and `/probe`.
+                RelabelConfig {
+                    source_labels: vec![ADDRESS_LABEL.to_owned()],
+                    regex: Regexp::must_new("\\[::1\\]:.*"),
+                    target_label: SCHEME_LABEL.to_owned(),
+                    replacement: "https".to_owned(),
+                    action: Action::Replace,
+                    ..RelabelConfig::default()
+                },
+                RelabelConfig {
+                    source_labels: vec![ADDRESS_LABEL.to_owned()],
+                    regex: Regexp::must_new("\\[::1\\]:.*"),
+                    target_label: METRICS_PATH_LABEL.to_owned(),
+                    replacement: "/probe".to_owned(),
+                    action: Action::Replace,
+                    ..RelabelConfig::default()
+                },
+            ]);
+
+        let targets = cfg.populate_targets(&[group_a]).expect("populate_targets");
+        assert_eq!(targets.len(), 2);
+
+        assert_eq!(
+            targets[0].url().as_str(),
+            "http://10.0.0.1:9100/custom?module=http_api&module=extra&target=10.0.0.1%3A9100"
+        );
+        assert_eq!(
+            targets[0].labels(),
+            &BTreeMap::from([
+                ("env".to_owned(), "prod".to_owned()),
+                ("instance".to_owned(), "10.0.0.1:9100".to_owned()),
+                ("job".to_owned(), "api-pool".to_owned()),
+                ("role".to_owned(), "api".to_owned()),
+            ])
+        );
+
+        assert_eq!(
+            targets[1].url().as_str(),
+            "https://[::1]:9443/probe?module=http_api&module=extra&target=%5B%3A%3A1%5D%3A9443"
+        );
+        assert_eq!(
+            targets[1].labels().get("instance").map(String::as_str),
+            Some("[::1]:9443")
+        );
+
+        #[cfg(feature = "arrow")]
+        {
+            let ta = targets[0]
+                .to_target_attributes()
+                .expect("non-empty target attributes");
+            assert_eq!(
+                ta.resource_attributes()
+                    .get("service.name")
+                    .map(String::as_str),
+                Some("api-pool")
+            );
+            assert_eq!(
+                ta.resource_attributes()
+                    .get("service.instance.id")
+                    .map(String::as_str),
+                Some("10.0.0.1:9100")
+            );
+            assert_eq!(
+                ta.resource_attributes().get("env").map(String::as_str),
+                Some("prod")
+            );
+            assert_eq!(
+                ta.resource_attributes().get("role").map(String::as_str),
+                Some("api")
+            );
+        }
+
+        // Relabeling that clears `__address__` or injects URL userinfo/query fails cleanly.
+        let bad_addr_group = StaticConfig {
+            targets: vec!["user:pass@127.0.0.1:9100".to_owned()],
+            labels: BTreeMap::new(),
+        }
+        .into_target_group("bad");
+        assert!(matches!(
+            ScrapeConfig::new("bad").populate_targets(&[bad_addr_group]),
+            Err(ScrapeError::InvalidConfig(_))
+        ));
+
+        let strip_addr = ScrapeConfig::new("strip").with_relabel_configs(vec![RelabelConfig {
+            target_label: ADDRESS_LABEL.to_owned(),
+            replacement: String::new(),
+            action: Action::Replace,
+            ..RelabelConfig::default()
+        }]);
+        let g = StaticConfig {
+            targets: vec!["127.0.0.1:9100".to_owned()],
+            labels: BTreeMap::new(),
+        }
+        .into_target_group("0");
+        assert!(matches!(
+            strip_addr.populate_targets(&[g]),
+            Err(ScrapeError::InvalidConfig(_))
+        ));
     }
 }

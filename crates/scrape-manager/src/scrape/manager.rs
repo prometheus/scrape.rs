@@ -11,9 +11,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "arrow")]
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::Arc;
+#[cfg(feature = "arrow")]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 #[cfg(feature = "arrow")]
@@ -22,7 +26,11 @@ use std::time::Instant as StdInstant;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 #[cfg(feature = "arrow")]
-use prometheus_expfmt::arrow::{DecodeBudget, DecodeCursor, DecodeStep, OtapMetricRecords};
+use prometheus_expfmt::arrow::{
+    DecodeBudget, DecodeCursor, DecodeStep, MetricRelabelPlan, OtapMetricRecords, TargetAttributes,
+};
+#[cfg(feature = "arrow")]
+use prometheus_relabel::ValidationScheme;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 
@@ -30,11 +38,19 @@ use tokio::time::{Instant, sleep_until};
 use crate::scrape::DecoderPool;
 #[cfg(feature = "arrow")]
 use crate::scrape::http::current_timestamp_ms;
-use crate::scrape::schedule::{TargetSchedule, advance_grid_deadline};
+use crate::scrape::schedule::{ScheduledTarget, TargetSchedule, advance_grid_deadline};
 use crate::scrape::{
     BodyBufferPool, FetchedScrape, ReqwestFetcher, SchedulingMode, ScrapeConfig, ScrapeError,
     ScrapeTarget, SequentialSchedule, TargetFetcher,
 };
+
+/// Upper bound on cached one-shot [`TargetAttributes`] entries kept for repeated
+/// `scrape_once_arrow` / `run_once_arrow` calls so unbounded target churn cannot leak memory.
+#[cfg(feature = "arrow")]
+const MAX_CACHED_TARGET_ATTRS: usize = 1_024;
+
+#[cfg(feature = "arrow")]
+type TargetAttrsCache = HashMap<BTreeMap<String, String>, Option<Arc<TargetAttributes>>>;
 
 /// Control-plane messages accepted by a running [`ScrapeManager`].
 #[derive(Clone, Debug)]
@@ -216,6 +232,10 @@ pub struct ScrapeManager<F = ReqwestFetcher> {
     body_pool: BodyBufferPool,
     #[cfg(feature = "arrow")]
     decoder_pool: DecoderPool,
+    #[cfg(feature = "arrow")]
+    metric_relabel_plan: Option<Arc<MetricRelabelPlan>>,
+    #[cfg(feature = "arrow")]
+    target_attrs_cache: Mutex<TargetAttrsCache>,
     counters: AtomicCounters,
 }
 
@@ -255,12 +275,28 @@ impl<F> ScrapeManager<F> {
             config.scheduling.max_decoders(),
             config.max_retained_decoder_bytes,
         );
+        #[cfg(feature = "arrow")]
+        let metric_relabel_plan = if config.metric_relabel_configs.is_empty() {
+            None
+        } else {
+            Some(Arc::new(
+                MetricRelabelPlan::try_new(
+                    config.metric_relabel_configs.clone(),
+                    ValidationScheme::Utf8,
+                )
+                .map_err(|err| ScrapeError::InvalidConfig(err.to_string()))?,
+            ))
+        };
         Ok(Self {
             config,
             fetcher,
             body_pool,
             #[cfg(feature = "arrow")]
             decoder_pool,
+            #[cfg(feature = "arrow")]
+            metric_relabel_plan,
+            #[cfg(feature = "arrow")]
+            target_attrs_cache: Mutex::new(HashMap::new()),
             counters: AtomicCounters::default(),
         })
     }
@@ -334,19 +370,52 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         ctrl_rx: mpsc::UnboundedReceiver<ScrapeCommand>,
         sink: &S,
     ) {
-        self.run_loop(initial_targets, ctrl_rx, |target| async move {
-            let res = self.scrape_once_raw(&target).await;
-            sink.on_raw_scrape(&target, res).await
+        self.run_loop(initial_targets, ctrl_rx, |scheduled| async move {
+            let res = self.scrape_once_raw(&scheduled.target).await;
+            sink.on_raw_scrape(&scheduled.target, res).await
         })
         .await;
     }
 
-    /// Fetches `target` once, streams cooperatives chunks through a pooled [`ArrowDecoder`], and
-    /// emits a final [`ScrapeReport`] to `sink`.
+    /// Fetches `target` once, streams cooperative chunks through a pooled `ArrowDecoder` with
+    /// target `ResourceAttrs`, `honor_labels`, and compiled `metric_relabel_configs`, and emits a
+    /// final [`ScrapeReport`] to `sink`.
     #[cfg(feature = "arrow")]
     pub async fn scrape_once_arrow<S: ArrowScrapeSink>(
         &self,
         target: &ScrapeTarget,
+        sink: &S,
+    ) -> ControlFlow<(), ScrapeReport> {
+        let target_attrs = self.cached_target_attributes(target);
+        self.scrape_once_arrow_with_attrs(target, target_attrs, sink)
+            .await
+    }
+
+    #[cfg(feature = "arrow")]
+    fn cached_target_attributes(&self, target: &ScrapeTarget) -> Option<Arc<TargetAttributes>> {
+        if target.labels().is_empty() {
+            return None;
+        }
+        let mut cache = self
+            .target_attrs_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = cache.get(target.labels()) {
+            return cached.clone();
+        }
+        let built = target.to_target_attributes().map(Arc::new);
+        if cache.len() >= MAX_CACHED_TARGET_ATTRS {
+            cache.clear();
+        }
+        cache.insert(target.labels().clone(), built.clone());
+        built
+    }
+
+    #[cfg(feature = "arrow")]
+    async fn scrape_once_arrow_with_attrs<S: ArrowScrapeSink>(
+        &self,
+        target: &ScrapeTarget,
+        target_attrs: Option<Arc<TargetAttributes>>,
         sink: &S,
     ) -> ControlFlow<(), ScrapeReport> {
         let started = StdInstant::now();
@@ -383,7 +452,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         let scrape_timestamp_ms = fetched.scrape_timestamp_ms;
 
         let decode_outcome = self
-            .decode_fetched_cooperatively(target, fetched, sink)
+            .decode_fetched_cooperatively(target, target_attrs, fetched, sink)
             .await;
 
         let report = match decode_outcome {
@@ -455,8 +524,12 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         ctrl_rx: mpsc::UnboundedReceiver<ScrapeCommand>,
         sink: &S,
     ) {
-        self.run_loop(initial_targets, ctrl_rx, |target| async move {
-            match self.scrape_once_arrow(&target, sink).await {
+        self.run_loop(initial_targets, ctrl_rx, |scheduled| async move {
+            let target_attrs = scheduled.target_attributes();
+            match self
+                .scrape_once_arrow_with_attrs(&scheduled.target, target_attrs, sink)
+                .await
+            {
                 ControlFlow::Continue(_) => ControlFlow::Continue(()),
                 ControlFlow::Break(()) => ControlFlow::Break(()),
             }
@@ -468,6 +541,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
     async fn decode_fetched_cooperatively<S: ArrowScrapeSink>(
         &self,
         target: &ScrapeTarget,
+        target_attrs: Option<Arc<TargetAttributes>>,
         fetched: FetchedScrape,
         sink: &S,
     ) -> ControlFlow<(), (u64, usize, Result<(), ScrapeError>)> {
@@ -504,12 +578,19 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         // TODO(bwplotka): Add and wire `ScrapeConfig::honor_timestamps` once
         // `DecodeOptions::with_honor_timestamps` lands in
         // https://github.com/prometheus/scrape.rs/issues/33.
-        let decode_opts = self
+        let mut decode_opts = self
             .config
             .decode_options
             .clone()
             .with_timestamp_ms(scrape_timestamp_ms)
-            .with_max_data_points_per_batch(chunk_limit);
+            .with_max_data_points_per_batch(chunk_limit)
+            .with_honor_labels(self.config.honor_labels || self.config.decode_options.honor_labels);
+        if let Some(target_attrs) = target_attrs {
+            decode_opts = decode_opts.with_target_attributes(target_attrs);
+        }
+        if let Some(plan) = &self.metric_relabel_plan {
+            decode_opts = decode_opts.with_metric_relabel_plan(Arc::clone(plan));
+        }
 
         let cursor = match decoder.start_decode_stream(&format, &decode_opts) {
             Ok(c) => c,
@@ -685,7 +766,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         ctrl_rx: mpsc::UnboundedReceiver<ScrapeCommand>,
         exec_one: Exec,
     ) where
-        Exec: Fn(Arc<ScrapeTarget>) -> Fut,
+        Exec: Fn(ScheduledTarget) -> Fut,
         Fut: Future<Output = ControlFlow<()>>,
     {
         match self.config.scheduling {
@@ -714,11 +795,13 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         mut ctrl_rx: mpsc::UnboundedReceiver<ScrapeCommand>,
         exec_one: Exec,
     ) where
-        Exec: Fn(Arc<ScrapeTarget>) -> Fut,
+        Exec: Fn(ScheduledTarget) -> Fut,
         Fut: Future<Output = ControlFlow<()>>,
     {
-        let mut targets: Vec<Arc<ScrapeTarget>> =
-            initial_targets.into_iter().map(Arc::new).collect();
+        let mut targets: Vec<ScheduledTarget> = initial_targets
+            .into_iter()
+            .map(|t| ScheduledTarget::new(Arc::new(t)))
+            .collect();
         let interval = self.config.scrape_interval;
         let start_now = Instant::now();
         let mut next_due = start_now
@@ -732,7 +815,10 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                 cmd = ctrl_rx.recv() => {
                     match cmd {
                         Some(ScrapeCommand::UpdateTargets(new_targets)) => {
-                            targets = new_targets.into_iter().map(Arc::new).collect();
+                            targets = new_targets
+                                .into_iter()
+                                .map(|t| ScheduledTarget::new(Arc::new(t)))
+                                .collect();
                         }
                         Some(ScrapeCommand::Shutdown) | None => return,
                     }
@@ -763,7 +849,10 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                                             // Stage the updated target list for the next cycle
                                             // tick without cancelling the in-flight scrape or
                                             // skipping remaining targets in the current pass.
-                                            targets = new_targets.into_iter().map(Arc::new).collect();
+                                            targets = new_targets
+                                                .into_iter()
+                                                .map(|t| ScheduledTarget::new(Arc::new(t)))
+                                                .collect();
                                         }
                                         Some(ScrapeCommand::Shutdown) | None => return,
                                     }
@@ -803,7 +892,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         max_in_flight: usize,
         exec_one: Exec,
     ) where
-        Exec: Fn(Arc<ScrapeTarget>) -> Fut,
+        Exec: Fn(ScheduledTarget) -> Fut,
         Fut: Future<Output = ControlFlow<()>>,
     {
         let start_now = Instant::now();
@@ -822,7 +911,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                 while in_flight.len() < max_in_flight
                     && let Some(due) = schedule.pop_due(now)
                 {
-                    let fut = exec_one(due.target);
+                    let fut = exec_one(due.scheduled);
                     in_flight.push(async move {
                         let out = fut.await;
                         (due.slot_id, due.generation, out)
