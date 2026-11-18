@@ -18,11 +18,12 @@ use std::cell::RefCell;
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use otel_arrow_dfe_pdata::otap::{Metrics, OtapArrowRecords, OtapBatchStore};
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use prometheus_expfmt::arrow::{
-    ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep, OtapMetricRecords,
+    ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep, OtapMetricRecords, TargetAttributes,
 };
 use prometheus_expfmt::format::Format;
 
@@ -60,6 +61,7 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
         // Wrap `ArrowDecoder` in `!Send` `Rc<RefCell<_>>` to mirror thread-per-core OTAP receivers.
         let shared_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
         let opts = DecodeOptions::new().with_timestamp_ms(1_700_000_000_000);
+        let opts_for_full = opts.clone();
         let full_237_clone = Rc::clone(&full_237);
 
         let handle = tokio::task::spawn_local(async move {
@@ -70,7 +72,7 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
             for i in 0..32 {
                 let records = shared_decoder
                     .borrow_mut()
-                    .decode(&full_237_clone, &Format::TEXT, &opts)
+                    .decode(&full_237_clone, &Format::TEXT, &opts_for_full)
                     .expect("scrape succeeds");
                 let otap = to_otap_arrow_records(&records);
                 let dec_mem = shared_decoder.borrow().retained_memory_bytes();
@@ -113,7 +115,8 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
         // Verify `decode_stream` caps retained decoder scratch memory to a single 128-point chunk
         // and keeps both decoder capacity and live heap constant across repeated scrapes.
         let stream_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
-        let stream_opts = opts.with_max_data_points_per_batch(128);
+        let stream_opts = opts.clone().with_max_data_points_per_batch(128);
+        let stream_opts_for_coop = stream_opts.clone();
         let full_237_coop = Rc::clone(&full_237);
         let stream_handle = tokio::task::spawn_local(async move {
             let mut warmup_stream_dec_mem = 0usize;
@@ -174,7 +177,7 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
             for i in 0..32 {
                 let mut cursor = coop_decoder
                     .borrow_mut()
-                    .start_decode_stream(&Format::TEXT, &stream_opts)
+                    .start_decode_stream(&Format::TEXT, &stream_opts_for_coop)
                     .expect("cursor starts");
                 loop {
                     let step = coop_decoder
@@ -196,7 +199,7 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
                     let mut stream = owned_coop_decoder.decode_stream(
                         &full_237_coop,
                         &Format::TEXT,
-                        &stream_opts,
+                        &stream_opts_for_coop,
                     );
                     while let Some(chunk_res) = stream
                         .next_cooperative(coop_budget, tokio::task::yield_now)
@@ -241,10 +244,17 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
             .await
             .expect("cooperative streaming local task succeeds");
 
-        // Verify OpenMetrics 1.0 scrapes (with histograms, summaries, exemplars, and units) also
-        // keep retained scratch memory and live heap strictly constant after warmup.
+        // Verify OpenMetrics 1.0 scrapes (with histograms, summaries, exemplars, units, and cached
+        // target `ResourceAttrs`) also keep retained scratch memory and live heap strictly constant
+        // after warmup.
         let om_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
-        let om_opts = opts;
+        let target_attrs = Arc::new(
+            TargetAttributes::new()
+                .with_job("om-target")
+                .with_instance("10.0.0.1:9090")
+                .with_target_label("env", "prod"),
+        );
+        let om_opts = opts.with_target_attributes(target_attrs);
         let om_handle = tokio::task::spawn_local(async move {
             let mut warmup_om_dec_mem = 0usize;
             let mut warmup_om_live_heap = 0usize;

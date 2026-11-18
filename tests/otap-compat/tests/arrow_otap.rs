@@ -36,7 +36,7 @@ use otel_arrow_dfe_pdata::testing::round_trip::{otap_to_otlp, to_metrics_data};
 use prometheus_expfmt::arrow::{
     ArrowDecoder, CounterSuffixPolicy, DecodeBudget, DecodeCursor, DecodeError, DecodeOptions,
     DecodeStep, MetricPayloadType, OtapMetricRecords, PROMETHEUS_TYPE_METADATA_KEY,
-    UnitSuffixPolicy, UntypedPolicy,
+    SERVICE_INSTANCE_ID_ATTR, SERVICE_NAME_ATTR, TargetAttributes, UnitSuffixPolicy, UntypedPolicy,
 };
 use prometheus_expfmt::format::Format;
 
@@ -100,6 +100,10 @@ fn number_dp(attrs: &[(&str, &str)], time_unix_nano: u64, val: f64) -> NumberDat
 #[test]
 fn metric_payload_type_discriminants_match_otap_proto() {
     let cases = [
+        (
+            MetricPayloadType::ResourceAttrs,
+            ArrowPayloadType::ResourceAttrs,
+        ),
         (
             MetricPayloadType::UnivariateMetrics,
             ArrowPayloadType::UnivariateMetrics,
@@ -879,7 +883,7 @@ fn decode_stream_chunks_validate_in_otap_and_handle_more_than_u16_max_metrics() 
 
     // Stream the full 237-family payload in 64-point chunks and verify semantic equivalence with
     // single-batch decoding.
-    let stream_opts = single_opts.with_max_data_points_per_batch(64);
+    let stream_opts = single_opts.clone().with_max_data_points_per_batch(64);
     let mut chunk_count = 0usize;
     let mut streamed_dps = 0usize;
     let mut streamed_otlp = Vec::new();
@@ -906,7 +910,7 @@ fn decode_stream_chunks_validate_in_otap_and_handle_more_than_u16_max_metrics() 
         .decode(&om_bench, &Format::OPEN_METRICS_1_0_0, &single_opts)
         .expect("single-batch OpenMetrics decode succeeds");
     let om_single_otlp = otap_to_otlp(&to_otap_arrow_records(&om_single));
-    let om_stream_opts = single_opts.with_max_data_points_per_batch(16);
+    let om_stream_opts = single_opts.clone().with_max_data_points_per_batch(16);
     let mut om_streamed_otlp = Vec::new();
     for chunk_res in decoder.decode_stream(&om_bench, &Format::OPEN_METRICS_1_0_0, &om_stream_opts)
     {
@@ -1018,6 +1022,77 @@ fn univariate_metrics_resource_id_enables_otap_resource_attribute_upserts() {
     assert!(res_attrs.contains(&kv_str("gcp.project_id", "gpe-test-1")));
     assert!(res_attrs.contains(&kv_str("service.name", "avalanche")));
     assert!(res_attrs.contains(&kv_str("service.instance.id", "10.0.0.1:9001")));
+}
+
+#[test]
+fn target_attributes_round_trip_through_otap_resource_attrs_and_downstream_upserts() {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use otel_arrow_dfe_pdata::otap::transform::{
+        AttributesTransform, LiteralValue, UpsertTransform, apply_attribute_transform,
+    };
+
+    let target = Arc::new(
+        TargetAttributes::from_target_labels([
+            ("__address__", "10.52.2.15:9001"),
+            ("job", "avalanche"),
+            ("instance", "10.52.2.15:9001"),
+            ("cluster", "us-central1-a"),
+        ])
+        .with_resource_attribute("deployment.environment", "staging"),
+    );
+
+    let mut decoder = ArrowDecoder::new();
+    let opts = DecodeOptions::new()
+        .with_timestamp_ms(1_700_000_000_000)
+        .with_target_attributes(target);
+    let decoded = decoder
+        .decode(
+            b"# TYPE up gauge\nup{series_id=\"0\"} 1\n# TYPE req_total counter\nreq_total 5\n",
+            &Format::TEXT,
+            &opts,
+        )
+        .expect("decode succeeds");
+    assert!(decoded.resource_attrs().is_some());
+
+    let mut otap = to_otap_arrow_records(&decoded);
+    assert!(otap.get(ArrowPayloadType::ResourceAttrs).is_some());
+
+    let downstream = AttributesTransform {
+        upsert: Some(UpsertTransform::new(BTreeMap::from([(
+            "gcp.project_id".into(),
+            LiteralValue::Str("gpe-test-1".into()),
+        )]))),
+        ..Default::default()
+    };
+    apply_attribute_transform(
+        &mut otap,
+        ArrowPayloadType::ResourceAttrs,
+        &downstream,
+        false,
+    )
+    .expect("downstream resource attribute upsert succeeds on pre-populated ResourceAttrs");
+
+    otap.encode_transport_optimized()
+        .expect("transport optimize succeeds");
+    otap.decode_transport_optimized_ids()
+        .expect("transport decode IDs succeeds");
+
+    let OtlpProtoMessage::Metrics(otlp) = otap_to_otlp(&otap) else {
+        panic!("expected OTLP MetricsData");
+    };
+    assert_eq!(otlp.resource_metrics.len(), 1);
+    let res_attrs = &otlp.resource_metrics[0]
+        .resource
+        .as_ref()
+        .expect("resource present")
+        .attributes;
+    assert!(res_attrs.contains(&kv_str(SERVICE_NAME_ATTR, "avalanche")));
+    assert!(res_attrs.contains(&kv_str(SERVICE_INSTANCE_ID_ATTR, "10.52.2.15:9001")));
+    assert!(res_attrs.contains(&kv_str("cluster", "us-central1-a")));
+    assert!(res_attrs.contains(&kv_str("deployment.environment", "staging")));
+    assert!(res_attrs.contains(&kv_str("gcp.project_id", "gpe-test-1")));
 }
 
 async fn probe_scheduling_lateness(
@@ -1140,7 +1215,7 @@ fn cooperative_decode_bounds_local_set_timer_scheduling_lateness_and_validates_i
                 last_records = Some(records);
             }
 
-            let stream_opts = opts.with_max_data_points_per_batch(64);
+            let stream_opts = opts.clone().with_max_data_points_per_batch(64);
             let stream_budget = budget.with_max_entries(32);
             let mut stream_yields = 0usize;
             let mut streamed_otlp = Vec::new();
