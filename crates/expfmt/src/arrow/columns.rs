@@ -13,6 +13,7 @@
 
 //! Reusable zero-allocation column and table staging buffers for [`super::ArrowDecoder`].
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_array::types::{UInt8Type, UInt16Type};
@@ -30,8 +31,9 @@ use super::schema::{
     OTAP_METRIC_TYPE_HISTOGRAM, OTAP_METRIC_TYPE_SUM, UTC_TIME_ZONE, ValEncoding, dp_attrs_schema,
     exemplars_schema, histogram_bucket_counts_item_field, histogram_dp_schema,
     histogram_explicit_bounds_item_field, metric_attrs_key_dict, metric_attrs_schema,
-    metric_attrs_type_val_dict, number_dp_schema, resource_struct_fields, summary_dp_schema,
-    summary_quantile_item_field, summary_quantile_struct_fields, univariate_metrics_schema,
+    metric_attrs_type_val_dict, number_dp_schema, resource_attrs_schema, resource_struct_fields,
+    summary_dp_schema, summary_quantile_item_field, summary_quantile_struct_fields,
+    univariate_metrics_schema,
 };
 
 /// Reusable scratch vectors used when materializing Arrow columns without reallocating.
@@ -746,6 +748,56 @@ impl AttrTable {
             vec![parent_id_arr, key_arr, type_arr, val_arr],
         )?))
     }
+}
+
+/// Builds an OTAP `ResourceAttrs` (`attributes_16`) [`RecordBatch`] attached to `parent_id = 0`
+/// (matching `UnivariateMetrics.resource.id = 0`).
+///
+/// Returns `Ok(None)` when `attrs` is empty so empty tables are omitted per OTAP invariants.
+pub(super) fn build_resource_attrs_batch(
+    attrs: &BTreeMap<String, String>,
+) -> Result<Option<RecordBatch>, DecodeError> {
+    if attrs.is_empty() {
+        return Ok(None);
+    }
+
+    let num_attrs = attrs.len();
+    let key_bytes: usize = attrs.keys().map(String::len).sum();
+    let val_bytes: usize = attrs.values().map(String::len).sum();
+    let mut key_interner = StringInterner::with_capacity(num_attrs, key_bytes);
+    let mut val_interner = StringInterner::with_capacity(num_attrs, val_bytes);
+    let mut pairs = Vec::with_capacity(num_attrs);
+
+    for (k, v) in attrs {
+        let kid =
+            key_interner
+                .intern(k.as_bytes())
+                .ok_or_else(|| DecodeError::CapacityOverflow {
+                    table: "ResourceAttrs.key",
+                    count: key_interner.len(),
+                })?;
+        let vid =
+            val_interner
+                .intern(v.as_bytes())
+                .ok_or_else(|| DecodeError::CapacityOverflow {
+                    table: "ResourceAttrs.str",
+                    count: val_interner.len(),
+                })?;
+        pairs.push((kid, vid));
+    }
+
+    let enc = AttrEncoding::new(&key_interner, &val_interner, true);
+    let mut scratch = ScratchBuffers::with_capacity(0, 0, num_attrs);
+    scratch.u16_buf.clear();
+    scratch.u16_buf.resize(num_attrs, 0);
+    let parent_id_arr: ArrayRef =
+        Arc::new(UInt16Array::new(scalar_from_slice(&scratch.u16_buf), None));
+    let (key_arr, type_arr, val_arr) = scratch.build_attr_columns(&pairs, &enc, "ResourceAttrs")?;
+
+    Ok(Some(RecordBatch::try_new(
+        resource_attrs_schema(enc.key_enc, enc.val_enc),
+        vec![parent_id_arr, key_arr, type_arr, val_arr],
+    )?))
 }
 
 /// Staging buffer for an optional fixed-size binary column (`span_id` or `trace_id` on exemplars).

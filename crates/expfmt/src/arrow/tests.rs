@@ -809,7 +809,7 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
     );
 
     // 2. Chunked `start_decode_stream` driven 1 entry at a time.
-    let stream_opts = opts.with_max_data_points_per_batch(1);
+    let stream_opts = opts.clone().with_max_data_points_per_batch(1);
     let expected_chunks: Vec<_> = ref_dec
         .decode_stream(
             om_payload.as_bytes(),
@@ -919,7 +919,7 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
     ));
     assert!(matches!(
         job.decoder
-            .start_decode_stream(&Format::TEXT, &opts.with_timestamp_ms(i64::MAX)),
+            .start_decode_stream(&Format::TEXT, &opts.clone().with_timestamp_ms(i64::MAX)),
         Err(DecodeError::TimestampOverflow { .. })
     ));
 
@@ -1117,7 +1117,7 @@ fn cooperative_async_helpers_respect_fast_path_and_yield_budgets() {
     assert_eq!(coop_polls, coop_yields);
 
     // 3. `DecodeStream::next_cooperative` yields between steps while streaming chunks.
-    let stream_opts = opts.with_max_data_points_per_batch(15);
+    let stream_opts = opts.clone().with_max_data_points_per_batch(15);
     let expected_chunks: Vec<_> = dec
         .decode_stream(bytes, &Format::TEXT, &stream_opts)
         .collect::<Result<Vec<_>, _>>()
@@ -1193,4 +1193,205 @@ fn cooperative_async_helpers_respect_fast_path_and_yield_budgets() {
     ));
     assert!(stream_err_res.1.is_none());
     assert_eq!(stream_err_polls, 1);
+}
+
+#[test]
+fn target_attributes_emit_resource_attrs_and_map_job_and_instance() {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use arrow_array::UInt16Array;
+
+    let target = Arc::new(
+        TargetAttributes::from_target_labels([
+            ("__address__", "10.0.0.1:9100"),
+            ("__meta_kubernetes_pod_name", "api-0"),
+            ("job", "api-server"),
+            ("instance", "10.0.0.1:9100"),
+            ("env", "prod"),
+            ("empty_label", ""),
+        ])
+        .with_resource_attribute("cloud.region", "us-central1"),
+    );
+
+    assert_eq!(
+        target.target_labels(),
+        &BTreeMap::from([
+            ("env".to_owned(), "prod".to_owned()),
+            ("instance".to_owned(), "10.0.0.1:9100".to_owned()),
+            ("job".to_owned(), "api-server".to_owned()),
+        ])
+    );
+    assert_eq!(
+        target.resource_attributes(),
+        &BTreeMap::from([
+            ("cloud.region".to_owned(), "us-central1".to_owned()),
+            ("env".to_owned(), "prod".to_owned()),
+            (
+                SERVICE_INSTANCE_ID_ATTR.to_owned(),
+                "10.0.0.1:9100".to_owned()
+            ),
+            (SERVICE_NAME_ATTR.to_owned(), "api-server".to_owned()),
+        ])
+    );
+
+    let opts = DecodeOptions::new()
+        .with_timestamp_ms(1_700_000_000_000)
+        .with_target_attributes(Arc::clone(&target));
+
+    let payload =
+        b"# TYPE reqs_total counter\nreqs_total{method=\"GET\"} 1\nreqs_total{method=\"POST\"} 2\n";
+    let mut dec = ArrowDecoder::new();
+    let records = dec.decode(payload, &Format::TEXT, &opts).unwrap();
+
+    let res_batch = records
+        .resource_attrs()
+        .expect("ResourceAttrs emitted on non-empty scrape");
+    assert_eq!(
+        records.get(MetricPayloadType::ResourceAttrs),
+        Some(res_batch)
+    );
+    assert_eq!(res_batch.num_rows(), 4);
+    assert_eq!(
+        res_batch
+            .schema()
+            .field_with_name("parent_id")
+            .unwrap()
+            .metadata()
+            .get("encoding")
+            .map(String::as_str),
+        Some("plain")
+    );
+
+    let parent_ids = res_batch
+        .column_by_name("parent_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt16Array>()
+        .unwrap();
+    let keys = res_batch
+        .column_by_name("key")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt8Type>>()
+        .unwrap();
+    let key_vals = keys
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let types = res_batch
+        .column_by_name("type")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .unwrap();
+    let vals = res_batch
+        .column_by_name("str")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt16Type>>()
+        .unwrap();
+    let str_vals = vals
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    let mut extracted = BTreeMap::new();
+    for row in 0..res_batch.num_rows() {
+        assert_eq!(parent_ids.value(row), 0);
+        assert_eq!(types.value(row), 1);
+        let k = key_vals.value(usize::from(keys.keys().value(row)));
+        let v = str_vals.value(usize::from(vals.keys().value(row)));
+        extracted.insert(k.to_owned(), v.to_owned());
+    }
+    assert_eq!(&extracted, target.resource_attributes());
+
+    // Multi-chunk streaming attaches `ResourceAttrs` to every emitted chunk.
+    let stream_opts = opts.clone().with_max_data_points_per_batch(1);
+    let chunks: Vec<_> = dec
+        .decode_stream(payload, &Format::TEXT, &stream_opts)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(chunks.len(), 2);
+    for chunk in &chunks {
+        assert_eq!(chunk.resource_attrs(), Some(res_batch));
+    }
+
+    // Empty and all-dropped scrapes omit `ResourceAttrs`.
+    let empty = dec.decode(b"", &Format::TEXT, &opts).unwrap();
+    assert!(empty.is_empty());
+    assert!(empty.resource_attrs().is_none());
+
+    let dropped_opts = opts.clone().with_untyped_policy(UntypedPolicy::Drop);
+    let dropped = dec
+        .decode(b"untyped_only 1\n", &Format::TEXT, &dropped_opts)
+        .unwrap();
+    assert!(dropped.is_empty());
+    assert!(dropped.resource_attrs().is_none());
+
+    // Explicit resource attributes override `job` -> `service.name` while keeping `job` in
+    // `target_labels`.
+    let overridden = TargetAttributes::new()
+        .with_job("prom-job")
+        .with_instance("host:9090")
+        .with_resource_attribute(SERVICE_NAME_ATTR, "explicit-service");
+    assert_eq!(
+        overridden.target_labels().get("job").map(String::as_str),
+        Some("prom-job")
+    );
+    assert_eq!(
+        overridden
+            .resource_attributes()
+            .get(SERVICE_NAME_ATTR)
+            .map(String::as_str),
+        Some("explicit-service")
+    );
+    assert_eq!(
+        overridden
+            .resource_attributes()
+            .get(SERVICE_INSTANCE_ID_ATTR)
+            .map(String::as_str),
+        Some("host:9090")
+    );
+
+    // Reserved-only and cleared target labels stay empty and omit `ResourceAttrs`.
+    let reserved_only = TargetAttributes::from_target_labels([
+        ("__address__", "10.0.0.1:9100"),
+        ("__meta_foo", "bar"),
+    ])
+    .with_job("temp")
+    .with_job("");
+    assert!(reserved_only.is_empty());
+    let reserved_opts = DecodeOptions::new().with_target_attributes(Arc::new(reserved_only));
+    let reserved_records = dec.decode(b"m 1\n", &Format::TEXT, &reserved_opts).unwrap();
+    assert!(reserved_records.resource_attrs().is_none());
+
+    // `Clone` and `Eq` treat cached vs uncached `TargetAttributes` identically.
+    let uncached = TargetAttributes::new()
+        .with_job("api-server")
+        .with_instance("10.0.0.1:9100")
+        .with_target_label("env", "prod")
+        .with_resource_attribute("cloud.region", "us-central1");
+    assert_eq!(*target, uncached);
+    assert_eq!(target.as_ref().clone(), uncached);
+
+    // >256 resource attributes widen `ResourceAttrs.key` from UInt8 to UInt16 dictionary.
+    let mut wide_target = TargetAttributes::new();
+    for i in 0..260 {
+        wide_target = wide_target.with_target_label(format!("res_k_{i}"), "v");
+    }
+    let wide_opts = DecodeOptions::new().with_target_attributes(Arc::new(wide_target));
+    let wide_records = dec.decode(b"m 1\n", &Format::TEXT, &wide_opts).unwrap();
+    let wide_res = wide_records.resource_attrs().unwrap();
+    assert_eq!(wide_res.num_rows(), 260);
+    assert_eq!(
+        wide_res
+            .schema()
+            .field_with_name("key")
+            .unwrap()
+            .data_type(),
+        &DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8))
+    );
 }

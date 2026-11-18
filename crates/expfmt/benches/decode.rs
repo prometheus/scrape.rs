@@ -110,7 +110,7 @@ fn main() {
     let full_bytes = full.as_bytes();
 
     let opts = DecodeOptions::new().with_timestamp_ms(0);
-    let stream_256_opts = opts.with_max_data_points_per_batch(256);
+    let stream_256_opts = opts.clone().with_max_data_points_per_batch(256);
     let budget = DecodeBudget::default();
 
     let mut suite = Suite::from_env("prometheus-expfmt").with_alloc(&ALLOC);
@@ -121,19 +121,28 @@ fn main() {
         ("alltypes.237mfs", full_bytes),
     ] {
         let bytes = payload.len() as u64;
+        let opts_decode = opts.clone();
+        let opts_coop = opts.clone();
+        let opts_stream_16k = opts.clone();
+        let opts_stream_256 = stream_256_opts.clone();
+        let opts_stream_256_coop = stream_256_opts.clone();
 
         suite = suite
             .bench(format!("Decode/case={case}/mode=decode"), move |b| {
                 // Warm internal staging and interner capacities once so B/op and allocs/op
                 // measure steady-state scrape reuse rather than cold capacity growth divided by N.
                 let mut decoder = ArrowDecoder::new();
-                black_box(decoder.decode(payload, &Format::TEXT, &opts).unwrap());
+                black_box(
+                    decoder
+                        .decode(payload, &Format::TEXT, &opts_decode)
+                        .unwrap(),
+                );
 
                 b.set_bytes(bytes);
                 b.report_allocs();
                 while b.keep_running() {
                     let records = decoder
-                        .decode(black_box(payload), &Format::TEXT, &opts)
+                        .decode(black_box(payload), &Format::TEXT, &opts_decode)
                         .unwrap();
                     black_box(records);
                 }
@@ -142,7 +151,7 @@ fn main() {
                 format!("Decode/case={case}/mode=decode_cooperative"),
                 move |b| {
                     let mut decoder = ArrowDecoder::new();
-                    black_box(decoder.decode(payload, &Format::TEXT, &opts).unwrap());
+                    black_box(decoder.decode(payload, &Format::TEXT, &opts_coop).unwrap());
 
                     b.set_bytes(bytes);
                     b.report_allocs();
@@ -150,7 +159,7 @@ fn main() {
                         let records = poll_cooperative(decoder.decode_cooperative(
                             black_box(payload),
                             &Format::TEXT,
-                            &opts,
+                            &opts_coop,
                             budget,
                             || YieldOnce(false),
                         ))
@@ -161,21 +170,7 @@ fn main() {
             )
             .bench(format!("Decode/case={case}/mode=stream_16k"), move |b| {
                 let mut decoder = ArrowDecoder::new();
-                for chunk in decoder.decode_stream(payload, &Format::TEXT, &opts) {
-                    black_box(chunk.unwrap());
-                }
-
-                b.set_bytes(bytes);
-                b.report_allocs();
-                while b.keep_running() {
-                    for chunk in decoder.decode_stream(black_box(payload), &Format::TEXT, &opts) {
-                        black_box(chunk.unwrap());
-                    }
-                }
-            })
-            .bench(format!("Decode/case={case}/mode=stream_256"), move |b| {
-                let mut decoder = ArrowDecoder::new();
-                for chunk in decoder.decode_stream(payload, &Format::TEXT, &stream_256_opts) {
+                for chunk in decoder.decode_stream(payload, &Format::TEXT, &opts_stream_16k) {
                     black_box(chunk.unwrap());
                 }
 
@@ -183,7 +178,23 @@ fn main() {
                 b.report_allocs();
                 while b.keep_running() {
                     for chunk in
-                        decoder.decode_stream(black_box(payload), &Format::TEXT, &stream_256_opts)
+                        decoder.decode_stream(black_box(payload), &Format::TEXT, &opts_stream_16k)
+                    {
+                        black_box(chunk.unwrap());
+                    }
+                }
+            })
+            .bench(format!("Decode/case={case}/mode=stream_256"), move |b| {
+                let mut decoder = ArrowDecoder::new();
+                for chunk in decoder.decode_stream(payload, &Format::TEXT, &opts_stream_256) {
+                    black_box(chunk.unwrap());
+                }
+
+                b.set_bytes(bytes);
+                b.report_allocs();
+                while b.keep_running() {
+                    for chunk in
+                        decoder.decode_stream(black_box(payload), &Format::TEXT, &opts_stream_256)
                     {
                         black_box(chunk.unwrap());
                     }
@@ -193,7 +204,9 @@ fn main() {
                 format!("Decode/case={case}/mode=stream_256_cooperative"),
                 move |b| {
                     let mut decoder = ArrowDecoder::new();
-                    for chunk in decoder.decode_stream(payload, &Format::TEXT, &stream_256_opts) {
+                    for chunk in
+                        decoder.decode_stream(payload, &Format::TEXT, &opts_stream_256_coop)
+                    {
                         black_box(chunk.unwrap());
                     }
 
@@ -203,7 +216,7 @@ fn main() {
                         let mut stream = decoder.decode_stream(
                             black_box(payload),
                             &Format::TEXT,
-                            &stream_256_opts,
+                            &opts_stream_256_coop,
                         );
                         loop {
                             match stream.step(budget).unwrap() {
