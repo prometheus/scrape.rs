@@ -19,10 +19,11 @@ use std::collections::BTreeMap;
 use prometheus_relabel::{
     Action, Config, DEFAULT_REPLACEMENT, DictionaryValueTransform, LabelSet, METRIC_NAME_LABEL,
     Regexp, SingleLabelFilterSummary, SingleLabelKeepCache, SingleLabelTransformCache,
-    TargetPopulateConfig, ValidationScheme, eval_key_keep_mask, eval_single_label_keep_mask,
-    eval_single_label_value_transform, is_valid_legacy_target_label, keep_metric_name,
-    merge_target_and_metric_labels, populate_discovered_labels, populate_labels, process,
-    resolve_conflicting_exposed_keys, split_metric_name_pushdown,
+    TargetPopulateConfig, ValidationScheme, eval_key_keep_mask, eval_key_keep_mask_iter,
+    eval_single_label_keep_mask, eval_single_label_value_transform, is_valid_legacy_target_label,
+    keep_metric_name, merge_target_and_metric_labels, populate_discovered_labels, populate_labels,
+    process, resolve_conflicting_exposed_keys, resolve_conflicting_exposed_keys_iter,
+    split_metric_name_pushdown,
 };
 
 fn label_set(pairs: &[(&str, &str)]) -> LabelSet {
@@ -1397,6 +1398,38 @@ fn stage2_dictionary_vectorized_honor_labels_and_attribute_transforms() {
             .target_value(shared_vals[2]),
         Some("api")
     );
+    assert!(keep_cache.keep_str(0, "prod", &keep_env));
+    assert!(!keep_cache.keep_str(1, "dev", &keep_env));
+    assert!(keep_cache.retained_memory_bytes() >= shared_vals.len());
+    assert_eq!(
+        xform_cache
+            .transform_str(2, "api-7f8b", &replace_cfg)
+            .target_value("api-7f8b"),
+        Some("api")
+    );
+    assert_eq!(
+        xform_cache
+            .eval_single_str("worker-12ab", &replace_cfg)
+            .target_value("worker-12ab"),
+        Some("worker")
+    );
+    assert!(xform_cache.retained_memory_bytes() > 0);
+
+    let mut iter_renamed = Vec::new();
+    assert!(resolve_conflicting_exposed_keys_iter(
+        colliding_keys.iter().copied(),
+        &target_labels,
+        false,
+        &mut iter_renamed,
+    ));
+    assert_eq!(iter_renamed, renamed);
+
+    let mut iter_mask = Vec::new();
+    assert_eq!(
+        eval_key_keep_mask_iter(dict_keys.iter().copied(), &drop_cfg, &mut iter_mask),
+        Some(2)
+    );
+    assert_eq!(iter_mask, vec![true, true, false, false, true]);
 
     // 7. End-to-end equivalence: Stage 1 `__name__` pushdown + Stage 2 dictionary primitives vs per-sample `process`.
     let pipeline_cfgs = [
