@@ -45,7 +45,7 @@ options ndots:5 timeout:2 attempts:2
 
 fn build_srv_records(count: usize) -> Vec<DnsRecord> {
     (0..count)
-        .map(|i| DnsRecord::Srv {
+        .map(|i| DnsRecord::SRV {
             priority: 10,
             weight: 20,
             port: 9100,
@@ -62,7 +62,7 @@ fn build_a_records(count: usize) -> Vec<DnsRecord> {
 
 fn build_aaaa_records(count: usize) -> Vec<DnsRecord> {
     (0..count)
-        .map(|i| DnsRecord::Aaaa(Ipv6Addr::new(0xfd00, 0, 0, 1, 0, 0, 0, (i + 1) as u16)))
+        .map(|i| DnsRecord::AAAA(Ipv6Addr::new(0xfd00, 0, 0, 1, 0, 0, 0, (i + 1) as u16)))
         .collect()
 }
 

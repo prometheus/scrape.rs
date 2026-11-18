@@ -176,10 +176,10 @@ fn dns_discovery_records_match_prometheus_dns_test() {
     .unwrap();
     let groups = sd
         .refresh_with(|_, qtype| {
-            assert_eq!(qtype, DnsRecordType::Aaaa);
+            assert_eq!(qtype, DnsRecordType::AAAA);
             Ok(vec![
-                DnsRecord::Aaaa("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
-                DnsRecord::Aaaa("::ffff:10.0.0.1".parse::<Ipv6Addr>().unwrap()),
+                DnsRecord::AAAA("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+                DnsRecord::AAAA("::ffff:10.0.0.1".parse::<Ipv6Addr>().unwrap()),
             ])
         })
         .unwrap();
@@ -219,16 +219,16 @@ fn dns_discovery_records_match_prometheus_dns_test() {
     .unwrap();
     let groups = sd
         .refresh_with(|_, qtype| {
-            assert_eq!(qtype, DnsRecordType::Srv);
+            assert_eq!(qtype, DnsRecordType::SRV);
             Ok(vec![
-                DnsRecord::Cname("_mysql._tcp.alias.example.com.".to_owned()),
-                DnsRecord::Srv {
+                DnsRecord::CNAME("_mysql._tcp.alias.example.com.".to_owned()),
+                DnsRecord::SRV {
                     priority: 0,
                     weight: 0,
                     port: 3306,
                     target: "db1.example.com.".to_owned(),
                 },
-                DnsRecord::Srv {
+                DnsRecord::SRV {
                     priority: 0,
                     weight: 0,
                     port: 3306,
@@ -274,11 +274,11 @@ fn dns_discovery_records_match_prometheus_dns_test() {
     let groups = sd
         .refresh_with(|_, _| {
             Ok(vec![
-                DnsRecord::Mx {
+                DnsRecord::MX {
                     preference: 10,
                     target: "smtp1.example.com.".to_owned(),
                 },
-                DnsRecord::Mx {
+                DnsRecord::MX {
                     preference: 20,
                     target: "smtp2.example.com.".to_owned(),
                 },
@@ -326,7 +326,7 @@ fn dns_discovery_records_match_prometheus_dns_test() {
             } else if name == "nxdomain.example.com." {
                 Ok(vec![])
             } else {
-                Ok(vec![DnsRecord::Ns {
+                Ok(vec![DnsRecord::NS {
                     target: "ns1.example.com.".to_owned(),
                 }])
             }
@@ -353,14 +353,14 @@ fn dns_discovery_records_match_prometheus_dns_test() {
         .refresh_with(|name, _| {
             if name == "example.com." {
                 Ok(vec![
-                    DnsRecord::Ns {
+                    DnsRecord::NS {
                         target: "bad/path.example.com.".to_owned(),
                     },
-                    DnsRecord::Ns {
+                    DnsRecord::NS {
                         target: "a..b.example.com.".to_owned(),
                     },
                     DnsRecord::A(Ipv4Addr::LOCALHOST),
-                    DnsRecord::Ns {
+                    DnsRecord::NS {
                         target: "good.example.com.".to_owned(),
                     },
                 ])

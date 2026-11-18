@@ -67,26 +67,26 @@ fn default_record_type() -> String {
 pub enum DnsRecordType {
     /// RFC 2782 `SRV` service record (default).
     #[default]
-    Srv,
+    SRV,
     /// IPv4 `A` address record.
     A,
     /// IPv6 `AAAA` address record.
-    Aaaa,
+    AAAA,
     /// Mail exchange `MX` record.
-    Mx,
+    MX,
     /// Name server `NS` record.
-    Ns,
+    NS,
 }
 
 impl DnsRecordType {
     /// Parses a case-insensitive DNS record type string (`"SRV"`, `"A"`, `"AAAA"`, `"MX"`, `"NS"`).
     pub fn parse(s: &str) -> Result<Self, DiscoveryError> {
         match s.to_ascii_uppercase().as_str() {
-            "SRV" => Ok(Self::Srv),
+            "SRV" => Ok(Self::SRV),
             "A" => Ok(Self::A),
-            "AAAA" => Ok(Self::Aaaa),
-            "MX" => Ok(Self::Mx),
-            "NS" => Ok(Self::Ns),
+            "AAAA" => Ok(Self::AAAA),
+            "MX" => Ok(Self::MX),
+            "NS" => Ok(Self::NS),
             _ => Err(DiscoveryError::InvalidConfig(format!(
                 "invalid DNS-SD records type {s}"
             ))),
@@ -97,10 +97,10 @@ impl DnsRecordType {
     const fn qtype(self) -> u16 {
         match self {
             Self::A => QTYPE_A,
-            Self::Ns => QTYPE_NS,
-            Self::Mx => QTYPE_MX,
-            Self::Aaaa => QTYPE_AAAA,
-            Self::Srv => QTYPE_SRV,
+            Self::NS => QTYPE_NS,
+            Self::MX => QTYPE_MX,
+            Self::AAAA => QTYPE_AAAA,
+            Self::SRV => QTYPE_SRV,
         }
     }
 }
@@ -109,7 +109,7 @@ impl DnsRecordType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DnsRecord {
     /// `SRV` answer record.
-    Srv {
+    SRV {
         /// Priority of the target host.
         priority: u16,
         /// Relative weight for records with the same priority.
@@ -122,21 +122,21 @@ pub enum DnsRecord {
     /// IPv4 `A` answer record.
     A(Ipv4Addr),
     /// IPv6 `AAAA` answer record.
-    Aaaa(Ipv6Addr),
+    AAAA(Ipv6Addr),
     /// `MX` answer record.
-    Mx {
+    MX {
         /// Preference value given to this RR.
         preference: u16,
         /// Mail exchange host domain name.
         target: String,
     },
     /// `NS` answer record.
-    Ns {
+    NS {
         /// Authoritative name server host domain name.
         target: String,
     },
     /// `CNAME` alias record (skipped when constructing targets, matching Prometheus).
-    Cname(String),
+    CNAME(String),
 }
 
 fn deserialize_refresh_interval<'de, D: Deserializer<'de>>(
@@ -203,7 +203,7 @@ impl DnsSdConfig {
             ));
         }
         let parsed = DnsRecordType::parse(&self.record_type)?;
-        if parsed != DnsRecordType::Srv && self.port == 0 {
+        if parsed != DnsRecordType::SRV && self.port == 0 {
             return Err(DiscoveryError::InvalidConfig(
                 "a port is required in DNS-SD configs for all record types except SRV".to_owned(),
             ));
@@ -533,8 +533,8 @@ fn records_to_target_group(
         let addr_port: u16;
 
         match (record_type, record) {
-            (_, DnsRecord::Cname(_)) => continue,
-            (DnsRecordType::Srv, DnsRecord::Srv { port, target, .. }) => {
+            (_, DnsRecord::CNAME(_)) => continue,
+            (DnsRecordType::SRV, DnsRecord::SRV { port, target, .. }) => {
                 if !is_safe_domain_target(target) {
                     continue;
                 }
@@ -543,7 +543,7 @@ fn records_to_target_group(
                 srv_port = port.to_string();
                 addr_port = *port;
             }
-            (DnsRecordType::Mx, DnsRecord::Mx { target, .. }) => {
+            (DnsRecordType::MX, DnsRecord::MX { target, .. }) => {
                 if !is_safe_domain_target(target) {
                     continue;
                 }
@@ -551,7 +551,7 @@ fn records_to_target_group(
                 mx_target.clone_from(target);
                 addr_port = default_port;
             }
-            (DnsRecordType::Ns, DnsRecord::Ns { target }) => {
+            (DnsRecordType::NS, DnsRecord::NS { target }) => {
                 if !is_safe_domain_target(target) {
                     continue;
                 }
@@ -563,7 +563,7 @@ fn records_to_target_group(
                 target_host_raw = ip.to_string();
                 addr_port = default_port;
             }
-            (DnsRecordType::Aaaa, DnsRecord::Aaaa(ip)) => {
+            (DnsRecordType::AAAA, DnsRecord::AAAA(ip)) => {
                 target_host_raw = match ip.to_ipv4_mapped() {
                     Some(v4) => v4.to_string(),
                     None => ip.to_string(),
@@ -893,7 +893,7 @@ fn decode_dns_response(
                 }
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(rdata);
-                records.push(DnsRecord::Aaaa(Ipv6Addr::from(octets)));
+                records.push(DnsRecord::AAAA(Ipv6Addr::from(octets)));
             }
             QTYPE_SRV => {
                 if rdata.len() < 7 {
@@ -907,7 +907,7 @@ fn decode_dns_response(
                 if next_rdata != rdata_end {
                     return Err(DiscoveryError::Dns("invalid SRV record length".to_owned()));
                 }
-                records.push(DnsRecord::Srv {
+                records.push(DnsRecord::SRV {
                     priority,
                     weight,
                     port,
@@ -924,14 +924,14 @@ fn decode_dns_response(
                 if next_rdata != rdata_end {
                     return Err(DiscoveryError::Dns("invalid MX record length".to_owned()));
                 }
-                records.push(DnsRecord::Mx { preference, target });
+                records.push(DnsRecord::MX { preference, target });
             }
             QTYPE_NS => {
                 let (target, next_rdata) = decode_dns_name_bounded(msg, rdata_start, rdata_end)?;
                 if next_rdata != rdata_end {
                     return Err(DiscoveryError::Dns("invalid NS record length".to_owned()));
                 }
-                records.push(DnsRecord::Ns { target });
+                records.push(DnsRecord::NS { target });
             }
             QTYPE_CNAME => {
                 let (target, next_rdata) = decode_dns_name_bounded(msg, rdata_start, rdata_end)?;
@@ -940,7 +940,7 @@ fn decode_dns_response(
                         "invalid CNAME record length".to_owned(),
                     ));
                 }
-                records.push(DnsRecord::Cname(target));
+                records.push(DnsRecord::CNAME(target));
             }
             _ => {}
         }
@@ -1119,8 +1119,8 @@ mod tests {
         assert_eq!(
             records,
             vec![
-                DnsRecord::Cname("alias.example.com.".to_owned()),
-                DnsRecord::Srv {
+                DnsRecord::CNAME("alias.example.com.".to_owned()),
+                DnsRecord::SRV {
                     priority: 10,
                     weight: 20,
                     port: 8080,
@@ -1224,7 +1224,7 @@ mod tests {
         else {
             panic!("expected decoded NS records");
         };
-        let ns_group = records_to_target_group(".", DnsRecordType::Ns, 53, &ns_records);
+        let ns_group = records_to_target_group(".", DnsRecordType::NS, 53, &ns_records);
         assert_eq!(ns_group.targets.len(), 1);
         assert_eq!(
             ns_group.targets[0].get(ADDRESS_LABEL),
@@ -1339,12 +1339,12 @@ mod tests {
         assert_eq!(
             multi_records,
             vec![
-                DnsRecord::Aaaa("2001:db8::1".parse().unwrap()),
-                DnsRecord::Mx {
+                DnsRecord::AAAA("2001:db8::1".parse().unwrap()),
+                DnsRecord::MX {
                     preference: 10,
                     target: "mx.local.".to_owned(),
                 },
-                DnsRecord::Ns {
+                DnsRecord::NS {
                     target: "ns.local.".to_owned(),
                 },
             ]
