@@ -2256,3 +2256,122 @@ fn staleness_label_set_deduplication_and_single_rotation_compaction() {
         "single 100% churn rotation must compact dead series immediately ({mem_cycle_1} vs {mem_cycle_0})"
     );
 }
+
+#[test]
+fn flush_target_stale_rolls_back_dangling_empty_scrape_and_streams_past_u16_metric_limit() {
+    let mut dec = ArrowDecoder::new();
+    let mut tracker = StalenessTracker::new();
+    let opts = DecodeOptions::new().with_timestamp_ms(1_000);
+
+    // 1. An abandoned scrape on an initially empty tracker leaves `active_scrape_id != 0` and
+    //    staged uncommitted entries; `flush_target_stale` must roll them back even when
+    //    `tracker.is_empty()`.
+    let budget_1 = DecodeBudget::default().with_max_entries(1);
+    let mut dangling = dec.start_decode(&Format::TEXT, &opts).unwrap();
+    let payload = b"# TYPE g gauge\ng{k=\"1\"} 1\ng{k=\"2\"} 2\n";
+    assert_eq!(
+        dec.step_decode_with_staleness(&mut dangling, payload, budget_1, &mut tracker)
+            .unwrap(),
+        DecodeStep::Pending
+    );
+    assert_eq!(
+        dec.step_decode_with_staleness(&mut dangling, payload, budget_1, &mut tracker)
+            .unwrap(),
+        DecodeStep::Pending
+    );
+    assert!(tracker.is_empty());
+    assert_ne!(tracker.active_scrape_id(), 0);
+    assert!(tracker.retained_memory_bytes() > 0);
+
+    let empty_flush = dec.flush_target_stale(&mut tracker, &opts).unwrap();
+    assert!(empty_flush.is_empty());
+    assert!(tracker.is_empty());
+    assert_eq!(tracker.active_scrape_id(), 0);
+    // Drop the abandoned cursor's scratch back into `dec` without disturbing the rolled-back tracker.
+    dec.finish_decode(&mut dangling);
+
+    // 2. `flush_target_stale_stream` chunks stale points by `max_data_points_per_batch` and rolls
+    //    back cleanly if dropped before completion.
+    dec.decode_with_staleness(
+        b"# TYPE g gauge\ng{k=\"1\"} 1\ng{k=\"2\"} 2\ng{k=\"3\"} 3\ng{k=\"4\"} 4\ng{k=\"5\"} 5\n",
+        &Format::TEXT,
+        &opts,
+        &mut tracker,
+    )
+    .unwrap();
+    assert_eq!(tracker.active_series_len(), 5);
+
+    let chunk_opts = opts
+        .with_timestamp_ms(2_000)
+        .with_max_data_points_per_batch(2);
+    {
+        let mut partial = dec.flush_target_stale_stream(&mut tracker, &chunk_opts);
+        let first = partial.next().unwrap().unwrap();
+        assert_eq!(first.num_data_points(), 2);
+    }
+    assert_eq!(tracker.active_series_len(), 5);
+    assert_eq!(tracker.active_scrape_id(), 0);
+
+    let chunks: Vec<_> = dec
+        .flush_target_stale_stream(&mut tracker, &chunk_opts)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(chunks.len(), 3);
+    assert_eq!(
+        chunks
+            .iter()
+            .map(OtapMetricRecords::num_data_points)
+            .sum::<usize>(),
+        5
+    );
+    assert!(tracker.is_empty());
+    assert_eq!(tracker.active_scrape_id(), 0);
+
+    // 3. Past OTAP's 65,536-family `u16` batch limit, single-batch `flush_target_stale` returns
+    //    `CapacityOverflow` and preserves the active set, while `flush_target_stale_stream` splits
+    //    the flush across bounded OTAP batches and clears the tracker.
+    let total_families = 65_537usize;
+    let mut huge = String::with_capacity(total_families * 12);
+    for i in 0..total_families {
+        use std::fmt::Write as _;
+        let _ = writeln!(huge, "m_{i} {i}");
+    }
+    let large_opts = DecodeOptions::new()
+        .with_timestamp_ms(3_000)
+        .with_max_data_points_per_batch(100_000);
+    let live_chunks: Vec<_> = dec
+        .decode_stream_with_staleness(huge.as_bytes(), &Format::TEXT, &large_opts, &mut tracker)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(live_chunks.len(), 2);
+    assert_eq!(tracker.active_series_len(), total_families);
+
+    let flush_opts = large_opts.with_timestamp_ms(4_000);
+    let err = dec
+        .flush_target_stale(&mut tracker, &flush_opts)
+        .expect_err("single-batch flush_target_stale must reject >65,536 families");
+    assert!(matches!(err, DecodeError::CapacityOverflow { .. }));
+    assert_eq!(tracker.active_series_len(), total_families);
+    assert_eq!(tracker.active_scrape_id(), 0);
+
+    let stale_chunks: Vec<_> = dec
+        .flush_target_stale_stream(&mut tracker, &flush_opts)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(stale_chunks.len(), 2);
+    assert_eq!(stale_chunks[0].num_metrics(), 65_536);
+    assert_eq!(stale_chunks[0].num_data_points(), 65_536);
+    assert_eq!(stale_chunks[1].num_metrics(), 1);
+    assert_eq!(stale_chunks[1].num_data_points(), 1);
+    let flags = stale_chunks[1]
+        .number_data_points()
+        .unwrap()
+        .column_by_name("flags")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt32Array>()
+        .unwrap();
+    assert_eq!(flags.value(0), DATA_POINT_FLAG_NO_RECORDED_VALUE);
+    assert!(tracker.is_empty());
+    assert_eq!(tracker.active_scrape_id(), 0);
+}

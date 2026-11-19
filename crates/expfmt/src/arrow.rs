@@ -814,6 +814,12 @@ impl ArrowDecoder {
     /// or when a scrape target is decommissioned so downstream consumers mark all previously
     /// active series for that target stale without re-emitting them on subsequent scrapes.
     ///
+    /// Single-batch `flush_target_stale` ignores [`DecodeOptions::max_data_points_per_batch`] and
+    /// returns [`DecodeError::CapacityOverflow`] if `tracker` has more than 65,536 active metric
+    /// families (OTAP's `u16` `UnivariateMetrics.id` limit). Use
+    /// [`ArrowDecoder::flush_target_stale_stream`] for chunked, >65,536-family, or cooperative
+    /// target flushes.
+    ///
     /// # Errors
     ///
     /// Returns [`DecodeError`] if `opts.timestamp_ms` overflows `i64` nanoseconds or an OTAP table
@@ -824,6 +830,9 @@ impl ArrowDecoder {
         opts: &DecodeOptions,
     ) -> Result<OtapMetricRecords, DecodeError> {
         self.reset_scrape();
+        // Roll back any dangling uncommitted scrape before the empty check so staged `seen` flags,
+        // `active_scrape_id`, and uncommitted arena entries do not survive an early return.
+        tracker.abort_scrape();
         if tracker.is_empty() {
             return Ok(OtapMetricRecords::default());
         }
@@ -860,6 +869,25 @@ impl ArrowDecoder {
         };
         tracker.commit_scrape();
         Ok(batches)
+    }
+
+    /// Streams stale data points (`flags = DATA_POINT_FLAG_NO_RECORDED_VALUE` with omitted values)
+    /// at `opts.timestamp_ms` for every currently active series in `tracker` in chunks bounded by
+    /// [`DecodeOptions::max_data_points_per_batch`] and OTAP's 65,536-metric per-batch `u16` ID
+    /// limit, clearing the active set once all chunks complete.
+    ///
+    /// Use this instead of [`ArrowDecoder::flush_target_stale`] when a target may have more than
+    /// 65,536 active metric families, when callers bound per-batch data points, or when flushing
+    /// cooperatively via [`DecodeStream::step`] / [`DecodeStream::next_cooperative`].
+    ///
+    /// If a chunk returns [`DecodeError`] or the returned [`DecodeStream`] is dropped before
+    /// completion, `tracker` rolls back to the committed active series set.
+    pub fn flush_target_stale_stream<'dec>(
+        &'dec mut self,
+        tracker: &'dec mut StalenessTracker,
+        opts: &DecodeOptions,
+    ) -> DecodeStream<'dec, 'static> {
+        self.decode_stream_inner(b"", &Format::TEXT, opts, Some(tracker))
     }
 
     fn decode_stream_inner<'dec, 'input>(
