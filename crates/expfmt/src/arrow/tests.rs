@@ -20,6 +20,209 @@ use arrow_schema::{DataType, TimeUnit};
 use super::schema::{OTAP_METRIC_TYPE_GAUGE, OTAP_METRIC_TYPE_SUM};
 use super::*;
 
+fn assert_timestamp_column(
+    batch: &arrow_array::RecordBatch,
+    column_name: &str,
+    expected: Option<i64>,
+) {
+    let column = batch.column_by_name(column_name);
+    let Some(expected) = expected else {
+        assert!(column.is_none(), "{column_name} should be omitted");
+        return;
+    };
+    let timestamps = column
+        .unwrap()
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    assert_eq!(timestamps.len(), batch.num_rows());
+    assert_eq!(timestamps.null_count(), 0);
+    assert!(timestamps.values().iter().all(|&value| value == expected));
+}
+
+#[test]
+fn sample_timestamp_policy_applies_to_single_and_streamed_data_points() {
+    assert!(DecodeOptions::new().honor_timestamps);
+    assert_eq!(DecodeOptions::new(), DecodeOptions::default());
+
+    let mut decoder = ArrowDecoder::new();
+    for (format, wire_timestamp, expected_wire_ns) in [
+        (Format::TEXT, "10000", Some(10_000_000_000)),
+        (Format::TEXT, "0", Some(0)),
+        (Format::TEXT, "9223372036855", None),
+        (Format::OPEN_METRICS_1_0_0, "10.0", Some(10_000_000_000)),
+        (Format::OPEN_METRICS_1_0_0, "0.0", Some(0)),
+        (Format::OPEN_METRICS_1_0_0, "-10.0", Some(-10_000_000_000)),
+        (Format::OPEN_METRICS_1_0_0, "1000000000000.0", None),
+        (Format::OPEN_METRICS_1_0_0, "-1000000000000.0", None),
+    ] {
+        // Scalars and every component of assembled families carry a wire timestamp.
+        let mut payload = concat!(
+            "# TYPE c counter\nc_total 2 TS\n",
+            "# TYPE g gauge\ng 3 TS\nu 4 TS\n",
+            "# TYPE h histogram\n",
+            "h_bucket{le=\"1\"} 1 TS\nh_bucket{le=\"+Inf\"} 2 TS\n",
+            "h_sum 1.5 TS\nh_count 2 TS\n",
+            "# TYPE s summary\ns{quantile=\"0.5\"} 0.2 TS\n",
+            "s_sum 0.2 TS\ns_count 1 TS\n",
+        )
+        .replace("TS", wire_timestamp);
+        if format == Format::OPEN_METRICS_1_0_0 {
+            payload.push_str("# EOF\n");
+        }
+
+        for honor_timestamps in [true, false] {
+            for timestamp_ms in [Some(20_000), None] {
+                let mut opts = DecodeOptions::new()
+                    .with_honor_timestamps(honor_timestamps)
+                    .with_max_data_points_per_batch(1);
+                opts.timestamp_ms = timestamp_ms;
+
+                for streaming in [false, true] {
+                    let result = if streaming {
+                        decoder
+                            .decode_stream(payload.as_bytes(), &format, &opts)
+                            .collect::<Result<Vec<_>, _>>()
+                    } else {
+                        decoder
+                            .decode(payload.as_bytes(), &format, &opts)
+                            .map(|records| vec![records])
+                    };
+                    if honor_timestamps && expected_wire_ns.is_none() {
+                        assert!(matches!(result, Err(DecodeError::TimestampOverflow { .. })));
+                        continue;
+                    }
+                    let chunks = result.unwrap_or_else(|err| {
+                        panic!(
+                            "format={format:?}, timestamp={wire_timestamp}, honor_timestamps={honor_timestamps}, fallback={timestamp_ms:?}, streaming={streaming}: {err:?}"
+                        )
+                    });
+                    assert_eq!(
+                        chunks
+                            .iter()
+                            .map(OtapMetricRecords::num_data_points)
+                            .sum::<usize>(),
+                        5
+                    );
+                    let expected = if honor_timestamps {
+                        expected_wire_ns
+                    } else {
+                        timestamp_ms.map(|ms| ms * 1_000_000)
+                    };
+                    for records in chunks {
+                        for batch in [
+                            records.number_data_points(),
+                            records.histogram_data_points(),
+                            records.summary_data_points(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            assert_timestamp_column(batch, "time_unix_nano", expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ignoring_sample_timestamps_preserves_exemplar_and_start_timestamps() {
+    let payload = concat!(
+        "# TYPE c counter\n",
+        "c_total 2 10.0 # {trace_id=\"0123456789abcdef0123456789abcdef\"} 1 7.0\n",
+        "c_created 1.0\n",
+        "# TYPE h histogram\n",
+        "h_bucket{le=\"+Inf\"} 2 10.0 # {trace_id=\"0123456789abcdef0123456789abcdef\"} 1 7.0\n",
+        "h_sum 1.5 10.0\nh_count 2 10.0\nh_created 1.0\n",
+        "# TYPE s summary\ns{quantile=\"0.5\"} 0.2 10.0\n",
+        "s_sum 0.2 10.0\ns_count 1 10.0\ns_created 1.0\n# EOF\n",
+    );
+    let mut decoder = ArrowDecoder::new();
+    for honor_timestamps in [true, false] {
+        let opts = DecodeOptions::new()
+            .with_timestamp_ms(20_000)
+            .with_honor_timestamps(honor_timestamps)
+            .with_max_data_points_per_batch(1);
+        for streaming in [false, true] {
+            let chunks = if streaming {
+                decoder
+                    .decode_stream(payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts)
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            } else {
+                vec![
+                    decoder
+                        .decode(payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts)
+                        .unwrap(),
+                ]
+            };
+            let mut exemplar_count = 0;
+            for records in chunks {
+                for batch in [
+                    records.number_data_points(),
+                    records.histogram_data_points(),
+                    records.summary_data_points(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let expected = if honor_timestamps {
+                        10_000_000_000
+                    } else {
+                        20_000_000_000
+                    };
+                    assert_timestamp_column(batch, "time_unix_nano", Some(expected));
+                    assert_timestamp_column(batch, "start_time_unix_nano", Some(1_000_000_000));
+                }
+                for batch in [
+                    records.number_dp_exemplars(),
+                    records.histogram_dp_exemplars(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    assert_timestamp_column(batch, "time_unix_nano", Some(7_000_000_000));
+                    exemplar_count += batch.num_rows();
+                }
+            }
+            assert_eq!(exemplar_count, 2);
+        }
+    }
+}
+
+#[test]
+fn ignoring_sample_timestamps_still_validates_syntax_defaults_and_exemplars() {
+    let mut decoder = ArrowDecoder::new();
+    let opts = DecodeOptions::new().with_honor_timestamps(false);
+    // Like Go's Prometheus text lexer, signed wire timestamps are invalid syntax even when
+    // sample timestamps are ignored. OpenMetrics signed timestamps are covered above.
+    for payload in ["m 1 invalid\n", "m 1 -10000\n", "m 1 -9223372036855\n"] {
+        assert!(
+            decoder
+                .decode(payload.as_bytes(), &Format::TEXT, &opts)
+                .is_err()
+        );
+    }
+    let opts = opts.with_timestamp_ms(9_223_372_036_855);
+    assert!(matches!(
+        decoder.decode(b"m 1 10000\n", &Format::TEXT, &opts),
+        Err(DecodeError::TimestampOverflow { .. })
+    ));
+
+    let opts = DecodeOptions::new().with_honor_timestamps(false);
+    for payload in [
+        "# TYPE c counter\nc_total 2 10.0 # {id=\"a\"} 1 1000000000000.0\n# EOF\n",
+        "# TYPE h histogram\nh_bucket{le=\"+Inf\"} 2 10.0 # {id=\"a\"} 1 1000000000000.0\n# EOF\n",
+    ] {
+        assert!(matches!(
+            decoder.decode(payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts),
+            Err(DecodeError::TimestampOverflow { .. })
+        ));
+    }
+}
+
 #[test]
 fn empty_and_metadata_only_inputs_produce_empty_records() {
     let mut dec = ArrowDecoder::new();

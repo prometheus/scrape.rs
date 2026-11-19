@@ -152,8 +152,14 @@ pub enum UntypedPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodeOptions {
     /// Default timestamp in milliseconds since the Unix epoch applied to samples that omit an
-    /// explicit wire timestamp. When `None`, untimestamped samples leave `time_unix_nano` unset.
+    /// explicit wire timestamp, or to all samples when [`Self::honor_timestamps`] is `false`.
+    /// When `None`, samples without an honored wire timestamp leave `time_unix_nano` unset.
     pub timestamp_ms: Option<i64>,
+    /// Whether to honor explicit wire sample timestamps. Defaults to `true`.
+    /// When `false`, all sample timestamps use [`Self::timestamp_ms`] instead, without validating
+    /// whether the ignored wire timestamp fits in nanoseconds. Exemplar and start timestamps
+    /// are unaffected.
+    pub honor_timestamps: bool,
     /// Maximum number of data points materialized per [`super::OtapMetricRecords`] chunk yielded by
     /// [`super::ArrowDecoder::decode_stream`]. Values of `0` are clamped to `1`. Single-batch
     /// [`super::ArrowDecoder::decode`] ignores this limit.
@@ -180,6 +186,7 @@ impl DecodeOptions {
     pub const fn new() -> Self {
         Self {
             timestamp_ms: None,
+            honor_timestamps: true,
             max_data_points_per_batch: DEFAULT_MAX_DATA_POINTS_PER_BATCH,
             counter_suffix_policy: CounterSuffixPolicy::Keep,
             unit_suffix_policy: UnitSuffixPolicy::Keep,
@@ -187,10 +194,18 @@ impl DecodeOptions {
         }
     }
 
-    /// Sets the fallback timestamp in milliseconds for samples without an explicit wire timestamp.
+    /// Sets the fallback timestamp in milliseconds for samples without an honored wire timestamp.
     #[must_use]
     pub const fn with_timestamp_ms(mut self, timestamp_ms: i64) -> Self {
         self.timestamp_ms = Some(timestamp_ms);
+        self
+    }
+
+    /// Sets whether to honor explicit wire sample timestamps, leaving exemplar and start
+    /// timestamps unaffected.
+    #[must_use]
+    pub const fn with_honor_timestamps(mut self, honor_timestamps: bool) -> Self {
+        self.honor_timestamps = honor_timestamps;
         self
     }
 
