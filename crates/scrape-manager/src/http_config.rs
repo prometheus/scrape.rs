@@ -12,6 +12,13 @@
 // limitations under the License.
 
 //! HTTP client and TLS configuration types with 1:1 parity with `prometheus/common/config`.
+//!
+//! # Secret redaction
+//!
+//! [`Secret`] values and passwords embedded in [`ProxyConfig::proxy_url`] are irreversibly
+//! redacted in both [`fmt::Debug`] and [`serde::Serialize`] (to `"<secret>"` and `"xxxxx"`
+//! respectively), matching Prometheus config marshaling. Round-tripping through `Serialize` ->
+//! `Deserialize` does not preserve secret values.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -487,11 +494,17 @@ impl Authorization {
 }
 
 /// Proxy configuration embedded in [`HttpClientConfig`] and [`OAuth2`] (`common/config.ProxyConfig`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// [`fmt::Debug`] and [`serde::Serialize`] redact passwords in `proxy_url` to `"xxxxx"` and
+/// [`Secret`] entries in `proxy_connect_header` to `"<secret>"`.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProxyConfig {
     /// HTTP proxy server URL.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_opt_url"
+    )]
     pub proxy_url: Option<String>,
     /// Comma-separated addresses that bypass the proxy.
     #[serde(
@@ -505,6 +518,18 @@ pub struct ProxyConfig {
     /// Headers sent to proxies during `CONNECT` requests.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub proxy_connect_header: BTreeMap<String, Vec<Secret>>,
+}
+
+impl fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted_url = self.proxy_url.as_deref().map(redact_url);
+        f.debug_struct("ProxyConfig")
+            .field("proxy_url", &redacted_url)
+            .field("no_proxy", &self.no_proxy)
+            .field("proxy_from_environment", &self.proxy_from_environment)
+            .field("proxy_connect_header", &self.proxy_connect_header)
+            .finish()
+    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -733,9 +758,14 @@ impl Headers {
     /// Validates that no reserved headers are configured (`Headers.Validate`).
     pub fn validate(&self) -> Result<(), String> {
         for name in self.headers.keys() {
-            let canonical = canonical_header_key(name);
-            if RESERVED_HEADERS.contains(&canonical.as_str()) {
-                return Err(format!("setting header {canonical:?} is not allowed"));
+            if RESERVED_HEADERS
+                .iter()
+                .any(|reserved| reserved.eq_ignore_ascii_case(name))
+            {
+                return Err(format!(
+                    "setting header {:?} is not allowed",
+                    canonical_header_key(name)
+                ));
             }
         }
         Ok(())
@@ -750,6 +780,10 @@ fn default_true() -> bool {
 }
 
 /// HTTP client configuration (`common/config.HTTPClientConfig`).
+///
+/// Both [`fmt::Debug`] and [`serde::Serialize`] irreversibly redact [`Secret`] fields to
+/// `"<secret>"` and `proxy_url` passwords to `"xxxxx"`, so serializing a config is intentionally
+/// lossy for secret values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HttpClientConfig {
@@ -831,8 +865,39 @@ impl HttpClientConfig {
 
     /// Validates the HTTP client configuration and normalizes `bearer_token` / `bearer_token_file`
     /// into `authorization` (`HTTPClientConfig.Validate`).
+    ///
+    /// Returns without mutating `self` if any validation check fails.
     pub fn validate(&mut self) -> Result<(), String> {
-        self.tls_config.validate()?;
+        self.validate_fields()?;
+
+        if let Some(auth) = &mut self.authorization {
+            let trimmed = auth.auth_type.trim();
+            auth.auth_type = if trimmed.is_empty() {
+                "Bearer".to_owned()
+            } else {
+                trimmed.to_owned()
+            };
+        } else if !self.bearer_token.is_empty() {
+            let token = std::mem::take(&mut self.bearer_token);
+            self.authorization = Some(Authorization {
+                auth_type: "Bearer".to_owned(),
+                credentials: token,
+                credentials_file: String::new(),
+                credentials_ref: String::new(),
+            });
+        } else if !self.bearer_token_file.is_empty() {
+            let file = std::mem::take(&mut self.bearer_token_file);
+            self.authorization = Some(Authorization {
+                auth_type: "Bearer".to_owned(),
+                credentials: Secret::default(),
+                credentials_file: file,
+                credentials_ref: String::new(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_auth(&self) -> Result<(), String> {
         if !self.bearer_token.is_empty() && !self.bearer_token_file.is_empty() {
             return Err(
                 "at most one of bearer_token & bearer_token_file must be configured".to_owned(),
@@ -870,7 +935,7 @@ impl HttpClientConfig {
                 );
             }
         }
-        if let Some(auth) = &mut self.authorization {
+        if let Some(auth) = &self.authorization {
             if !self.bearer_token.is_empty() || !self.bearer_token_file.is_empty() {
                 return Err(
                     "authorization is not compatible with bearer_token & bearer_token_file"
@@ -888,11 +953,7 @@ impl HttpClientConfig {
                         .to_owned(),
                 );
             }
-            auth.auth_type = auth.auth_type.trim().to_owned();
-            if auth.auth_type.is_empty() {
-                auth.auth_type = "Bearer".to_owned();
-            }
-            if auth.auth_type.eq_ignore_ascii_case("basic") {
+            if auth.auth_type.trim().eq_ignore_ascii_case("basic") {
                 return Err(
                     "authorization type cannot be set to \"basic\", use \"basic_auth\" instead"
                         .to_owned(),
@@ -904,23 +965,13 @@ impl HttpClientConfig {
                         .to_owned(),
                 );
             }
-        } else if !self.bearer_token.is_empty() {
-            let token = std::mem::take(&mut self.bearer_token);
-            self.authorization = Some(Authorization {
-                auth_type: "Bearer".to_owned(),
-                credentials: token,
-                credentials_file: String::new(),
-                credentials_ref: String::new(),
-            });
-        } else if !self.bearer_token_file.is_empty() {
-            let file = std::mem::take(&mut self.bearer_token_file);
-            self.authorization = Some(Authorization {
-                auth_type: "Bearer".to_owned(),
-                credentials: Secret::default(),
-                credentials_file: file,
-                credentials_ref: String::new(),
-            });
         }
+        Ok(())
+    }
+
+    fn validate_fields(&self) -> Result<(), String> {
+        self.tls_config.validate()?;
+        self.validate_auth()?;
 
         if let Some(oauth2) = &self.oauth2 {
             oauth2.validate()?;
@@ -1102,15 +1153,83 @@ pub fn count_true(flags: &[bool]) -> usize {
     flags.iter().filter(|&&b| b).count()
 }
 
+fn is_valid_url_scheme(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    matches!(bytes.next(), Some(b) if b.is_ascii_alphabetic())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
+fn redact_authority_password(raw: &str, authority_start: usize) -> Option<String> {
+    let rest = &raw[authority_start..];
+    let authority_end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let at_pos = authority.rfind('@')?;
+    let colon_pos = authority[..at_pos].find(':')?;
+    let prefix = &raw[..authority_start + colon_pos + 1];
+    let suffix = &raw[authority_start + at_pos..];
+    Some(format!("{prefix}xxxxx{suffix}"))
+}
+
+fn redact_url(raw: &str) -> String {
+    let authority_start = raw
+        .find("://")
+        .filter(|&idx| is_valid_url_scheme(&raw[..idx]))
+        .map_or(0, |idx| idx + 3);
+
+    if let Ok(mut parsed) = url::Url::parse(raw)
+        && !parsed.cannot_be_a_base()
+    {
+        if parsed.password().is_some() {
+            // Preserve the original URL spelling (matching Go's `url.URL.Redacted()`, which does
+            // not append a trailing `/` to `http://u:p@host:8080`). Fall back to `Url::set_password`
+            // only if WHATWG parsing accepted a non-standard separator.
+            if authority_start > 0
+                && let Some(redacted) = redact_authority_password(raw, authority_start)
+            {
+                return redacted;
+            }
+            let _ = parsed.set_password(Some("xxxxx"));
+            return parsed.into();
+        }
+        return raw.to_owned();
+    }
+
+    // Fallback for malformed or schemeless URLs (for example `http://u:p@proxy:99999`,
+    // `u:p@proxy:8080`, or `u:p@proxy://x`) so userinfo credentials are never echoed raw.
+    if let Some(redacted) = redact_authority_password(raw, authority_start) {
+        return redacted;
+    }
+    let rest = &raw[authority_start..];
+    if let Some(last_at) = rest.rfind('@')
+        && rest[..last_at].contains(':')
+    {
+        return SECRET_TOKEN.to_owned();
+    }
+    raw.to_owned()
+}
+
+fn serialize_opt_url<S: Serializer>(
+    url: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match url {
+        Some(u) => serializer.serialize_some(&redact_url(u)),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Validates that `s` can be parsed by Go's `net/url.Parse`.
 pub fn validate_go_url(s: &str) -> Result<(), String> {
     if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
-        return Err(format!("net/url: invalid control character in URL {s:?}"));
+        return Err(format!(
+            "net/url: invalid control character in URL {:?}",
+            redact_url(s)
+        ));
     }
     if s.contains("://") {
         let base_parse = url::Url::parse(s);
         if let Err(err) = base_parse {
-            return Err(format!("parse {s:?}: {err}"));
+            return Err(format!("parse {:?}: {err}", redact_url(s)));
         }
     }
     Ok(())
