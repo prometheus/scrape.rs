@@ -37,7 +37,10 @@ url = { workspace = true }
 
 [dev-dependencies]
 benchfmt = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio-rustls = { workspace = true }
 
 [[bench]]
 name = "discovery_dns"

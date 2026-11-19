@@ -1104,11 +1104,14 @@ dependencies = [
  "prometheus-relabel",
  "regex",
  "reqwest",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "serde_yaml",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "url",
 ]
 
