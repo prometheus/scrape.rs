@@ -49,11 +49,11 @@ use self::intern::StringInterner;
 pub use self::options::{
     CounterSuffixPolicy, DECODE_BUDGET_DURATION_CHECK_INTERVAL, DEFAULT_DECODE_BUDGET_MAX_BYTES,
     DEFAULT_DECODE_BUDGET_MAX_DURATION, DEFAULT_DECODE_BUDGET_MAX_ENTRIES,
-    DEFAULT_MAX_DATA_POINTS_PER_BATCH, DecodeBudget, DecodeError, DecodeOptions, UnitSuffixPolicy,
-    UntypedPolicy,
+    DEFAULT_MAX_DATA_POINTS_PER_BATCH, DecodeBudget, DecodeError, DecodeOptions, TargetAttributes,
+    UnitSuffixPolicy, UntypedPolicy,
 };
 pub use self::records::{MetricPayloadType, OtapMetricRecords};
-pub use self::schema::PROMETHEUS_TYPE_METADATA_KEY;
+pub use self::schema::{PROMETHEUS_TYPE_METADATA_KEY, SERVICE_INSTANCE_ID_ATTR, SERVICE_NAME_ATTR};
 
 /// Maximum distinct `UnivariateMetrics` rows representable in a single OTAP batch (`u16` IDs).
 const MAX_METRICS_PER_BATCH: usize = (u16::MAX as usize) + 1;
@@ -654,7 +654,7 @@ impl ArrowDecoder {
                     input,
                     cursor: DecodeCursor {
                         parser_state: ActiveParserState::Invalid,
-                        opts: *opts,
+                        opts: opts.clone(),
                         default_ts_ns: None,
                         max_data_points,
                         scrape_id,
@@ -686,7 +686,7 @@ impl ArrowDecoder {
         let (parser, default_ts_ns) = self.init_scrape_parser(b"", format, opts)?;
         Ok(DecodeCursor {
             parser_state: parser.into_state(),
-            opts: *opts,
+            opts: opts.clone(),
             default_ts_ns,
             max_data_points,
             scrape_id: self.scrape_id,
@@ -844,7 +844,7 @@ impl ArrowDecoder {
                         if self.metrics.is_empty() {
                             return Ok(DecodeStep::Done);
                         }
-                        let batch = self.finish_batches(default_ts_ns.is_some())?;
+                        let batch = self.finish_batches(opts, default_ts_ns.is_some())?;
                         if CHUNKED {
                             self.reset_batch();
                         }
@@ -892,7 +892,7 @@ impl ArrowDecoder {
                                 self.current_family
                                     .start_new(raw_name, &self.series_name_buf);
                                 *pending_series = true;
-                                let batch = self.finish_batches(default_ts_ns.is_some())?;
+                                let batch = self.finish_batches(opts, default_ts_ns.is_some())?;
                                 self.reset_batch();
                                 return Ok(DecodeStep::Batch(batch));
                             }
@@ -915,7 +915,7 @@ impl ArrowDecoder {
                                 self.flush_pending_family(opts, default_ts_ns)?;
                             }
                             *pending_series = true;
-                            let batch = self.finish_batches(default_ts_ns.is_some())?;
+                            let batch = self.finish_batches(opts, default_ts_ns.is_some())?;
                             self.reset_batch();
                             return Ok(DecodeStep::Batch(batch));
                         }
@@ -927,7 +927,7 @@ impl ArrowDecoder {
                         && self.assembly.is_empty()
                         && self.total_data_points() >= max_data_points
                     {
-                        let batch = self.finish_batches(default_ts_ns.is_some())?;
+                        let batch = self.finish_batches(opts, default_ts_ns.is_some())?;
                         self.reset_batch();
                         return Ok(DecodeStep::Batch(batch));
                     }
@@ -1549,11 +1549,19 @@ impl ArrowDecoder {
         Ok(())
     }
 
-    fn finish_batches(&mut self, has_default_ts: bool) -> Result<OtapMetricRecords, DecodeError> {
+    fn finish_batches(
+        &mut self,
+        opts: &DecodeOptions,
+        has_default_ts: bool,
+    ) -> Result<OtapMetricRecords, DecodeError> {
         if self.metrics.is_empty() {
             return Ok(OtapMetricRecords::default());
         }
 
+        let resource_attrs = match opts.target_attributes.as_deref() {
+            Some(target) => target.resource_attrs_batch()?,
+            None => None,
+        };
         let univariate_metrics = Some(self.metrics.build_univariate_metrics(&mut self.scratch)?);
         let number_data_points = self.num_dp.build_batch(has_default_ts, &mut self.scratch)?;
         let summary_data_points = self.sum_dp.build_batch(has_default_ts, &mut self.scratch)?;
@@ -1589,6 +1597,7 @@ impl ArrowDecoder {
         let metric_attrs = Some(self.metrics.build_metric_attrs(&mut self.scratch)?);
 
         Ok(OtapMetricRecords {
+            resource_attrs,
             univariate_metrics,
             metric_attrs,
             number_data_points,

@@ -431,7 +431,7 @@ impl ScrapeConfig {
     /// Sets [`ScrapeConfig::decode_options`].
     #[cfg(feature = "arrow")]
     #[must_use]
-    pub const fn with_decode_options(mut self, options: DecodeOptions) -> Self {
+    pub fn with_decode_options(mut self, options: DecodeOptions) -> Self {
         self.decode_options = options;
         self
     }

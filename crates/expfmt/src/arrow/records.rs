@@ -35,6 +35,8 @@ use arrow_array::RecordBatch;
 #[repr(i32)]
 #[non_exhaustive]
 pub enum MetricPayloadType {
+    /// Target-level resource attributes (`ArrowPayloadType::ResourceAttrs = 1`).
+    ResourceAttrs = 1,
     /// Metric descriptor table (`ArrowPayloadType::UnivariateMetrics = 10`).
     UnivariateMetrics = 10,
     /// Scalar gauge, counter, and untyped data points (`ArrowPayloadType::NumberDataPoints = 11`).
@@ -83,6 +85,7 @@ impl MetricPayloadType {
 /// Tables with zero rows are omitted (`None`) to match OTAP batch store invariants.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OtapMetricRecords {
+    pub(super) resource_attrs: Option<RecordBatch>,
     pub(super) univariate_metrics: Option<RecordBatch>,
     pub(super) metric_attrs: Option<RecordBatch>,
     pub(super) number_data_points: Option<RecordBatch>,
@@ -98,6 +101,12 @@ pub struct OtapMetricRecords {
 }
 
 impl OtapMetricRecords {
+    /// Returns the `ResourceAttrs` table (`ArrowPayloadType = 1`), if non-empty.
+    #[must_use]
+    pub fn resource_attrs(&self) -> Option<&RecordBatch> {
+        self.resource_attrs.as_ref()
+    }
+
     /// Returns the `UnivariateMetrics` table (`ArrowPayloadType = 10`), if non-empty.
     #[must_use]
     pub fn univariate_metrics(&self) -> Option<&RecordBatch> {
@@ -174,6 +183,7 @@ impl OtapMetricRecords {
     #[must_use]
     pub fn get(&self, payload_type: MetricPayloadType) -> Option<&RecordBatch> {
         match payload_type {
+            MetricPayloadType::ResourceAttrs => self.resource_attrs.as_ref(),
             MetricPayloadType::UnivariateMetrics => self.univariate_metrics.as_ref(),
             MetricPayloadType::NumberDataPoints => self.number_data_points.as_ref(),
             MetricPayloadType::SummaryDataPoints => self.summary_data_points.as_ref(),
@@ -194,6 +204,10 @@ impl OtapMetricRecords {
     /// Iterates over all non-empty `(MetricPayloadType, &RecordBatch)` pairs in wire order.
     pub fn iter(&self) -> impl Iterator<Item = (MetricPayloadType, &RecordBatch)> {
         [
+            (
+                MetricPayloadType::ResourceAttrs,
+                self.resource_attrs.as_ref(),
+            ),
             (
                 MetricPayloadType::UnivariateMetrics,
                 self.univariate_metrics.as_ref(),
@@ -247,6 +261,7 @@ impl OtapMetricRecords {
     /// Consumes `self` and yields all non-empty `(MetricPayloadType, RecordBatch)` pairs.
     pub fn into_batches(self) -> impl Iterator<Item = (MetricPayloadType, RecordBatch)> {
         [
+            (MetricPayloadType::ResourceAttrs, self.resource_attrs),
             (
                 MetricPayloadType::UnivariateMetrics,
                 self.univariate_metrics,

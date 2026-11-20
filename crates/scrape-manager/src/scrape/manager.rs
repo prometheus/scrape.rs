@@ -507,6 +507,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         let decode_opts = self
             .config
             .decode_options
+            .clone()
             .with_timestamp_ms(scrape_timestamp_ms)
             .with_max_data_points_per_batch(chunk_limit);
 

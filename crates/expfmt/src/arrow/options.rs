@@ -14,11 +14,17 @@
 //! Configuration policies, [`DecodeOptions`], [`DecodeBudget`], and [`DecodeError`] for
 //! [`super::ArrowDecoder`].
 
+use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use arrow_array::RecordBatch;
 use arrow_schema::ArrowError;
 
 use crate::parse::ParseError;
+
+use super::columns::build_resource_attrs_batch;
+use super::schema::{SERVICE_INSTANCE_ID_ATTR, SERVICE_NAME_ATTR};
 
 /// Default upper bound on data points emitted per [`super::OtapMetricRecords`] chunk in
 /// [`super::ArrowDecoder::decode_stream`].
@@ -148,8 +154,217 @@ pub enum UntypedPolicy {
     Drop,
 }
 
+/// Reserved Prometheus label prefix excluded from public target labels and resource attributes.
+const RESERVED_LABEL_PREFIX: &str = "__";
+const JOB_LABEL: &str = "job";
+const INSTANCE_LABEL: &str = "instance";
+
+/// Target-level Prometheus labels and OpenTelemetry resource attributes attached once per scrape
+/// to the OTAP `ResourceAttrs` (`ArrowPayloadType = 1`) table.
+///
+/// Non-reserved, non-empty Prometheus target labels map into OpenTelemetry resource attributes:
+/// - `job` maps to [`SERVICE_NAME_ATTR`] (`"service.name"`).
+/// - `instance` maps to [`SERVICE_INSTANCE_ID_ATTR`] (`"service.instance.id"`).
+/// - Any other public target label attaches verbatim as a resource attribute.
+/// - Internal labels starting with `"__"` and empty target label values are ignored.
+///
+/// Explicit resource attributes added via [`Self::with_resource_attribute`] or
+/// [`Self::with_resource_attributes`] take precedence over mapped target labels. The encoded
+/// `ResourceAttrs` [`RecordBatch`] is materialized lazily on first decode and shared across
+/// streaming chunks and repeated scrapes via `Arc<TargetAttributes>`.
+#[derive(Debug, Default)]
+pub struct TargetAttributes {
+    target_labels: BTreeMap<String, String>,
+    explicit_resource_attrs: BTreeMap<String, String>,
+    resolved_resource_attrs: BTreeMap<String, String>,
+    cached_batch: OnceLock<Option<RecordBatch>>,
+}
+
+impl Clone for TargetAttributes {
+    fn clone(&self) -> Self {
+        let cached_batch = match self.cached_batch.get() {
+            Some(batch) => OnceLock::from(batch.clone()),
+            None => OnceLock::new(),
+        };
+        Self {
+            target_labels: self.target_labels.clone(),
+            explicit_resource_attrs: self.explicit_resource_attrs.clone(),
+            resolved_resource_attrs: self.resolved_resource_attrs.clone(),
+            cached_batch,
+        }
+    }
+}
+
+impl PartialEq for TargetAttributes {
+    fn eq(&self, other: &Self) -> bool {
+        self.target_labels == other.target_labels
+            && self.explicit_resource_attrs == other.explicit_resource_attrs
+            && self.resolved_resource_attrs == other.resolved_resource_attrs
+    }
+}
+
+impl Eq for TargetAttributes {}
+
+impl TargetAttributes {
+    /// Creates an empty [`TargetAttributes`] set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a [`TargetAttributes`] set from Prometheus target labels, ignoring reserved `"__*"`
+    /// labels and empty values.
+    #[must_use]
+    pub fn from_target_labels<I, K, V>(labels: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        Self::new().with_target_labels(labels)
+    }
+
+    /// Sets the Prometheus `job` target label, mapped to `service.name` in `ResourceAttrs`.
+    #[must_use]
+    pub fn with_job(self, job: impl Into<String>) -> Self {
+        self.with_target_label(JOB_LABEL, job)
+    }
+
+    /// Sets the Prometheus `instance` target label, mapped to `service.instance.id` in
+    /// `ResourceAttrs`.
+    #[must_use]
+    pub fn with_instance(self, instance: impl Into<String>) -> Self {
+        self.with_target_label(INSTANCE_LABEL, instance)
+    }
+
+    /// Inserts or updates a single Prometheus target label.
+    ///
+    /// Reserved `"__*"` label names are ignored. Setting an empty value removes any previous value
+    /// for `key`, matching Prometheus label semantics.
+    #[must_use]
+    pub fn with_target_label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.insert_target_label_raw(key.into(), value.into());
+        self.rebuild_resolved();
+        self
+    }
+
+    /// Inserts or updates multiple Prometheus target labels.
+    #[must_use]
+    pub fn with_target_labels<I, K, V>(mut self, labels: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        for (k, v) in labels {
+            self.insert_target_label_raw(k.as_ref().to_owned(), v.as_ref().to_owned());
+        }
+        self.rebuild_resolved();
+        self
+    }
+
+    /// Inserts or updates an explicit OpenTelemetry resource attribute.
+    ///
+    /// Explicit resource attributes take precedence over attributes mapped from Prometheus target
+    /// labels (such as `job` -> `service.name` and `instance` -> `service.instance.id`).
+    #[must_use]
+    pub fn with_resource_attribute(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        let key = key.into();
+        if !key.is_empty() {
+            self.explicit_resource_attrs.insert(key, value.into());
+            self.rebuild_resolved();
+        }
+        self
+    }
+
+    /// Inserts or updates multiple explicit OpenTelemetry resource attributes.
+    #[must_use]
+    pub fn with_resource_attributes<I, K, V>(mut self, attrs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        for (k, v) in attrs {
+            let key = k.as_ref();
+            if !key.is_empty() {
+                self.explicit_resource_attrs
+                    .insert(key.to_owned(), v.as_ref().to_owned());
+            }
+        }
+        self.rebuild_resolved();
+        self
+    }
+
+    /// Returns the public (non-reserved, non-empty) Prometheus target labels.
+    #[must_use]
+    pub fn target_labels(&self) -> &BTreeMap<String, String> {
+        &self.target_labels
+    }
+
+    /// Returns the resolved OpenTelemetry resource attributes emitted in `ResourceAttrs`.
+    #[must_use]
+    pub fn resource_attributes(&self) -> &BTreeMap<String, String> {
+        &self.resolved_resource_attrs
+    }
+
+    /// Returns `true` when neither Prometheus target labels nor explicit resource attributes are
+    /// configured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.target_labels.is_empty() && self.resolved_resource_attrs.is_empty()
+    }
+
+    pub(super) fn resource_attrs_batch(&self) -> Result<Option<RecordBatch>, DecodeError> {
+        if let Some(batch) = self.cached_batch.get() {
+            return Ok(batch.clone());
+        }
+        let built = build_resource_attrs_batch(&self.resolved_resource_attrs)?;
+        let cached = self.cached_batch.get_or_init(|| built);
+        Ok(cached.clone())
+    }
+
+    fn insert_target_label_raw(&mut self, key: String, value: String) {
+        if key.is_empty() || key.starts_with(RESERVED_LABEL_PREFIX) {
+            return;
+        }
+        if value.is_empty() {
+            self.target_labels.remove(&key);
+        } else {
+            self.target_labels.insert(key, value);
+        }
+    }
+
+    fn rebuild_resolved(&mut self) {
+        self.resolved_resource_attrs.clear();
+        for (k, v) in &self.target_labels {
+            if k != JOB_LABEL && k != INSTANCE_LABEL {
+                self.resolved_resource_attrs.insert(k.clone(), v.clone());
+            }
+        }
+        if let Some(job) = self.target_labels.get(JOB_LABEL) {
+            self.resolved_resource_attrs
+                .entry(SERVICE_NAME_ATTR.to_owned())
+                .or_insert_with(|| job.clone());
+        }
+        if let Some(instance) = self.target_labels.get(INSTANCE_LABEL) {
+            self.resolved_resource_attrs
+                .entry(SERVICE_INSTANCE_ID_ATTR.to_owned())
+                .or_insert_with(|| instance.clone());
+        }
+        for (k, v) in &self.explicit_resource_attrs {
+            self.resolved_resource_attrs.insert(k.clone(), v.clone());
+        }
+        self.cached_batch = OnceLock::new();
+    }
+}
+
 /// Options controlling [`super::ArrowDecoder::decode`] and [`super::ArrowDecoder::decode_stream`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodeOptions {
     /// Default timestamp in milliseconds since the Unix epoch applied to samples that omit an
     /// explicit wire timestamp. When `None`, untimestamped samples leave `time_unix_nano` unset.
@@ -164,6 +379,9 @@ pub struct DecodeOptions {
     pub unit_suffix_policy: UnitSuffixPolicy,
     /// Projection policy for untyped (`unknown`) metric families.
     pub untyped_policy: UntypedPolicy,
+    /// Optional target labels and OpenTelemetry resource attributes attached to every non-empty
+    /// decoded batch as `ResourceAttrs` (`ArrowPayloadType = 1`).
+    pub target_attributes: Option<Arc<TargetAttributes>>,
 }
 
 impl Default for DecodeOptions {
@@ -174,8 +392,8 @@ impl Default for DecodeOptions {
 
 impl DecodeOptions {
     /// Creates default [`DecodeOptions`] with no fallback timestamp,
-    /// [`DEFAULT_MAX_DATA_POINTS_PER_BATCH`] data points per streamed batch, and default
-    /// translation policies.
+    /// [`DEFAULT_MAX_DATA_POINTS_PER_BATCH`] data points per streamed batch, default translation
+    /// policies, and no target resource attributes.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -184,12 +402,13 @@ impl DecodeOptions {
             counter_suffix_policy: CounterSuffixPolicy::Keep,
             unit_suffix_policy: UnitSuffixPolicy::Keep,
             untyped_policy: UntypedPolicy::Gauge,
+            target_attributes: None,
         }
     }
 
     /// Sets the fallback timestamp in milliseconds for samples without an explicit wire timestamp.
     #[must_use]
-    pub const fn with_timestamp_ms(mut self, timestamp_ms: i64) -> Self {
+    pub fn with_timestamp_ms(mut self, timestamp_ms: i64) -> Self {
         self.timestamp_ms = Some(timestamp_ms);
         self
     }
@@ -197,32 +416,36 @@ impl DecodeOptions {
     /// Sets the maximum number of data points materialized per batch in
     /// [`super::ArrowDecoder::decode_stream`].
     #[must_use]
-    pub const fn with_max_data_points_per_batch(
-        mut self,
-        max_data_points_per_batch: usize,
-    ) -> Self {
+    pub fn with_max_data_points_per_batch(mut self, max_data_points_per_batch: usize) -> Self {
         self.max_data_points_per_batch = max_data_points_per_batch;
         self
     }
 
     /// Sets the [`CounterSuffixPolicy`] for counter metric names.
     #[must_use]
-    pub const fn with_counter_suffix_policy(mut self, policy: CounterSuffixPolicy) -> Self {
+    pub fn with_counter_suffix_policy(mut self, policy: CounterSuffixPolicy) -> Self {
         self.counter_suffix_policy = policy;
         self
     }
 
     /// Sets the [`UnitSuffixPolicy`] for `# UNIT` suffixes on metric names.
     #[must_use]
-    pub const fn with_unit_suffix_policy(mut self, policy: UnitSuffixPolicy) -> Self {
+    pub fn with_unit_suffix_policy(mut self, policy: UnitSuffixPolicy) -> Self {
         self.unit_suffix_policy = policy;
         self
     }
 
     /// Sets the [`UntypedPolicy`] for untyped (`unknown`) metric families.
     #[must_use]
-    pub const fn with_untyped_policy(mut self, policy: UntypedPolicy) -> Self {
+    pub fn with_untyped_policy(mut self, policy: UntypedPolicy) -> Self {
         self.untyped_policy = policy;
+        self
+    }
+
+    /// Sets target labels and OpenTelemetry resource attributes emitted in `ResourceAttrs`.
+    #[must_use]
+    pub fn with_target_attributes(mut self, target_attributes: Arc<TargetAttributes>) -> Self {
+        self.target_attributes = Some(target_attributes);
         self
     }
 }

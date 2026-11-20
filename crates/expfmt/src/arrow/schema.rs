@@ -49,6 +49,12 @@ pub(super) const ATTR_VALUE_TYPE_STR: u8 = 1;
 /// Metric-level metadata attribute key recording the original Prometheus exposition type.
 pub const PROMETHEUS_TYPE_METADATA_KEY: &str = "prometheus.type";
 
+/// OpenTelemetry resource attribute key mapped from the Prometheus `job` target label.
+pub const SERVICE_NAME_ATTR: &str = "service.name";
+
+/// OpenTelemetry resource attribute key mapped from the Prometheus `instance` target label.
+pub const SERVICE_INSTANCE_ID_ATTR: &str = "service.instance.id";
+
 /// UTC timezone tag required by section 5.5.2 of the OTAP specification on `Timestamp(Nanosecond)`.
 pub(super) const UTC_TIME_ZONE: &str = "UTC";
 
@@ -517,6 +523,33 @@ static DP_ATTRS_SCHEMAS: LazyLock<[SchemaRef; 6]> = LazyLock::new(|| {
         build_u32_attrs_schema(KeyEncoding::Utf8, ValEncoding::Utf8),
     ]
 });
+
+fn build_u16_attrs_schema(key_enc: KeyEncoding, val_enc: ValEncoding) -> SchemaRef {
+    let (key_dt, val_dt) = attr_key_val_data_types(key_enc, val_enc);
+    Arc::new(Schema::new(vec![
+        Field::new("parent_id", DataType::UInt16, false).with_metadata(plain_id_metadata()),
+        Field::new("key", key_dt, false),
+        Field::new("type", DataType::UInt8, false),
+        Field::new("str", val_dt, true),
+    ]))
+}
+
+static RESOURCE_ATTRS_SCHEMAS: LazyLock<[SchemaRef; 6]> = LazyLock::new(|| {
+    [
+        build_u16_attrs_schema(KeyEncoding::DictU8, ValEncoding::DictU16),
+        build_u16_attrs_schema(KeyEncoding::DictU8, ValEncoding::Utf8),
+        build_u16_attrs_schema(KeyEncoding::DictU16, ValEncoding::DictU16),
+        build_u16_attrs_schema(KeyEncoding::DictU16, ValEncoding::Utf8),
+        build_u16_attrs_schema(KeyEncoding::Utf8, ValEncoding::DictU16),
+        build_u16_attrs_schema(KeyEncoding::Utf8, ValEncoding::Utf8),
+    ]
+});
+
+#[inline]
+pub(super) fn resource_attrs_schema(key_enc: KeyEncoding, val_enc: ValEncoding) -> SchemaRef {
+    let idx = (key_enc as usize) * 2 + (val_enc as usize);
+    Arc::clone(&RESOURCE_ATTRS_SCHEMAS[idx])
+}
 
 #[inline]
 pub(super) fn dp_attrs_schema(key_enc: KeyEncoding, val_enc: ValEncoding) -> SchemaRef {
