@@ -1095,6 +1095,69 @@ mod tests {
     }
 
     #[test]
+    fn new_metric_name_resets_the_type() {
+        for input in [
+            &b"# TYPE h histogram\nbare 1\n# EOF\n"[..],
+            b"# TYPE h histogram\n{\"c.d\"} 1\n# EOF\n",
+        ] {
+            let mut parser = OpenMetrics2Parser::new(input);
+            assert_eq!(parser.next_entry(), Ok(Some(Entry::Type)));
+            assert_eq!(parser.next_entry(), Ok(Some(Entry::Series)));
+            assert_eq!(parser.metric_type().1, MetricType::Unknown);
+        }
+    }
+
+    /// Parses one native histogram with `fields` after the shared required fields.
+    fn native_histogram(fields: &str) -> Result<Option<Entry>, ParseError> {
+        let input = format!(
+            "# TYPE h histogram\nh {{schema:0,zero_threshold:0,zero_count:0,{fields}}}\n# EOF\n"
+        );
+        let mut parser = OpenMetrics2Parser::new(input.as_bytes());
+        assert_eq!(parser.next_entry(), Ok(Some(Entry::Type)));
+        parser.next_entry()
+    }
+
+    #[test]
+    fn native_histogram_validation_errors() {
+        let invalid = |message: &str| Err(ParseError::InvalidValue(message.to_owned()));
+        let negative = "histogram has a negative observation count";
+        let cases = [
+            (
+                "count:1.5,sum:1,positive_spans:[0:1],positive_buckets:[-1.5]",
+                invalid(negative),
+            ),
+            ("count:-1.5,sum:1", invalid(negative)),
+            (
+                "count:1,sum:1,positive_spans:[0:2],positive_buckets:[2,-1]",
+                invalid("bucket has observation count of -1"),
+            ),
+            (
+                "count:2,sum:1,positive_spans:[0:1],positive_buckets:[1]",
+                invalid("1 observations found in buckets, but the Count field is 2"),
+            ),
+            (
+                "count:0,sum:NaN,positive_spans:[0:1],positive_buckets:[1]",
+                invalid("1 observations found in buckets, but the Count field is 0"),
+            ),
+            (
+                "count:2,sum:NaN,positive_spans:[0:1],positive_buckets:[1]",
+                Ok(Some(Entry::Histogram)),
+            ),
+            (
+                "count:2,sum:1,positive_spans:[0:1,-1:1],positive_buckets:[1,1]",
+                invalid("span has a negative offset"),
+            ),
+            (
+                "count:1,sum:1,positive_spans:[0:2],positive_buckets:[1]",
+                invalid("spans need 2 buckets, have 1 buckets"),
+            ),
+        ];
+        for (fields, expected) in cases {
+            assert_eq!(native_histogram(fields), expected, "{fields}");
+        }
+    }
+
+    #[test]
     fn splits_composite_fields_outside_brackets() {
         let parts: Vec<&str> = split_top_level("a:[1,2],b:(3,4),c:5").collect();
         assert_eq!(parts, ["a:[1,2]", "b:(3,4)", "c:5"]);

@@ -1,4 +1,5 @@
 type "foo_total" counter
 series "foo_total" 4031000000000000 - "__name__"="foo_total"
 exemplar 3ff0000000000000 1234566000 "id"="a"
+exemplar 4000000000000000 1234567000 "id"="b"
 st 0

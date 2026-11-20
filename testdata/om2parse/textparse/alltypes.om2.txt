@@ -8,6 +8,7 @@ series "http_requests_total{method=\"post\"}" 4008000000000000 1395066363000 "__
 st 0
 series "http_requests_total{method=\"put\"}" 0000000000000000 1395066363000 "__name__"="http_requests_total" "method"="put"
 exemplar 3ff0000000000000 1395066362500 "span_id"="s1" "trace_id"="t1"
+exemplar 3ff0000000000000 1395066362900 "span_id"="s2" "trace_id"="t2"
 st 0
 help "go_gc_duration_seconds" "GC duration percentiles."
 type "go_gc_duration_seconds" summary

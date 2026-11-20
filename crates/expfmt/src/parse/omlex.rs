@@ -42,6 +42,7 @@ pub(crate) struct LexerState {
     pub(super) pos: usize,
     pub(super) token_start: usize,
     state: State,
+    openmetrics2: bool,
 }
 
 /// Lexer tokens, named after the tokens in Go's openmetricsparse.go.
@@ -125,6 +126,7 @@ impl<'a> Lexer<'a> {
             pos: self.pos,
             token_start: self.token_start,
             state: self.state,
+            openmetrics2: self.openmetrics2,
         }
     }
 
@@ -135,7 +137,7 @@ impl<'a> Lexer<'a> {
             pos: state.pos,
             token_start: state.token_start,
             state: state.state,
-            openmetrics2: false,
+            openmetrics2: state.openmetrics2,
         }
     }
 
@@ -514,6 +516,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             [MName, Value, Timestamp, Linebreak, Eof]
         );
+    }
+
+    #[test]
+    fn state_round_trip_keeps_openmetrics2_mode() {
+        let input = b"a 1 st@3\n";
+        let mut lexer = Lexer::new_openmetrics2(input);
+        assert_eq!(lexer.lex(), Token::MName);
+        assert_eq!(lexer.lex(), Token::Value);
+        let mut lexer = Lexer::from_state(input, lexer.into_state());
+        assert_eq!(lexer.lex(), Token::StartTimestamp);
     }
 
     #[test]

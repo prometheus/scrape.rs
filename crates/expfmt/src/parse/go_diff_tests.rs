@@ -123,7 +123,7 @@ fn render<'a>(mut parser: impl Parser<'a>, start_timestamps: bool) -> Vec<u8> {
                 write!(out, " {:016x} {timestamp}", value.to_bits()).unwrap();
                 parser.labels(&mut labels);
                 quote_labels(&mut out, &labels);
-                if let Some((value, timestamp)) = parser.exemplar(&mut labels) {
+                while let Some((value, timestamp)) = parser.exemplar(&mut labels) {
                     exemplar_text(&mut out, value, timestamp, &labels);
                 }
                 start_timestamp_text(&mut out, &mut parser, start_timestamps);
