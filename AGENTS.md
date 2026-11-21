@@ -55,4 +55,6 @@ If Rust must differ from Go on purpose, explain each difference in the PR body w
 
 - Sign off every commit with `git commit -s` (DCO).
 - PR titles use `<area>: <summary>`, for example `parse: add OpenMetrics 1.0 parser`.
-- Link the GitHub issue the PR closes.
+- Link the relevant GitHub issue, if any. Use `Fixes #N` only when the PR meets all of the issue's acceptance criteria, otherwise use `Refs #N`.
+
+Do not claim Go parity for behavior you did not verify.
