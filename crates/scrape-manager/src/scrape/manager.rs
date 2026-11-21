@@ -84,7 +84,7 @@ impl ScrapeControl {
 pub struct ScrapeReport {
     /// `true` when HTTP fetch and payload decoding succeeded (`up == 1`).
     pub up: bool,
-    /// Unix epoch timestamp in milliseconds recorded for the scrape.
+    /// Unix epoch timestamp in milliseconds at which the scrape started, also on failed scrapes.
     pub scrape_timestamp_ms: i64,
     /// End-to-end fetch + decode wall-clock duration.
     pub duration: Duration,
@@ -350,6 +350,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
         sink: &S,
     ) -> ControlFlow<(), ScrapeReport> {
         let started = StdInstant::now();
+        let started_ms = current_timestamp_ms();
         self.counters.started.fetch_add(1, Ordering::Relaxed);
 
         let fetched = match self.fetcher.fetch(target, &self.body_pool).await {
@@ -358,7 +359,7 @@ impl<F: TargetFetcher> ScrapeManager<F> {
                 self.counters.failed.fetch_add(1, Ordering::Relaxed);
                 let report = ScrapeReport {
                     up: false,
-                    scrape_timestamp_ms: current_timestamp_ms(),
+                    scrape_timestamp_ms: started_ms,
                     duration: started.elapsed(),
                     wire_bytes: 0,
                     uncompressed_bytes: 0,

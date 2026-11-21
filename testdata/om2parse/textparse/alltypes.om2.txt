@@ -75,16 +75,16 @@ st 0
 help "latency_seconds" "Service latency (native histogram)."
 type "latency_seconds" histogram
 unit "latency_seconds" "seconds"
-histogram "latency_seconds" - int schema=0 count=5 sum=4028333333333333 zero_threshold=3f50624dd2f1a9fc zero_count=2 hint=0 pos_spans=[0:3] pos=[1,0,0] neg_spans=[] neg=[] "__name__"="latency_seconds"
+histogram "latency_seconds" - int schema=0 count=5 sum=4028333333333333 zero_threshold=3f50624dd2f1a9fc zero_count=2 hint=0 pos_spans=[0:3] pos=[1,0,0] neg_spans=[] neg=[] custom=[] "__name__"="latency_seconds"
 st 0
 help "payload_size" "Payload size (float native histogram)."
 type "payload_size" histogram
-histogram "payload_size" - float schema=0 count=4016000000000000 sum=4028333333333333 zero_threshold=3f50624dd2f1a9fc zero_count=4004000000000000 hint=0 pos_spans=[0:2] pos=[4000000000000000,3ff0000000000000] neg_spans=[] neg=[] "__name__"="payload_size"
+histogram "payload_size" - float schema=0 count=4016000000000000 sum=4028333333333333 zero_threshold=3f50624dd2f1a9fc zero_count=4004000000000000 hint=0 pos_spans=[0:2] pos=[4000000000000000,3ff0000000000000] neg_spans=[] neg=[] custom=[] "__name__"="payload_size"
 st 0
 help "request_size" "Request size distribution (gauge histogram)."
 type "request_size" gaugehistogram
 unit "request_size" "bytes"
-histogram "request_size" - int schema=0 count=6 sum=4059000000000000 zero_threshold=3f50624dd2f1a9fc zero_count=1 hint=3 pos_spans=[0:2] pos=[3,-1] neg_spans=[] neg=[] "__name__"="request_size"
+histogram "request_size" - int schema=0 count=6 sum=4059000000000000 zero_threshold=3f50624dd2f1a9fc zero_count=1 hint=3 pos_spans=[0:2] pos=[3,-1] neg_spans=[] neg=[] custom=[] "__name__"="request_size"
 st 0
 help "build_info" "Build information."
 type "build_info" info

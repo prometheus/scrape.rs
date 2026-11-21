@@ -75,3 +75,47 @@ func TestExtractFuncInputLiteral(t *testing.T) {
 		})
 	}
 }
+
+func TestConfigExpectationsSynced(t *testing.T) {
+	promMod, err := resolveModule("github.com/prometheus/prometheus")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commonMod, err := resolveModule("github.com/prometheus/common")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out ConfigExpectations
+	if err := parsePromConfigTests(filepath.Join(promMod.Dir, "config", "config_test.go"), &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := parseCommonHTTPConfigTests(filepath.Join(commonMod.Dir, "config", "http_config_test.go"), &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := parseCommonTLSConfigTests(filepath.Join(commonMod.Dir, "config", "tls_config_test.go"), &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(out.ExpectedErrors) == 0 {
+		t.Fatal("expected non-empty ExpectedErrors from prometheus/config/config_test.go")
+	}
+	if len(out.GetScrapeConfigsCases) == 0 {
+		t.Fatal("expected non-empty GetScrapeConfigsCases from prometheus/config/config_test.go")
+	}
+	if len(out.ValidationSettingsCases) == 0 {
+		t.Fatal("expected non-empty ValidationSettingsCases from prometheus/config/config_test.go")
+	}
+	if len(out.EscapingSettingsCases) == 0 {
+		t.Fatal("expected non-empty EscapingSettingsCases from prometheus/config/config_test.go")
+	}
+	if len(out.InvalidHTTPClientConfigs) == 0 {
+		t.Fatal("expected non-empty InvalidHTTPClientConfigs from common/config/http_config_test.go")
+	}
+	if len(out.ValidTLSConfigs) == 0 {
+		t.Fatal("expected non-empty ValidTLSConfigs from common/config/tls_config_test.go")
+	}
+	if len(out.InvalidTLSConfigs) == 0 {
+		t.Fatal("expected non-empty InvalidTLSConfigs from common/config/tls_config_test.go")
+	}
+}

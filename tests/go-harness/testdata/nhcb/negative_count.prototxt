@@ -1,0 +1,8 @@
+name: "negative_count"
+type: HISTOGRAM
+metric: <
+  histogram: <
+    sample_count_float: -1
+    bucket: < cumulative_count: 1 upper_bound: 1 >
+  >
+>

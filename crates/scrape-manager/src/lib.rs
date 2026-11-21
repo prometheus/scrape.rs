@@ -19,4 +19,7 @@
 pub use prometheus_expfmt as expfmt;
 pub use prometheus_relabel as relabel;
 
+pub mod config;
+pub mod discovery;
+pub mod http_config;
 pub mod scrape;
