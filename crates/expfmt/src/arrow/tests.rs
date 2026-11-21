@@ -511,6 +511,44 @@ fn decode_stream_splits_mid_family_preserves_metadata_and_handles_edges() {
 }
 
 #[test]
+fn decodes_prometheus_text_1_0_0_with_utf8_names() {
+    // Prometheus UTF-8 text (`text/plain; version=1.0.0`) is decoded by the same parser as
+    // `0.0.4`; only the name quoting rules differ, so both formats must dispatch here.
+    let payload = concat!(
+        "# TYPE \"http.requests.total\" counter\n",
+        "{\"http.requests.total\",\"method\"=\"GET\"} 2\n",
+        "{\"http.requests.total\",\"method\"=\"POST\"} 3\n",
+    );
+
+    let mut dec = ArrowDecoder::new();
+    let opts = DecodeOptions::default();
+    for format in [
+        Format::TEXT_1_0_0,
+        Format::from("text/plain; version=1.0.0; escaping=allow-utf-8"),
+    ] {
+        let records = dec.decode(payload.as_bytes(), &format, &opts).unwrap();
+        assert_eq!(records.num_metrics(), 1, "format={format}");
+        assert_eq!(records.num_data_points(), 2, "format={format}");
+
+        let metrics = records.univariate_metrics().unwrap();
+        let names = metrics
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "http.requests.total", "format={format}");
+    }
+
+    // A format the scoped enum does not cover still reports `UnsupportedFormat`.
+    let mut dec = ArrowDecoder::new();
+    assert!(matches!(
+        dec.decode(payload.as_bytes(), &Format::PROTO_DELIM, &opts),
+        Err(DecodeError::UnsupportedFormat(_))
+    ));
+}
+
+#[test]
 fn interleaved_family_starts_fresh_untyped_run() {
     let mut dec = ArrowDecoder::new();
     let opts = DecodeOptions::default();

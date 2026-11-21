@@ -18,6 +18,7 @@ The `format` module mirrors [`prometheus/common/expfmt/expfmt.go`](https://githu
 | Format | Baseline `Content-Type` | Scope |
 | :--- | :--- | :--- |
 | Prometheus Text 0.0.4 | `text/plain; version=0.0.4; charset=utf-8` | Classic text exposition, `# HELP` and `# TYPE`, classic histograms and summaries, optional timestamps, UTF-8 quoted metric and label names. |
+| Prometheus Text 1.0.0 | `text/plain; version=1.0.0; charset=utf-8` | The UTF-8 text format promoted by `scrape_protocols` (`PrometheusText1.0.0`) and `escaping=allow-utf-8`. Decoded by the same layer as 0.0.4; the version only signals that names are UTF-8. |
 | OpenMetrics 1.0 | `application/openmetrics-text; version=1.0.0; charset=utf-8` and `0.0.1` | Strict grammar per the [OpenMetrics 1.0 ABNF specification](https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#abnf) in RFC 5234, `# UNIT`, `_created` lines, exemplars, `info`, `stateset`, `gaugehistogram`, and mandatory `# EOF`. |
 | OpenMetrics 2.0 | `application/openmetrics-text; version=2.0.0; charset=utf-8` and `2.0.0-rc` | Native histograms in text format, inline start timestamps `st@...`, UTF-8 names, and composite values matching [`model/textparse/openmetrics2parse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/openmetrics2parse.go). |
 | Prometheus Protobuf | `application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited` plus `text` and `compact-text` | Varint length-delimited `MetricFamily` messages from [`prompb/io/prometheus/client/metrics.proto`](https://github.com/prometheus/prometheus/blob/main/prompb/io/prometheus/client/metrics.proto), native sparse exponential histograms, and custom-bucket native histograms. |
@@ -27,6 +28,25 @@ The `format` module mirrors [`prometheus/common/expfmt/expfmt.go`](https://githu
 OpenMetrics 1.0 defines a normative [ABNF grammar](https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#abnf) that takes precedence over the prose specification.
 - We will store machine-readable ABNF grammar files in the repository under `specs/expfmt/openmetrics_1_0.abnf` and `specs/expfmt/openmetrics_2_0.abnf`.
 - We will either generate the OpenMetrics parser state tables directly from the ABNF or validate a hand-written zero-copy lexer against an ABNF reference parser in tests and fuzzers.
+
+### Scraper-side negotiation
+
+`negotiate` / `negotiate_accept` cover the exporter side (`prometheus/common/expfmt/encode.go`). Scrapers need the mirror-image request and response handling, which Prometheus keeps in `config` and `scrape` instead of `prometheus/common/expfmt`, so `format` exposes it as well:
+
+- `ScrapeProtocol` mirrors `config.ScrapeProtocol` plus `config.ScrapeProtocolsHeaders` and `HeaderMediaType`: `PrometheusProto`, `PrometheusText0.0.4`, `PrometheusText1.0.0`, `OpenMetricsText0.0.1`, `OpenMetricsText1.0.0`, `OpenMetricsText2.0.0-rc`, and `OpenMetricsText2.0.0`, with `DEFAULT_SCRAPE_PROTOCOLS` and `DEFAULT_PROTO_FIRST_SCRAPE_PROTOCOLS` matching the Go defaults.
+- `accept_header(&[ScrapeProtocol], EscapingScheme)` mirrors [`acceptHeader`](https://github.com/prometheus/prometheus/blob/main/scrape/scrape.go): protocols in caller order with descending `q` weights starting at `q=0.8`, `*/*` last, and `;escaping=<scheme>` only on text `1.0.0` and OpenMetrics `1.0.0`+ media types.
+- `resolve_scrape_format(content_type, fallback_protocol, enable_open_metrics_2)` mirrors the `fallback_scrape_protocol` handling of [`extractMediaType`](https://github.com/prometheus/prometheus/blob/main/model/textparse/interface.go): it resolves the media type and `version` parameter, plus a declared `escaping` scheme on formats that negotiate one, so `text/plain; version=1.0.0` becomes `Format::TEXT_1_0_0`, OpenMetrics without `charset=utf-8` still decodes as OpenMetrics, and `proto` / `encoding` parameters on `application/vnd.google.protobuf` are ignored because Prometheus feeds every protobuf media type to its delimited parser. Blank, unparsable, unsupported, and OpenMetrics 2.0-without-flag content types resolve through the fallback protocol and return a `ScrapeFormatWarning` whose `Display` matches the Prometheus log line; without a fallback they are a `ScrapeFormatError` with the Prometheus error text.
+
+`response_format` keeps the stricter exporter-side `ResponseFormat` semantics, except that it recognizes `text/plain; version=1.0.0`, which Go's decoder predates, and that it carries a declared `escaping` scheme over just like `resolve_scrape_format` does.
+
+Intentional differences from Go, each covered by a test:
+
+- `fallback_scrape_protocol` keeps its configured version instead of being truncated to a bare media type by `HeaderMediaType`, so `OpenMetricsText2.0.0` selects the OpenMetrics 2.0 parser. A 2.x fallback with OpenMetrics 2.0 disabled degrades to `Format::OPEN_METRICS_1_0_0`, which is the parser Prometheus ends up using for that configuration.
+- `accept_header` clamps `q` weights at `q=0.1`. Go derives the weights from the same fixed base, so an over-long list would advertise `q=0.0` (not acceptable) past seven protocols and eventually the malformed `q=0.-1`; validated `scrape_protocols` rejects duplicates, so reachable lists stay below that.
+- Unknown `version` parameters on known media types resolve to the baseline format of the parser Prometheus would use (`0.0.4` for `text/plain`, `1.0.0` for `application/openmetrics-text`) instead of failing.
+- Duplicate media type parameters are accepted last-wins, matching the existing `response_format` parser, where Go's `mime.ParseMediaType` rejects them.
+- A valid `escaping=<scheme>` response parameter is carried over to the resolved `Format` by both `response_format` and `resolve_scrape_format`, but only for formats that negotiate one (text `1.0.0`, OpenMetrics `1.0.0`+), matching `ScrapeProtocol::supports_escaping`. Prometheus never reads escaping from responses, but `Format` is this crate's carrier for the escaping scheme, so dropping a declared scheme would make `Format::to_escaping_scheme` report the `underscores` default for an `allow-utf-8` or `dots` target; carrying it over for legacy `0.0.1`/`0.0.4` responses, which never advertise `escaping=`, would let a stray parameter change how callers interpret those names.
+- Rejected `Content-Type` values report the parse reason (for example `expected a type/subtype media type` or `invalid media type token`) in parentheses, since our minimal RFC 1521 parser cannot reuse Go's `mime` error text.
 
 ## Decoding architecture and APIs
 
@@ -206,6 +226,7 @@ To verify that `ArrowDecoder` meets the [`open-telemetry/otel-arrow#3277`](https
 ### Phase 1: Workspace layout, format negotiation, proto DTOs, and test fixtures
 - Set up the Cargo workspace with `arrow` and optional `dto` feature flags, plus `tests/go-harness`.
 - Implement `Format`, `FormatType`, `EscapingScheme`, and `Content-Type` / `Accept` header parsing matching [`prometheus/common/expfmt/expfmt.go`](https://github.com/prometheus/common/blob/main/expfmt/expfmt.go).
+- Implement scraper-side negotiation: `ScrapeProtocol`, `accept_header`, and `resolve_scrape_format` with `fallback_scrape_protocol` resolution, OpenMetrics 2.0 gating, and Prometheus-compatible warnings.
 - Compile the proto3 [`prompb/io/prometheus/client/metrics.proto`](https://github.com/prometheus/prometheus/blob/main/prompb/io/prometheus/client/metrics.proto) schema ([`buf.build/prometheus/prometheus`](https://buf.build/prometheus/prometheus/docs/main%3Aio.prometheus.client)) with `prost-build` for the `dto` module.
 - Add the `go generate` fixture sync tool in `tests/go-harness` and generate initial `testdata/` fixtures from [`prometheus/prometheus/model/textparse`](https://github.com/prometheus/prometheus/tree/main/model/textparse) and [`prometheus/common/expfmt`](https://github.com/prometheus/common/tree/main/expfmt), verified in CI with `git diff --exit-code`.
 
