@@ -1410,3 +1410,270 @@ async fn discovery_error_redacts_url_password_and_converts_http_config_errors() 
     let cfg_err = DiscoveryError::from(HttpConfigError::InvalidConfig("bad http cfg".to_owned()));
     assert!(matches!(cfg_err, DiscoveryError::InvalidConfig(m) if m == "bad http cfg"));
 }
+
+#[tokio::test]
+async fn kubernetes_pod_discovery_http_json_errors_remaining_endpoints_and_with_client() {
+    use prometheus_scrape_manager::discovery::DiscoveryError;
+    use std::sync::{Arc, Mutex};
+
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen_srv = Arc::clone(&seen_paths);
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let seen_srv = Arc::clone(&seen_srv);
+            tokio::spawn(async move {
+                let mut req_buf = vec![0u8; 4096];
+                let n = stream.read(&mut req_buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                let first_line = req_str.lines().next().unwrap_or("");
+                let path = first_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_owned();
+                seen_srv.lock().unwrap().push(path.clone());
+
+                let (status, body) = match path.as_str() {
+                    "/api/v1/namespaces/err-403/pods?resourceVersion=0" => {
+                        ("403 Forbidden", r#"{"status":"Failure","code":403}"#)
+                    }
+                    "/api/v1/namespaces/err-500/pods?resourceVersion=0" => (
+                        "500 Internal Server Error",
+                        r#"{"status":"Failure","code":500}"#,
+                    ),
+                    "/api/v1/namespaces/bad-json/pods?resourceVersion=0" => {
+                        ("200 OK", "not valid json")
+                    }
+                    "/api/v1/namespaces/ns-403/pods?resourceVersion=0" => {
+                        ("200 OK", r#"{"items":[]}"#)
+                    }
+                    "/api/v1/namespaces/ns-403" => {
+                        ("403 Forbidden", r#"{"status":"Failure","code":403}"#)
+                    }
+                    "/api/v1/namespaces/ns-bad-json/pods?resourceVersion=0" => {
+                        ("200 OK", r#"{"items":[]}"#)
+                    }
+                    "/api/v1/namespaces/ns-bad-json" => ("200 OK", "{broken"),
+                    "/api/v1/pods?resourceVersion=0" => (
+                        "200 OK",
+                        r#"{"items":[{"metadata":{"name":"all-ns-pod","namespace":"ns-a","ownerReferences":[{"kind":"ReplicaSet","name":"shared-rs","controller":true}]},"spec":{"containers":[{"name":"app","image":"app:1","ports":[{"containerPort":8080,"protocol":"TCP"}]}]},"status":{"phase":"Running","podIP":"10.1.0.1"}}]}"#,
+                    ),
+                    "/apis/apps/v1/replicasets?resourceVersion=0" => (
+                        "200 OK",
+                        r#"{"items":[{"metadata":{"name":"shared-rs","namespace":"ns-a","ownerReferences":[{"kind":"Deployment","name":"all-ns-deploy","controller":true}]}}]}"#,
+                    ),
+                    "/api/v1/namespaces/ns-a/pods?resourceVersion=0" => (
+                        "200 OK",
+                        r#"{"items":[{"metadata":{"name":"pod-rs-a","namespace":"ns-a","ownerReferences":[{"kind":"ReplicaSet","name":"shared-rs","controller":true}]},"spec":{"containers":[{"name":"app","image":"app:1","ports":[{"containerPort":8080,"protocol":"TCP"}]}]},"status":{"phase":"Running","podIP":"10.2.0.1"}},{"metadata":{"name":"pod-job-a","namespace":"ns-a","ownerReferences":[{"kind":"Job","name":"shared-job","controller":true}]},"spec":{"containers":[{"name":"worker","image":"w:1","ports":[]}]},"status":{"phase":"Running","podIP":"10.2.0.2"}}]}"#,
+                    ),
+                    "/api/v1/namespaces/ns-b/pods?resourceVersion=0" => (
+                        "200 OK",
+                        r#"{"items":[{"metadata":{"name":"pod-rs-b","namespace":"ns-b","ownerReferences":[{"kind":"ReplicaSet","name":"shared-rs","controller":true}]},"spec":{"containers":[{"name":"app","image":"app:1","ports":[{"containerPort":8080,"protocol":"TCP"}]}]},"status":{"phase":"Running","podIP":"10.2.0.3"}},{"metadata":{"name":"pod-job-b","namespace":"ns-b","ownerReferences":[{"kind":"Job","name":"shared-job","controller":true}]},"spec":{"containers":[{"name":"worker","image":"w:1","ports":[]}]},"status":{"phase":"Running","podIP":"10.2.0.4"}}]}"#,
+                    ),
+                    "/apis/apps/v1/namespaces/ns-a/replicasets?resourceVersion=0" => (
+                        "200 OK",
+                        r#"{"items":[{"metadata":{"name":"shared-rs","namespace":"ns-a","ownerReferences":[{"kind":"Deployment","name":"deploy-a","controller":true}]}}]}"#,
+                    ),
+                    "/apis/apps/v1/namespaces/ns-b/replicasets?resourceVersion=0" => (
+                        "200 OK",
+                        r#"{"items":[{"metadata":{"name":"shared-rs","namespace":"ns-b","ownerReferences":[{"kind":"Deployment","name":"deploy-b","controller":true}]}}]}"#,
+                    ),
+                    "/apis/batch/v1/namespaces/ns-a/jobs?resourceVersion=0" => (
+                        "200 OK",
+                        r#"{"items":[{"metadata":{"name":"shared-job","namespace":"ns-a","ownerReferences":[{"kind":"CronJob","name":"cron-a","controller":true}]}}]}"#,
+                    ),
+                    "/apis/batch/v1/namespaces/ns-b/jobs?resourceVersion=0" => (
+                        "200 OK",
+                        r#"{"items":[{"metadata":{"name":"shared-job","namespace":"ns-b","ownerReferences":[{"kind":"CronJob","name":"cron-b","controller":true}]}}]}"#,
+                    ),
+                    "/api/v1/namespaces/job-only/pods?resourceVersion=0" => (
+                        "200 OK",
+                        r#"{"items":[{"metadata":{"name":"job-pod","namespace":"job-only","ownerReferences":[{"kind":"Job","name":"adhoc-job","controller":true}]},"spec":{"containers":[{"name":"worker","image":"w:1","ports":[]}]},"status":{"phase":"Running","podIP":"10.3.0.1"}}]}"#,
+                    ),
+                    other => panic!("unexpected path: {other}"),
+                };
+
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    // 1. Non-2xx HTTP errors on `get_json` and `get_optional_json`, plus `DiscoveryError::Json`.
+    let make_ns_disc = |ns: &str, attach_ns: bool| {
+        KubernetesPodDiscovery::new(KubernetesSdConfig {
+            api_server: Some(format!("http://{addr}")),
+            role: Some(KubernetesRole::Pod),
+            namespaces: KubernetesNamespaceDiscovery {
+                own_namespace: false,
+                names: vec![ns.to_owned()],
+            },
+            attach_metadata: KubernetesAttachMetadataConfig {
+                namespace: attach_ns,
+                ..KubernetesAttachMetadataConfig::default()
+            },
+            ..KubernetesSdConfig::default()
+        })
+        .unwrap()
+    };
+
+    let err_403 = make_ns_disc("err-403", false).discover().await.unwrap_err();
+    assert!(
+        matches!(&err_403, DiscoveryError::Http(e) if e.status() == Some(reqwest::StatusCode::FORBIDDEN))
+    );
+    let err_500 = make_ns_disc("err-500", false).discover().await.unwrap_err();
+    assert!(
+        matches!(&err_500, DiscoveryError::Http(e) if e.status() == Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR))
+    );
+    let err_json = make_ns_disc("bad-json", false)
+        .discover()
+        .await
+        .unwrap_err();
+    assert!(matches!(err_json, DiscoveryError::Json(_)));
+
+    let err_ns_403 = make_ns_disc("ns-403", true).discover().await.unwrap_err();
+    assert!(
+        matches!(&err_ns_403, DiscoveryError::Http(e) if e.status() == Some(reqwest::StatusCode::FORBIDDEN))
+    );
+    let err_ns_json = make_ns_disc("ns-bad-json", true)
+        .discover()
+        .await
+        .unwrap_err();
+    assert!(matches!(err_ns_json, DiscoveryError::Json(_)));
+
+    // 2. All-namespaces `attach_metadata.deployment` using `with_client` and `config()`.
+    let custom_client = reqwest::Client::new();
+    assert!(
+        KubernetesPodDiscovery::with_client(
+            KubernetesSdConfig {
+                role: Some(KubernetesRole::Node),
+                ..KubernetesSdConfig::default()
+            },
+            custom_client.clone(),
+        )
+        .is_err()
+    );
+    assert!(
+        KubernetesPodDiscovery::with_client(
+            KubernetesSdConfig {
+                role: Some(KubernetesRole::Pod),
+                kubeconfig_file: "/etc/kubeconfig".to_owned(),
+                ..KubernetesSdConfig::default()
+            },
+            custom_client.clone(),
+        )
+        .is_err()
+    );
+    let all_ns_deploy = KubernetesPodDiscovery::with_client(
+        KubernetesSdConfig {
+            api_server: Some(format!("http://{addr}")),
+            role: Some(KubernetesRole::Pod),
+            attach_metadata: KubernetesAttachMetadataConfig {
+                deployment: true,
+                ..KubernetesAttachMetadataConfig::default()
+            },
+            ..KubernetesSdConfig::default()
+        },
+        custom_client,
+    )
+    .unwrap();
+    assert_eq!(all_ns_deploy.config().role, Some(KubernetesRole::Pod));
+    assert_eq!(
+        all_ns_deploy.config().api_server.as_deref(),
+        Some(format!("http://{addr}").as_str())
+    );
+    let all_groups = all_ns_deploy.discover().await.unwrap();
+    assert_eq!(all_groups.len(), 1);
+    assert_eq!(
+        all_groups[0]
+            .labels
+            .get("__meta_kubernetes_pod_deployment_name"),
+        Some(&"all-ns-deploy".to_owned())
+    );
+
+    // 3. Multi-namespace deployment + cronjob isolation for identically named ReplicaSets/Jobs.
+    let multi_disc = KubernetesPodDiscovery::new(KubernetesSdConfig {
+        api_server: Some(format!("http://{addr}")),
+        role: Some(KubernetesRole::Pod),
+        namespaces: KubernetesNamespaceDiscovery {
+            own_namespace: false,
+            names: vec!["ns-a".to_owned(), "ns-b".to_owned()],
+        },
+        attach_metadata: KubernetesAttachMetadataConfig {
+            deployment: true,
+            job: true,
+            cronjob: true,
+            ..KubernetesAttachMetadataConfig::default()
+        },
+        ..KubernetesSdConfig::default()
+    })
+    .unwrap();
+    let multi_groups = multi_disc.discover().await.unwrap();
+    assert_eq!(multi_groups.len(), 4);
+    assert_eq!(
+        multi_groups[0]
+            .labels
+            .get("__meta_kubernetes_pod_deployment_name"),
+        Some(&"deploy-a".to_owned())
+    );
+    assert_eq!(
+        multi_groups[1]
+            .labels
+            .get("__meta_kubernetes_pod_cronjob_name"),
+        Some(&"cron-a".to_owned())
+    );
+    assert_eq!(
+        multi_groups[2]
+            .labels
+            .get("__meta_kubernetes_pod_deployment_name"),
+        Some(&"deploy-b".to_owned())
+    );
+    assert_eq!(
+        multi_groups[3]
+            .labels
+            .get("__meta_kubernetes_pod_cronjob_name"),
+        Some(&"cron-b".to_owned())
+    );
+
+    // 4. `attach_metadata.job: true, cronjob: false` attaches job name without querying `/jobs`.
+    seen_paths.lock().unwrap().clear();
+    let job_only_disc = KubernetesPodDiscovery::new(KubernetesSdConfig {
+        api_server: Some(format!("http://{addr}")),
+        role: Some(KubernetesRole::Pod),
+        namespaces: KubernetesNamespaceDiscovery {
+            own_namespace: false,
+            names: vec!["job-only".to_owned()],
+        },
+        attach_metadata: KubernetesAttachMetadataConfig {
+            job: true,
+            cronjob: false,
+            ..KubernetesAttachMetadataConfig::default()
+        },
+        ..KubernetesSdConfig::default()
+    })
+    .unwrap();
+    let job_only_groups = job_only_disc.discover().await.unwrap();
+    assert_eq!(job_only_groups.len(), 1);
+    assert_eq!(
+        job_only_groups[0]
+            .labels
+            .get("__meta_kubernetes_pod_job_name"),
+        Some(&"adhoc-job".to_owned())
+    );
+    assert_eq!(
+        *seen_paths.lock().unwrap(),
+        vec!["/api/v1/namespaces/job-only/pods?resourceVersion=0".to_owned()]
+    );
+}
