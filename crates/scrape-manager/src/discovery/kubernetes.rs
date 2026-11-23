@@ -14,7 +14,7 @@
 //! Prometheus-compatible Kubernetes service discovery (`kubernetes_sd_configs`),
 //! with `reqwest`-based discovery for `role: pod`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -666,6 +666,79 @@ pub fn build_pod_target_group(
     metadata: &KubernetesMetadataContext,
     attach: &KubernetesAttachMetadataConfig,
 ) -> TargetGroup {
+    build_pod_target_group_inner(pod, metadata, attach, None)
+}
+
+/// Builds Prometheus [`TargetGroup`]s for a slice of Kubernetes [`Pod`]s, precomputing sanitized
+/// node and namespace metadata labels once per distinct node or namespace across the batch.
+pub fn build_pod_target_groups(
+    pods: &[Pod],
+    metadata: &KubernetesMetadataContext,
+    attach: &KubernetesAttachMetadataConfig,
+) -> Vec<TargetGroup> {
+    let mut cache = MetadataLabelCache::default();
+    pods.iter()
+        .map(|pod| build_pod_target_group_inner(pod, metadata, attach, Some(&mut cache)))
+        .collect()
+}
+
+#[derive(Default)]
+struct MetadataLabelCache<'a> {
+    nodes: HashMap<&'a str, Vec<(String, String)>>,
+    namespaces: HashMap<&'a str, Vec<(String, String)>>,
+}
+
+impl<'a> MetadataLabelCache<'a> {
+    fn extend_node_labels(
+        &mut self,
+        ls: &mut LabelSet,
+        metadata: &'a KubernetesMetadataContext,
+        node_name: &str,
+    ) {
+        if node_name.is_empty() {
+            return;
+        }
+        let Some((key, node)) = metadata.nodes.get_key_value(node_name) else {
+            ls.insert(NODE_NAME_LABEL.to_owned(), node_name.to_owned());
+            return;
+        };
+        let pairs = self.nodes.entry(key.as_str()).or_insert_with(|| {
+            let mut pre = LabelSet::new();
+            pre.insert(NODE_NAME_LABEL.to_owned(), key.clone());
+            add_object_meta_labels(&mut pre, &node.metadata, "node");
+            pre.into_iter().collect()
+        });
+        for (k, v) in pairs {
+            ls.insert(k.clone(), v.clone());
+        }
+    }
+
+    fn extend_namespace_labels(
+        &mut self,
+        ls: &mut LabelSet,
+        metadata: &'a KubernetesMetadataContext,
+        namespace: &str,
+    ) {
+        let Some((key, ns)) = metadata.namespaces.get_key_value(namespace) else {
+            return;
+        };
+        let pairs = self.namespaces.entry(key.as_str()).or_insert_with(|| {
+            let mut pre = LabelSet::new();
+            add_object_meta_labels(&mut pre, &ns.metadata, "namespace");
+            pre.into_iter().collect()
+        });
+        for (k, v) in pairs {
+            ls.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+fn build_pod_target_group_inner<'a>(
+    pod: &Pod,
+    metadata: &'a KubernetesMetadataContext,
+    attach: &KubernetesAttachMetadataConfig,
+    cache: Option<&mut MetadataLabelCache<'a>>,
+) -> TargetGroup {
     let source = pod_source(&pod.metadata.namespace, &pod.metadata.name);
     let mut tg = TargetGroup {
         targets: Vec::new(),
@@ -686,11 +759,23 @@ pub fn build_pod_target_group(
 
     let mut labels = pod_labels(pod, metadata, attach);
     labels.insert(NAMESPACE_LABEL.to_owned(), pod.metadata.namespace.clone());
-    if attach.node {
-        add_node_labels(&mut labels, metadata, &pod.spec.node_name);
-    }
-    if attach.namespace {
-        add_namespace_labels(&mut labels, metadata, &pod.metadata.namespace);
+    match cache {
+        Some(cache) => {
+            if attach.node {
+                cache.extend_node_labels(&mut labels, metadata, &pod.spec.node_name);
+            }
+            if attach.namespace {
+                cache.extend_namespace_labels(&mut labels, metadata, &pod.metadata.namespace);
+            }
+        }
+        None => {
+            if attach.node {
+                add_node_labels(&mut labels, metadata, &pod.spec.node_name);
+            }
+            if attach.namespace {
+                add_namespace_labels(&mut labels, metadata, &pod.metadata.namespace);
+            }
+        }
     }
     tg.labels = labels;
 
@@ -755,17 +840,6 @@ pub fn build_pod_target_group(
     }
 
     tg
-}
-
-/// Builds Prometheus [`TargetGroup`]s for a slice of Kubernetes [`Pod`]s.
-pub fn build_pod_target_groups(
-    pods: &[Pod],
-    metadata: &KubernetesMetadataContext,
-    attach: &KubernetesAttachMetadataConfig,
-) -> Vec<TargetGroup> {
-    pods.iter()
-        .map(|pod| build_pod_target_group(pod, metadata, attach))
-        .collect()
 }
 
 fn pod_labels(

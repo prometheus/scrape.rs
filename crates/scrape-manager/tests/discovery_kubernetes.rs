@@ -20,7 +20,7 @@ use prometheus_scrape_manager::config::load as load_prometheus_config;
 use prometheus_scrape_manager::discovery::kubernetes::{
     Job, KubernetesAttachMetadataConfig, KubernetesMetadataContext, KubernetesNamespaceDiscovery,
     KubernetesPodDiscovery, KubernetesRole, KubernetesSdConfig, KubernetesSelectorConfig,
-    Namespace, Node, OwnerReference, ReplicaSet, build_pod_target_group,
+    Namespace, Node, OwnerReference, ReplicaSet, build_pod_target_group, build_pod_target_groups,
 };
 use prometheus_scrape_manager::discovery::{ADDRESS_LABEL, DiscoveryConfigs, LabelSet, Pod};
 use prometheus_scrape_manager::http_config::{
@@ -588,6 +588,18 @@ fn kubernetes_pod_target_groups_match_prometheus_pod_test() {
         job_tg.labels.get("__meta_kubernetes_pod_cronjob_name"),
         Some(&"nightly-job".to_owned())
     );
+
+    // 5. Batch builder with cached node/namespace labels matches per-pod builder across shared nodes/namespaces.
+    let mut pod_b = job_pod.clone();
+    pod_b.metadata.name = "testpod-b".to_owned();
+    pod_b.status.pod_ip = "10.0.0.2".to_owned();
+    let batch_pods = vec![job_pod, pod_b];
+    let batch_groups = build_pod_target_groups(&batch_pods, &meta, &attach_all);
+    let single_groups: Vec<_> = batch_pods
+        .iter()
+        .map(|p| build_pod_target_group(p, &meta, &attach_all))
+        .collect();
+    assert_eq!(batch_groups, single_groups);
 }
 
 #[test]
