@@ -2163,8 +2163,60 @@ ZCXcq24++2iU8RQHuAIgTvD813EN4j4Wd++SFXpG+evSLLk+fyJse98OIktvI/E=\n\
             vec!["default".to_owned(), "monitoring".to_owned()]
         );
 
+        // Verify `own_namespace` appends when not already present (both empty and non-empty `names`).
+        let own_only = KubernetesPodDiscovery::new(KubernetesSdConfig {
+            role: Some(KubernetesRole::Pod),
+            namespaces: KubernetesNamespaceDiscovery {
+                own_namespace: true,
+                names: Vec::new(),
+            },
+            ..KubernetesSdConfig::default()
+        })
+        .unwrap()
+        .with_own_namespace_file(ns_file.to_string_lossy());
+        assert_eq!(
+            own_only.resolve_namespaces().unwrap(),
+            vec!["monitoring".to_owned()]
+        );
+
+        let own_plus_other = KubernetesPodDiscovery::new(KubernetesSdConfig {
+            role: Some(KubernetesRole::Pod),
+            namespaces: KubernetesNamespaceDiscovery {
+                own_namespace: true,
+                names: vec!["default".to_owned()],
+            },
+            ..KubernetesSdConfig::default()
+        })
+        .unwrap()
+        .with_own_namespace_file(ns_file.to_string_lossy());
+        assert_eq!(
+            own_plus_other.resolve_namespaces().unwrap(),
+            vec!["default".to_owned(), "monitoring".to_owned()]
+        );
+
+        // Missing or path-traversal `own_namespace_file` fails cleanly.
+        let missing_ns = own_only
+            .clone()
+            .with_own_namespace_file(dir.join("missing-ns").to_string_lossy());
+        assert!(missing_ns.resolve_namespaces().is_err());
+        let bad_ns_file = dir.join("bad-namespace");
+        for bad_own in ["../kube-system", "a/b", ".\n."] {
+            fs::write(&bad_ns_file, bad_own).unwrap();
+            let bad_disc = own_only
+                .clone()
+                .with_own_namespace_file(bad_ns_file.to_string_lossy());
+            assert!(
+                bad_disc.resolve_namespaces().is_err(),
+                "expected error for own_namespace_file content {bad_own:?}"
+            );
+        }
+
         assert!(
             disc.resolve_in_cluster_endpoint_and_auth("", "443")
+                .is_err()
+        );
+        assert!(
+            disc.resolve_in_cluster_endpoint_and_auth("10.96.0.1", "")
                 .is_err()
         );
         disc.in_cluster_token_file = dir.join("missing-token").to_string_lossy().into_owned();
