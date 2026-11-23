@@ -502,10 +502,12 @@ fn kubernetes_model_and_validation_edge_cases() {
     .unwrap();
     api_with_query.validate().unwrap();
     KubernetesPodDiscovery::new(api_with_query).unwrap();
-    let mut bad_ns: KubernetesSdConfig =
-        serde_json::from_str(r#"{"role": "pod", "namespaces": {"names": ["default?watch=true"]}}"#)
-            .unwrap();
-    assert!(bad_ns.validate().is_err());
+    // Prometheus does not validate `namespaces.names` at config load time.
+    let mut arbitrary_ns: KubernetesSdConfig = serde_json::from_str(
+        r#"{"role": "pod", "namespaces": {"names": ["UPPERCASE", "default?watch=true"]}}"#,
+    )
+    .unwrap();
+    arbitrary_ns.validate().unwrap();
 
     let ipv6_null_pod: Pod = serde_json::from_str(
         r#"{

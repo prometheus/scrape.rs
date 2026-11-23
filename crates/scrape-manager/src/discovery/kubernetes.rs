@@ -292,10 +292,6 @@ impl KubernetesSdConfig {
             validate_go_url(api_server).map_err(DiscoveryError::InvalidConfig)?;
         }
 
-        for ns in &self.namespaces.names {
-            validate_k8s_namespace_name(ns)?;
-        }
-
         let is_default_http = self.http_client_config.is_default();
         self.http_client_config
             .validate()
@@ -1188,7 +1184,7 @@ impl KubernetesPodDiscovery {
     fn resolve_namespaces(&self) -> Result<Vec<String>, DiscoveryError> {
         let mut names = Vec::with_capacity(self.config.namespaces.names.len() + 1);
         for ns in &self.config.namespaces.names {
-            validate_k8s_namespace_name(ns)?;
+            validate_namespace_path_segment(ns)?;
             if !names.contains(ns) {
                 names.push(ns.clone());
             }
@@ -1208,7 +1204,7 @@ impl KubernetesPodDiscovery {
                     "could not read own namespace name (empty file)".to_owned(),
                 ));
             }
-            validate_k8s_namespace_name(&own_ns)?;
+            validate_namespace_path_segment(&own_ns)?;
             if !names.contains(&own_ns) {
                 names.push(own_ns);
             }
@@ -1217,16 +1213,12 @@ impl KubernetesPodDiscovery {
     }
 }
 
-fn validate_k8s_namespace_name(ns: &str) -> Result<(), DiscoveryError> {
-    let bytes = ns.as_bytes();
-    let is_valid = !bytes.is_empty()
-        && bytes.len() <= 63
-        && bytes[0].is_ascii_lowercase() | bytes[0].is_ascii_digit()
-        && bytes[bytes.len() - 1].is_ascii_lowercase() | bytes[bytes.len() - 1].is_ascii_digit()
-        && bytes
-            .iter()
-            .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if !is_valid {
+// Reject dot-segments and path delimiters at discovery time (matching `client-go`
+// `IsValidPathSegmentName`) because `url::PathSegmentsMut::push("..")` pops the preceding
+// segment instead of percent-encoding it, which would turn a namespaced query into a
+// cluster-wide `/api/v1/pods` request.
+fn validate_namespace_path_segment(ns: &str) -> Result<(), DiscoveryError> {
+    if ns.is_empty() || ns == "." || ns == ".." || ns.contains(['/', '%']) {
         return Err(DiscoveryError::InvalidConfig(format!(
             "invalid Kubernetes namespace name {ns:?}"
         )));
@@ -1374,6 +1366,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(without_sel.as_str(), "https://k8s.local/api/v1/pods");
+    }
+
+    #[test]
+    fn resolve_namespaces_allows_non_dns_names_and_rejects_path_traversal() {
+        let cfg = KubernetesSdConfig {
+            role: Some(KubernetesRole::Pod),
+            namespaces: KubernetesNamespaceDiscovery {
+                own_namespace: false,
+                names: vec!["UPPERCASE".to_owned(), "default?watch=true".to_owned()],
+            },
+            ..KubernetesSdConfig::default()
+        };
+        let disc = KubernetesPodDiscovery::new(cfg).unwrap();
+        let resolved = disc.resolve_namespaces().unwrap();
+        assert_eq!(resolved, vec!["UPPERCASE", "default?watch=true"]);
+
+        let url = build_resource_url(
+            "https://k8s.local",
+            &["api", "v1", "namespaces", "default?watch=true", "pods"],
+            None,
+        )
+        .unwrap();
+        assert_eq!(url.query(), None);
+        assert_eq!(url.path(), "/api/v1/namespaces/default%3Fwatch=true/pods");
+
+        for bad in ["", ".", "..", "a/b", "a%2Fb"] {
+            let bad_cfg = KubernetesSdConfig {
+                role: Some(KubernetesRole::Pod),
+                namespaces: KubernetesNamespaceDiscovery {
+                    own_namespace: false,
+                    names: vec![bad.to_owned()],
+                },
+                ..KubernetesSdConfig::default()
+            };
+            let bad_disc = KubernetesPodDiscovery::new(bad_cfg).unwrap();
+            assert!(
+                bad_disc.resolve_namespaces().is_err(),
+                "expected path-segment error for namespace {bad:?}"
+            );
+        }
     }
 
     #[test]
