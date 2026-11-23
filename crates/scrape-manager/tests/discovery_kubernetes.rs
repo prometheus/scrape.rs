@@ -487,9 +487,15 @@ fn kubernetes_pod_target_groups_match_prometheus_pod_test() {
 #[test]
 fn kubernetes_model_and_validation_edge_cases() {
     assert!(serde_json::from_str::<KubernetesSdConfig>(r#"{"role": "POD"}"#).is_err());
-    let mut bad_scheme: KubernetesSdConfig =
+    // Go `config.URL` calls `url.Parse` without checking scheme; runner creation enforces http(s).
+    let mut non_http_scheme: KubernetesSdConfig =
         serde_json::from_str(r#"{"role": "pod", "api_server": "ftp://k8s.local"}"#).unwrap();
-    assert!(bad_scheme.validate().is_err());
+    non_http_scheme.validate().unwrap();
+    assert!(KubernetesPodDiscovery::new(non_http_scheme).is_err());
+    let mut host_port_api: KubernetesSdConfig =
+        serde_json::from_str(r#"{"role": "pod", "api_server": "kubernetes:443"}"#).unwrap();
+    host_port_api.validate().unwrap();
+    assert!(KubernetesPodDiscovery::new(host_port_api).is_err());
     let mut bad_query: KubernetesSdConfig =
         serde_json::from_str(r#"{"role": "pod", "api_server": "https://k8s.local?watch=true"}"#)
             .unwrap();

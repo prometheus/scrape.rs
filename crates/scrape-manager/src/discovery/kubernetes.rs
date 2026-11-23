@@ -287,19 +287,15 @@ impl KubernetesSdConfig {
             self.api_server = None;
         }
         if let Some(api_server) = &self.api_server {
-            let parsed = reqwest::Url::parse(api_server).map_err(|e| {
-                DiscoveryError::InvalidConfig(format!("invalid api_server URL {api_server:?}: {e}"))
-            })?;
-            if !matches!(parsed.scheme(), "http" | "https") {
-                return Err(DiscoveryError::InvalidConfig(format!(
-                    "invalid api_server URL scheme {:?}, expected \"http\" or \"https\"",
-                    parsed.scheme()
-                )));
-            }
-            if parsed.query().is_some() || parsed.fragment().is_some() {
-                return Err(DiscoveryError::InvalidConfig(format!(
-                    "api_server URL {api_server:?} must not contain query parameters or fragments"
-                )));
+            if let Ok(parsed) = reqwest::Url::parse(api_server) {
+                if parsed.query().is_some() || parsed.fragment().is_some() {
+                    return Err(DiscoveryError::InvalidConfig(format!(
+                        "api_server URL {api_server:?} must not contain query parameters or fragments"
+                    )));
+                }
+            } else {
+                crate::http_config::validate_go_url(api_server)
+                    .map_err(DiscoveryError::InvalidConfig)?;
             }
         }
 
@@ -1296,6 +1292,22 @@ fn validate_pod_runner_config(config: &mut KubernetesSdConfig) -> Result<(), Dis
         return Err(DiscoveryError::InvalidConfig(
             "kubeconfig_file is not supported by KubernetesPodDiscovery; configure api_server and HTTP credentials instead".to_owned(),
         ));
+    }
+    if let Some(api_server) = &config.api_server {
+        let parsed = reqwest::Url::parse(api_server).map_err(|e| {
+            DiscoveryError::InvalidConfig(format!("invalid api_server URL {api_server:?}: {e}"))
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(DiscoveryError::InvalidConfig(format!(
+                "invalid api_server URL scheme {:?}, expected \"http\" or \"https\"",
+                parsed.scheme()
+            )));
+        }
+        if parsed.cannot_be_a_base() {
+            return Err(DiscoveryError::InvalidConfig(format!(
+                "Kubernetes base URL {api_server:?} cannot be a base"
+            )));
+        }
     }
     Ok(())
 }
