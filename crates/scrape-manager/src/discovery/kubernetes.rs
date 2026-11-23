@@ -266,7 +266,10 @@ pub struct KubernetesSdConfig {
     #[serde(flatten)]
     pub http_client_config: HttpClientConfig,
     /// Namespace discovery configuration.
-    #[serde(skip_serializing_if = "KubernetesNamespaceDiscovery::is_empty")]
+    #[serde(
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "KubernetesNamespaceDiscovery::is_empty"
+    )]
     pub namespaces: KubernetesNamespaceDiscovery,
     /// Label and field selectors per Kubernetes resource role.
     #[serde(
@@ -275,7 +278,10 @@ pub struct KubernetesSdConfig {
     )]
     pub selectors: Vec<KubernetesSelectorConfig>,
     /// Additional metadata attachment flags.
-    #[serde(skip_serializing_if = "KubernetesAttachMetadataConfig::is_empty")]
+    #[serde(
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "KubernetesAttachMetadataConfig::is_empty"
+    )]
     pub attach_metadata: KubernetesAttachMetadataConfig,
 }
 

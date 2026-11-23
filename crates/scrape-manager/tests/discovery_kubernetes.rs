@@ -666,6 +666,22 @@ fn kubernetes_model_and_validation_edge_cases() {
     .unwrap();
     arbitrary_ns.validate().unwrap();
 
+    // Empty YAML mappings and explicit JSON nulls for namespaces/selectors/attach_metadata default cleanly.
+    let mut null_json: KubernetesSdConfig = serde_json::from_str(
+        r#"{"role": "pod", "namespaces": null, "selectors": null, "attach_metadata": null}"#,
+    )
+    .unwrap();
+    null_json.validate().unwrap();
+    assert!(null_json.namespaces.is_empty());
+    assert!(null_json.selectors.is_empty());
+    assert!(null_json.attach_metadata.is_empty());
+    let null_yaml_cfg = load_prometheus_config(
+        "scrape_configs:\n  - job_name: k8s\n    kubernetes_sd_configs:\n      - role: pod\n        namespaces:\n        selectors:\n        attach_metadata:\n",
+        false,
+    )
+    .unwrap();
+    assert_eq!(null_yaml_cfg.scrape_configs.len(), 1);
+
     let ipv6_null_pod: Pod = serde_json::from_str(
         r#"{
             "metadata": {
