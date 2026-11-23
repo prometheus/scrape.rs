@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -896,7 +897,7 @@ fn pod_source(namespace: &str, name: &str) -> String {
 #[derive(Clone, Debug)]
 pub struct KubernetesPodDiscovery {
     config: KubernetesSdConfig,
-    client: Option<reqwest::Client>,
+    client: Arc<OnceLock<reqwest::Client>>,
     own_namespace_file: String,
     in_cluster_token_file: String,
     in_cluster_ca_file: String,
@@ -906,15 +907,15 @@ impl KubernetesPodDiscovery {
     /// Creates a new [`KubernetesPodDiscovery`] after validating `config` (`role` must be `Pod`)
     /// and building a [`reqwest::Client`] when `api_server` is configured.
     ///
-    /// In-cluster mode (`api_server: None`) builds its TLS client using the service account CA
-    /// bundle and token when [`KubernetesPodDiscovery::discover`] runs.
+    /// In-cluster mode (`api_server: None`) lazily builds its TLS client once using the service
+    /// account CA bundle on the first [`KubernetesPodDiscovery::discover`] call and reuses that
+    /// client and connection pool across subsequent polls.
     pub fn new(mut config: KubernetesSdConfig) -> Result<Self, DiscoveryError> {
         validate_pod_runner_config(&mut config)?;
-        let client = if config.api_server.is_some() {
-            Some(config.http_client_config.build_client()?)
-        } else {
-            None
-        };
+        let client = Arc::new(OnceLock::new());
+        if config.api_server.is_some() {
+            let _ = client.set(config.http_client_config.build_client()?);
+        }
         Ok(Self {
             config,
             client,
@@ -930,9 +931,11 @@ impl KubernetesPodDiscovery {
         client: reqwest::Client,
     ) -> Result<Self, DiscoveryError> {
         validate_pod_runner_config(&mut config)?;
+        let cached_client = Arc::new(OnceLock::new());
+        let _ = cached_client.set(client);
         Ok(Self {
             config,
-            client: Some(client),
+            client: cached_client,
             own_namespace_file: IN_CLUSTER_NAMESPACE_FILE.to_owned(),
             in_cluster_token_file: IN_CLUSTER_TOKEN_FILE.to_owned(),
             in_cluster_ca_file: IN_CLUSTER_CA_FILE.to_owned(),
@@ -1110,9 +1113,12 @@ impl KubernetesPodDiscovery {
         &self,
     ) -> Result<(String, reqwest::Client, HttpClientConfig), DiscoveryError> {
         if let Some(api_server) = &self.config.api_server {
-            let client = match &self.client {
-                Some(c) => c.clone(),
-                None => self.config.http_client_config.build_client()?,
+            let client = if let Some(c) = self.client.get() {
+                c.clone()
+            } else {
+                let built = self.config.http_client_config.build_client()?;
+                let _ = self.client.set(built);
+                self.client.get().expect("client initialized").clone()
             };
             return Ok((
                 api_server.clone(),
@@ -1160,26 +1166,29 @@ impl KubernetesPodDiscovery {
                 .bearer_token_file
                 .clone_from(&self.in_cluster_token_file);
         }
-        let client = match &self.client {
-            Some(c) => c.clone(),
-            None => {
-                if http_cfg.tls_config.ca.is_empty()
-                    && http_cfg.tls_config.ca_file.is_empty()
-                    && !http_cfg.tls_config.insecure_skip_verify
-                {
-                    if !Path::new(&self.in_cluster_ca_file).exists() {
-                        return Err(DiscoveryError::InvalidConfig(format!(
-                            "unable to read in-cluster CA certificate file {}",
-                            self.in_cluster_ca_file
-                        )));
-                    }
-                    http_cfg
-                        .tls_config
-                        .ca_file
-                        .clone_from(&self.in_cluster_ca_file);
+        let client = if let Some(c) = self.client.get() {
+            c.clone()
+        } else {
+            if http_cfg.tls_config.ca.is_empty()
+                && http_cfg.tls_config.ca_file.is_empty()
+                && !http_cfg.tls_config.insecure_skip_verify
+            {
+                if !Path::new(&self.in_cluster_ca_file).exists() {
+                    return Err(DiscoveryError::InvalidConfig(format!(
+                        "unable to read in-cluster CA certificate file {}",
+                        self.in_cluster_ca_file
+                    )));
                 }
-                http_cfg.build_client()?
+                http_cfg
+                    .tls_config
+                    .ca_file
+                    .clone_from(&self.in_cluster_ca_file);
             }
+            // Cache the built in-cluster client so subsequent polls reuse the TLS config and
+            // connection pool instead of re-reading the CA bundle on every cycle.
+            let built = http_cfg.build_client()?;
+            let _ = self.client.set(built);
+            self.client.get().expect("client initialized").clone()
         };
         Ok((base_url, client, http_cfg))
     }
@@ -1814,12 +1823,73 @@ ZCXcq24++2iU8RQHuAIgTvD813EN4j4Wd++SFXpG+evSLLk+fyJse98OIktvI/E=\n\
                 .is_err()
         );
         disc.in_cluster_ca_file = ca_file.to_string_lossy().into_owned();
-        let (base_url, _client, eff_http) = disc
+        let (base_url, client1, eff_http) = disc
             .resolve_in_cluster_endpoint_and_auth("fd00::1", "6443")
             .unwrap();
         assert_eq!(base_url, "https://[fd00::1]:6443");
         assert_eq!(eff_http.bearer_token_file, disc.in_cluster_token_file);
         assert_eq!(eff_http.tls_config.ca_file, disc.in_cluster_ca_file);
+
+        // Subsequent in-cluster polls (including clones) must reuse the cached client without
+        // re-reading the CA bundle or rebuilding the connection pool.
+        fs::remove_file(&ca_file).unwrap();
+        let (_base_url2, client2, eff_http2) = disc
+            .clone()
+            .resolve_in_cluster_endpoint_and_auth("fd00::1", "6443")
+            .unwrap();
+        assert_eq!(eff_http2.bearer_token_file, disc.in_cluster_token_file);
+
+        // Verify both resolved clients share the same underlying connection pool.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let accepts_srv = Arc::clone(&accepts);
+
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    accepts_srv.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 4096];
+                        loop {
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            let body = r#"{"items":[]}"#;
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            if stream.write_all(resp.as_bytes()).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+
+            let url = reqwest::Url::parse(&format!("http://{addr}/api/v1/pods")).unwrap();
+            let _: PodList = disc.get_json(&client1, url.clone(), &eff_http).await.unwrap();
+            let _: PodList = disc.get_json(&client2, url, &eff_http2).await.unwrap();
+            assert_eq!(
+                accepts.load(Ordering::SeqCst),
+                1,
+                "expected cached in-cluster client to reuse pooled connection across polls"
+            );
+        });
 
         let _ = fs::remove_dir_all(&dir);
     }
