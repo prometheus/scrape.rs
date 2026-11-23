@@ -19,6 +19,7 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -34,6 +35,7 @@ const IN_CLUSTER_TOKEN_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccou
 const IN_CLUSTER_CA_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
 const IN_CLUSTER_NAMESPACE_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
 const USER_AGENT: &str = concat!("prometheus-scrape-manager/", env!("CARGO_PKG_VERSION"));
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Meta label prefix for all Kubernetes discovery labels (`"__meta_kubernetes_"`).
 pub const META_LABEL_PREFIX: &str = "__meta_kubernetes_";
@@ -901,6 +903,7 @@ pub struct KubernetesPodDiscovery {
     own_namespace_file: String,
     in_cluster_token_file: String,
     in_cluster_ca_file: String,
+    request_timeout: Duration,
 }
 
 impl KubernetesPodDiscovery {
@@ -922,6 +925,7 @@ impl KubernetesPodDiscovery {
             own_namespace_file: IN_CLUSTER_NAMESPACE_FILE.to_owned(),
             in_cluster_token_file: IN_CLUSTER_TOKEN_FILE.to_owned(),
             in_cluster_ca_file: IN_CLUSTER_CA_FILE.to_owned(),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         })
     }
 
@@ -939,6 +943,7 @@ impl KubernetesPodDiscovery {
             own_namespace_file: IN_CLUSTER_NAMESPACE_FILE.to_owned(),
             in_cluster_token_file: IN_CLUSTER_TOKEN_FILE.to_owned(),
             in_cluster_ca_file: IN_CLUSTER_CA_FILE.to_owned(),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         })
     }
 
@@ -947,6 +952,12 @@ impl KubernetesPodDiscovery {
     /// `"/var/run/secrets/kubernetes.io/serviceaccount/namespace"`).
     pub fn with_own_namespace_file(mut self, path: impl Into<String>) -> Self {
         self.own_namespace_file = path.into();
+        self
+    }
+
+    /// Sets the per-request timeout applied to Kubernetes API HTTP requests (defaults to `30s`).
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 
@@ -1073,17 +1084,27 @@ impl KubernetesPodDiscovery {
         Ok(build_pod_target_groups(&all_pods, &metadata, attach))
     }
 
+    fn build_get_request(
+        &self,
+        client: &reqwest::Client,
+        url: reqwest::Url,
+        http_cfg: &HttpClientConfig,
+    ) -> Result<reqwest::RequestBuilder, DiscoveryError> {
+        let req = client
+            .get(url)
+            .header("Accept", "application/json")
+            .header("User-Agent", USER_AGENT)
+            .timeout(self.request_timeout);
+        Ok(http_cfg.apply_to_request(req)?)
+    }
+
     async fn get_json<T: for<'de> Deserialize<'de>>(
         &self,
         client: &reqwest::Client,
         url: reqwest::Url,
         http_cfg: &HttpClientConfig,
     ) -> Result<T, DiscoveryError> {
-        let req = client
-            .get(url)
-            .header("Accept", "application/json")
-            .header("User-Agent", USER_AGENT);
-        let req = http_cfg.apply_to_request(req)?;
+        let req = self.build_get_request(client, url, http_cfg)?;
         let resp = req.send().await?.error_for_status()?;
         let body = resp.bytes().await?;
         Ok(serde_json::from_slice(&body)?)
@@ -1095,11 +1116,7 @@ impl KubernetesPodDiscovery {
         url: reqwest::Url,
         http_cfg: &HttpClientConfig,
     ) -> Result<Option<T>, DiscoveryError> {
-        let req = client
-            .get(url)
-            .header("Accept", "application/json")
-            .header("User-Agent", USER_AGENT);
-        let req = http_cfg.apply_to_request(req)?;
+        let req = self.build_get_request(client, url, http_cfg)?;
         let resp = req.send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);

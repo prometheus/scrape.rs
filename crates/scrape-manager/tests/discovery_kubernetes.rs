@@ -1071,3 +1071,79 @@ fn https_mtls_all_namespaces_404_tolerance_and_localset_execution() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
+
+#[tokio::test]
+async fn kubernetes_pod_discovery_enforces_per_request_timeout() {
+    use prometheus_scrape_manager::discovery::DiscoveryError;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut req_buf = vec![0u8; 4096];
+                let n = stream.read(&mut req_buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                let first_line = req_str.lines().next().unwrap_or("");
+                if first_line.starts_with("GET /api/v1/namespaces/slow-ns/pods ") {
+                    let body = r#"{"items":[]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    return;
+                }
+                // Hold the socket open without responding so both `get_json` and
+                // `get_optional_json` hit the configured per-request timeout.
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            });
+        }
+    });
+
+    // 1. Timeout on `get_json` (`/api/v1/pods`).
+    let stall_pods = KubernetesPodDiscovery::new(KubernetesSdConfig {
+        api_server: Some(format!("http://{addr}")),
+        role: Some(KubernetesRole::Pod),
+        ..KubernetesSdConfig::default()
+    })
+    .unwrap()
+    .with_request_timeout(Duration::from_millis(100));
+
+    let err = stall_pods.discover().await.unwrap_err();
+    assert!(
+        matches!(&err, DiscoveryError::Http(e) if e.is_timeout()),
+        "expected timeout error on get_json, got: {err:?}"
+    );
+
+    // 2. Timeout on `get_optional_json` (`/api/v1/namespaces/slow-ns`).
+    let stall_ns = KubernetesPodDiscovery::new(KubernetesSdConfig {
+        api_server: Some(format!("http://{addr}")),
+        role: Some(KubernetesRole::Pod),
+        namespaces: KubernetesNamespaceDiscovery {
+            own_namespace: false,
+            names: vec!["slow-ns".to_owned()],
+        },
+        attach_metadata: KubernetesAttachMetadataConfig {
+            namespace: true,
+            ..KubernetesAttachMetadataConfig::default()
+        },
+        ..KubernetesSdConfig::default()
+    })
+    .unwrap()
+    .with_request_timeout(Duration::from_millis(100));
+
+    let err = stall_ns.discover().await.unwrap_err();
+    assert!(
+        matches!(&err, DiscoveryError::Http(e) if e.is_timeout()),
+        "expected timeout error on get_optional_json, got: {err:?}"
+    );
+}
