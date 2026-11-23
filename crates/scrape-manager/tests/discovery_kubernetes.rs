@@ -178,6 +178,55 @@ fn kubernetes_sd_config_validation_matches_prometheus() {
         "setting header \"Authorization\" is not allowed"
     );
 
+    // Label selector validation matches `k8s.io/apimachinery/pkg/labels.Parse`.
+    for valid_label in [
+        "app=web",
+        "app==web,env!=dev",
+        "app.kubernetes.io/name in (prom,alertmanager)",
+        "tier notin (frontend,,backend)",
+        "env in ()",
+        "in in (in,notin)",
+        "key=,!absent,present",
+        "priority>10,weight<100",
+    ] {
+        let mut cfg: KubernetesSdConfig = serde_json::from_value(serde_json::json!({
+            "role": "pod",
+            "selectors": [{ "role": "pod", "label": valid_label }]
+        }))
+        .unwrap();
+        cfg.validate()
+            .unwrap_or_else(|e| panic!("expected valid label selector {valid_label:?}, got {e}"));
+    }
+
+    for invalid_label in [
+        "=val",
+        "app in (a,b",
+        "app in a",
+        "app=web,",
+        ",app=web",
+        "!app=web",
+        "app===web",
+        "bad/prefix/name=val",
+        "UPPER.DOMAIN/name=val",
+        "-badkey=val",
+        "app=-badval",
+        "priority>",
+        "priority>abc",
+        "priority>-1",
+        "app foo",
+        "!",
+    ] {
+        let mut cfg: KubernetesSdConfig = serde_json::from_value(serde_json::json!({
+            "role": "pod",
+            "selectors": [{ "role": "pod", "label": invalid_label }]
+        }))
+        .unwrap();
+        assert!(
+            cfg.validate().is_err(),
+            "expected invalid label selector {invalid_label:?} to fail validation"
+        );
+    }
+
     // Valid pod config with pod + node selectors, TLS, and custom header.
     let mut cfg = KubernetesSdConfig {
         api_server: Some("https://127.0.0.1:6443".to_owned()),

@@ -347,6 +347,9 @@ impl KubernetesSdConfig {
             if !selector.field.is_empty() {
                 validate_k8s_field_selector(&selector.field)?;
             }
+            if !selector.label.is_empty() {
+                validate_k8s_label_selector(&selector.label)?;
+            }
         }
 
         Ok(())
@@ -1239,6 +1242,320 @@ fn validate_k8s_field_selector(selector: &str) -> Result<(), DiscoveryError> {
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LabelToken<'a> {
+    End,
+    ClosedPar,
+    Comma,
+    DoesNotExist,
+    DoubleEquals,
+    Equals,
+    GreaterThan,
+    Identifier(&'a str),
+    In,
+    LessThan,
+    NotEquals,
+    NotIn,
+    OpenPar,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LabelParserCtx {
+    KeyAndOperator,
+    Values,
+}
+
+struct LabelSelectorParser<'a> {
+    tokens: Vec<(LabelToken<'a>, &'a str)>,
+    pos: usize,
+}
+
+impl<'a> LabelSelectorParser<'a> {
+    fn new(input: &'a str) -> Self {
+        let mut tokens = Vec::new();
+        let bytes = input.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            let (tok, lit, len) = match bytes[i] {
+                b'=' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => {
+                    (LabelToken::DoubleEquals, "==", 2)
+                }
+                b'!' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => {
+                    (LabelToken::NotEquals, "!=", 2)
+                }
+                b'=' => (LabelToken::Equals, "=", 1),
+                b'!' => (LabelToken::DoesNotExist, "!", 1),
+                b'(' => (LabelToken::OpenPar, "(", 1),
+                b')' => (LabelToken::ClosedPar, ")", 1),
+                b',' => (LabelToken::Comma, ",", 1),
+                b'>' => (LabelToken::GreaterThan, ">", 1),
+                b'<' => (LabelToken::LessThan, "<", 1),
+                _ => {
+                    let start = i;
+                    while i < bytes.len()
+                        && !matches!(
+                            bytes[i],
+                            b' ' | b'\t'
+                                | b'\r'
+                                | b'\n'
+                                | b'='
+                                | b'!'
+                                | b'('
+                                | b')'
+                                | b','
+                                | b'>'
+                                | b'<'
+                        )
+                    {
+                        i += 1;
+                    }
+                    let lit = &input[start..i];
+                    let tok = match lit {
+                        "in" => LabelToken::In,
+                        "notin" => LabelToken::NotIn,
+                        _ => LabelToken::Identifier(lit),
+                    };
+                    tokens.push((tok, lit));
+                    continue;
+                }
+            };
+            tokens.push((tok, lit));
+            i += len;
+        }
+        tokens.push((LabelToken::End, ""));
+        Self { tokens, pos: 0 }
+    }
+
+    fn peek(&self, ctx: LabelParserCtx) -> (LabelToken<'a>, &'a str) {
+        let (tok, lit) = self.tokens[self.pos];
+        if ctx == LabelParserCtx::Values && matches!(tok, LabelToken::In | LabelToken::NotIn) {
+            (LabelToken::Identifier(lit), lit)
+        } else {
+            (tok, lit)
+        }
+    }
+
+    fn consume(&mut self, ctx: LabelParserCtx) -> (LabelToken<'a>, &'a str) {
+        let res = self.peek(ctx);
+        if self.pos + 1 < self.tokens.len() {
+            self.pos += 1;
+        }
+        res
+    }
+
+    fn parse(&mut self) -> Result<(), DiscoveryError> {
+        loop {
+            let (tok, lit) = self.peek(LabelParserCtx::Values);
+            match tok {
+                LabelToken::Identifier(_) | LabelToken::DoesNotExist => {
+                    self.parse_requirement()?;
+                    let (t, l) = self.consume(LabelParserCtx::Values);
+                    match t {
+                        LabelToken::End => return Ok(()),
+                        LabelToken::Comma => {
+                            let (t2, l2) = self.peek(LabelParserCtx::Values);
+                            if !matches!(t2, LabelToken::Identifier(_) | LabelToken::DoesNotExist) {
+                                return Err(DiscoveryError::InvalidConfig(format!(
+                                    "found '{l2}', expected: identifier after ','"
+                                )));
+                            }
+                        }
+                        _ => {
+                            return Err(DiscoveryError::InvalidConfig(format!(
+                                "found '{l}', expected: ',' or 'end of string'"
+                            )));
+                        }
+                    }
+                }
+                LabelToken::End => return Ok(()),
+                _ => {
+                    return Err(DiscoveryError::InvalidConfig(format!(
+                        "found '{lit}', expected: !, identifier, or 'end of string'"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn parse_requirement(&mut self) -> Result<(), DiscoveryError> {
+        let (mut tok, mut lit) = self.consume(LabelParserCtx::Values);
+        let is_not = tok == LabelToken::DoesNotExist;
+        if is_not {
+            (tok, lit) = self.consume(LabelParserCtx::Values);
+        }
+        let LabelToken::Identifier(key) = tok else {
+            return Err(DiscoveryError::InvalidConfig(format!(
+                "unable to parse requirement: found '{lit}', expected: identifier"
+            )));
+        };
+        if !is_valid_k8s_label_key(key) {
+            return Err(DiscoveryError::InvalidConfig(format!(
+                "unable to parse requirement: invalid label key {key:?}"
+            )));
+        }
+        if is_not
+            || matches!(
+                self.peek(LabelParserCtx::Values).0,
+                LabelToken::End | LabelToken::Comma
+            )
+        {
+            return Ok(());
+        }
+
+        let (op_tok, op_lit) = self.consume(LabelParserCtx::KeyAndOperator);
+        match op_tok {
+            LabelToken::In | LabelToken::NotIn => self.parse_set_values(),
+            LabelToken::Equals | LabelToken::DoubleEquals | LabelToken::NotEquals => {
+                let val = self.parse_exact_value()?;
+                validate_k8s_label_value(val)
+            }
+            LabelToken::GreaterThan | LabelToken::LessThan => {
+                let val = self.parse_exact_value()?;
+                if val.parse::<i64>().is_err() {
+                    return Err(DiscoveryError::InvalidConfig(format!(
+                        "unable to parse requirement: for '{op_lit}' operator, value {val:?} must be an integer"
+                    )));
+                }
+                validate_k8s_label_value(val)
+            }
+            _ => Err(DiscoveryError::InvalidConfig(format!(
+                "unable to parse requirement: found '{op_lit}', expected: in, notin, =, ==, !=, >, <"
+            ))),
+        }
+    }
+
+    fn parse_set_values(&mut self) -> Result<(), DiscoveryError> {
+        let (tok, lit) = self.consume(LabelParserCtx::Values);
+        if tok != LabelToken::OpenPar {
+            return Err(DiscoveryError::InvalidConfig(format!(
+                "unable to parse requirement: found '{lit}', expected: '('"
+            )));
+        }
+        let (tok, lit) = self.peek(LabelParserCtx::Values);
+        match tok {
+            LabelToken::ClosedPar => {
+                self.consume(LabelParserCtx::Values);
+                Ok(())
+            }
+            LabelToken::Identifier(_) | LabelToken::Comma => {
+                loop {
+                    let (t, l) = self.consume(LabelParserCtx::Values);
+                    match t {
+                        LabelToken::Identifier(val) => {
+                            validate_k8s_label_value(val)?;
+                            let (t2, l2) = self.peek(LabelParserCtx::Values);
+                            match t2 {
+                                LabelToken::Comma => continue,
+                                LabelToken::ClosedPar => break,
+                                _ => {
+                                    return Err(DiscoveryError::InvalidConfig(format!(
+                                        "unable to parse requirement: found '{l2}', expected: ',' or ')'"
+                                    )));
+                                }
+                            }
+                        }
+                        LabelToken::Comma => {
+                            if self.peek(LabelParserCtx::Values).0 == LabelToken::ClosedPar {
+                                break;
+                            }
+                        }
+                        _ => {
+                            return Err(DiscoveryError::InvalidConfig(format!(
+                                "unable to parse requirement: found '{l}', expected: ',', or identifier"
+                            )));
+                        }
+                    }
+                }
+                let (close_tok, close_lit) = self.consume(LabelParserCtx::Values);
+                if close_tok != LabelToken::ClosedPar {
+                    return Err(DiscoveryError::InvalidConfig(format!(
+                        "unable to parse requirement: found '{close_lit}', expected: ')'"
+                    )));
+                }
+                Ok(())
+            }
+            _ => Err(DiscoveryError::InvalidConfig(format!(
+                "unable to parse requirement: found '{lit}', expected: ',', ')' or identifier"
+            ))),
+        }
+    }
+
+    fn parse_exact_value(&mut self) -> Result<&'a str, DiscoveryError> {
+        if matches!(
+            self.peek(LabelParserCtx::Values).0,
+            LabelToken::End | LabelToken::Comma
+        ) {
+            return Ok("");
+        }
+        let (tok, lit) = self.consume(LabelParserCtx::Values);
+        if let LabelToken::Identifier(val) = tok {
+            Ok(val)
+        } else {
+            Err(DiscoveryError::InvalidConfig(format!(
+                "unable to parse requirement: found '{lit}', expected: identifier"
+            )))
+        }
+    }
+}
+
+/// Validates a Kubernetes label selector matching `k8s.io/apimachinery/pkg/labels.Parse`.
+fn validate_k8s_label_selector(selector: &str) -> Result<(), DiscoveryError> {
+    LabelSelectorParser::new(selector).parse()
+}
+
+fn is_ascii_lower_alnum(b: u8) -> bool {
+    b.is_ascii_lowercase() || b.is_ascii_digit()
+}
+
+fn is_valid_dns_subdomain(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && s.split('.').all(|label| {
+            let b = label.as_bytes();
+            !b.is_empty()
+                && is_ascii_lower_alnum(b[0])
+                && is_ascii_lower_alnum(b[b.len() - 1])
+                && b.iter().all(|&c| is_ascii_lower_alnum(c) || c == b'-')
+        })
+}
+
+fn is_valid_k8s_label_name_part(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b.len() <= 63
+        && b[0].is_ascii_alphanumeric()
+        && b[b.len() - 1].is_ascii_alphanumeric()
+        && b.iter()
+            .all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+}
+
+fn is_valid_k8s_label_key(key: &str) -> bool {
+    match key.split_once('/') {
+        Some((prefix, name)) => {
+            !name.contains('/')
+                && is_valid_dns_subdomain(prefix)
+                && is_valid_k8s_label_name_part(name)
+        }
+        None => is_valid_k8s_label_name_part(key),
+    }
+}
+
+fn validate_k8s_label_value(val: &str) -> Result<(), DiscoveryError> {
+    if val.is_empty() || is_valid_k8s_label_name_part(val) {
+        Ok(())
+    } else {
+        Err(DiscoveryError::InvalidConfig(format!(
+            "unable to parse requirement: invalid label value {val:?}"
+        )))
+    }
 }
 
 /// Formats `host` and `port` as `host:port`, bracketing IPv6 literals to match Go `net.JoinHostPort`.
