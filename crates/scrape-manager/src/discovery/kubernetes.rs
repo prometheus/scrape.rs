@@ -1767,7 +1767,9 @@ fn build_resource_url(
         path_segs.pop_if_empty();
         path_segs.extend(segments);
     }
-    if let Some(sel) = selector {
+    if let Some(sel) = selector
+        && (!sel.label.is_empty() || !sel.field.is_empty())
+    {
         let mut pairs = url.query_pairs_mut();
         if !sel.label.is_empty() {
             pairs.append_pair("labelSelector", &sel.label);
@@ -1808,6 +1810,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(without_sel.as_str(), "https://k8s.local/api/v1/pods");
+
+        let empty_sel = KubernetesSelectorConfig {
+            role: Some(KubernetesRole::Pod),
+            label: String::new(),
+            field: String::new(),
+        };
+        let with_empty_sel = build_resource_url(
+            "https://k8s.local",
+            &["api", "v1", "pods"],
+            Some(&empty_sel),
+        )
+        .unwrap();
+        assert_eq!(with_empty_sel.as_str(), "https://k8s.local/api/v1/pods");
+        assert_eq!(with_empty_sel.query(), None);
+
+        let field_only_sel = KubernetesSelectorConfig {
+            role: Some(KubernetesRole::Pod),
+            label: String::new(),
+            field: "status.phase=Running".to_owned(),
+        };
+        let with_field_only = build_resource_url(
+            "https://k8s.local",
+            &["api", "v1", "pods"],
+            Some(&field_only_sel),
+        )
+        .unwrap();
+        assert_eq!(
+            with_field_only.as_str(),
+            "https://k8s.local/api/v1/pods?fieldSelector=status.phase%3DRunning"
+        );
     }
 
     #[test]
