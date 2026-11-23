@@ -811,7 +811,7 @@ async fn kubernetes_pod_discovery_reqwest_end_to_end() {
                 );
 
                 let body = if first_line.starts_with(
-                    "GET /api/v1/namespaces/monitoring/pods?labelSelector=app%3Dmetrics&fieldSelector=status.phase%3DRunning ",
+                    "GET /api/v1/namespaces/monitoring/pods?labelSelector=app%3Dmetrics&fieldSelector=status.phase%3DRunning&resourceVersion=0 ",
                 ) {
                     r#"{
                         "items": [{
@@ -850,7 +850,9 @@ async fn kubernetes_pod_discovery_reqwest_end_to_end() {
                             }
                         }]
                     }"#
-                } else if first_line.starts_with("GET /api/v1/nodes?labelSelector=role%3Dworker ") {
+                } else if first_line.starts_with(
+                    "GET /api/v1/nodes?labelSelector=role%3Dworker&resourceVersion=0 ",
+                ) {
                     r#"{
                         "items": [{
                             "metadata": {
@@ -859,9 +861,9 @@ async fn kubernetes_pod_discovery_reqwest_end_to_end() {
                             }
                         }]
                     }"#
-                } else if first_line
-                    .starts_with("GET /apis/apps/v1/namespaces/monitoring/replicasets ")
-                {
+                } else if first_line.starts_with(
+                    "GET /apis/apps/v1/namespaces/monitoring/replicasets?resourceVersion=0 ",
+                ) {
                     r#"{
                         "items": [{
                             "metadata": {
@@ -1016,31 +1018,37 @@ fn https_mtls_all_namespaces_404_tolerance_and_localset_execution() {
                         "missing file header in:\n{req_str}"
                     );
 
-                    let (status, body) = if first_line.starts_with("GET /api/v1/pods ") {
+                    let (status, body) = if first_line
+                        .starts_with("GET /api/v1/pods?resourceVersion=0 ")
+                    {
                         (
                             "200 OK",
                             r#"{"items":[{"metadata":{"name":"job-pod","namespace":"batch-ns","ownerReferences":[{"kind":"Job","name":"job-1","controller":true}]},"spec":{"containers":[{"name":"worker","image":"worker:1","ports":[{"containerPort":9091,"protocol":"TCP"}]}]},"status":{"phase":"Running","podIP":"10.9.0.2"}}]}"#,
                         )
-                    } else if first_line.starts_with("GET /api/v1/namespaces ") {
+                    } else if first_line.starts_with("GET /api/v1/namespaces?resourceVersion=0 ") {
                         (
                             "200 OK",
                             r#"{"items":[{"metadata":{"name":"batch-ns","labels":{"tier":"batch"}}}]}"#,
                         )
-                    } else if first_line.starts_with("GET /apis/batch/v1/jobs ") {
+                    } else if first_line.starts_with("GET /apis/batch/v1/jobs?resourceVersion=0 ") {
                         (
                             "200 OK",
                             r#"{"items":[{"metadata":{"name":"job-1","namespace":"batch-ns","ownerReferences":[{"kind":"CronJob","name":"nightly","controller":true}]}}]}"#,
                         )
                     } else if first_line.starts_with("GET /api/v1/namespaces/missing-ns ") {
                         ("404 Not Found", r#"{"status":"Failure","code":404}"#)
-                    } else if first_line.starts_with("GET /api/v1/namespaces/missing-ns/pods ") {
+                    } else if first_line
+                        .starts_with("GET /api/v1/namespaces/missing-ns/pods?resourceVersion=0 ")
+                    {
                         ("200 OK", r#"{"items":null}"#)
                     } else if first_line.starts_with("GET /api/v1/namespaces/batch-ns ") {
                         (
                             "200 OK",
                             r#"{"metadata":{"name":"batch-ns","labels":{"tier":"batch"}}}"#,
                         )
-                    } else if first_line.starts_with("GET /api/v1/namespaces/batch-ns/pods ") {
+                    } else if first_line
+                        .starts_with("GET /api/v1/namespaces/batch-ns/pods?resourceVersion=0 ")
+                    {
                         (
                             "200 OK",
                             r#"{"items":[{"metadata":{"name":"job-pod","namespace":"batch-ns"},"spec":{"containers":[{"name":"worker","image":"worker:1","ports":null}]},"status":{"phase":"Running","podIP":"10.9.0.2"}}]}"#,
@@ -1174,7 +1182,8 @@ async fn kubernetes_pod_discovery_enforces_per_request_timeout() {
                 }
                 let req_str = String::from_utf8_lossy(&req_buf[..n]);
                 let first_line = req_str.lines().next().unwrap_or("");
-                if first_line.starts_with("GET /api/v1/namespaces/slow-ns/pods ") {
+                if first_line.starts_with("GET /api/v1/namespaces/slow-ns/pods?resourceVersion=0 ")
+                {
                     let body = r#"{"items":[]}"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

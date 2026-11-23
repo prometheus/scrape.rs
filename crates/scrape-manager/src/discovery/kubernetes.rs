@@ -999,12 +999,12 @@ impl KubernetesPodDiscovery {
 
         let mut all_pods = Vec::new();
         if namespaces.is_empty() {
-            let url = build_resource_url(&base_url, &["api", "v1", "pods"], pod_selector)?;
+            let url = build_list_url(&base_url, &["api", "v1", "pods"], pod_selector)?;
             let list: PodList = self.get_json(&client, url, &effective_http).await?;
             all_pods.extend(list.items);
         } else {
             for ns in &namespaces {
-                let url = build_resource_url(
+                let url = build_list_url(
                     &base_url,
                     &["api", "v1", "namespaces", ns, "pods"],
                     pod_selector,
@@ -1018,7 +1018,7 @@ impl KubernetesPodDiscovery {
         let attach = &self.config.attach_metadata;
 
         if attach.node {
-            let url = build_resource_url(&base_url, &["api", "v1", "nodes"], node_selector)?;
+            let url = build_list_url(&base_url, &["api", "v1", "nodes"], node_selector)?;
             let list: NodeList = self.get_json(&client, url, &effective_http).await?;
             for node in list.items {
                 metadata.nodes.insert(node.metadata.name.clone(), node);
@@ -1027,7 +1027,7 @@ impl KubernetesPodDiscovery {
 
         if attach.namespace {
             if namespaces.is_empty() {
-                let url = build_resource_url(&base_url, &["api", "v1", "namespaces"], None)?;
+                let url = build_list_url(&base_url, &["api", "v1", "namespaces"], None)?;
                 let list: NamespaceList = self.get_json(&client, url, &effective_http).await?;
                 for ns in list.items {
                     metadata.namespaces.insert(ns.metadata.name.clone(), ns);
@@ -1048,8 +1048,7 @@ impl KubernetesPodDiscovery {
 
         if attach.deployment {
             if namespaces.is_empty() {
-                let url =
-                    build_resource_url(&base_url, &["apis", "apps", "v1", "replicasets"], None)?;
+                let url = build_list_url(&base_url, &["apis", "apps", "v1", "replicasets"], None)?;
                 let list: ReplicaSetList = self.get_json(&client, url, &effective_http).await?;
                 for rs in list.items {
                     metadata.replicasets.insert(
@@ -1059,7 +1058,7 @@ impl KubernetesPodDiscovery {
                 }
             } else {
                 for ns in &namespaces {
-                    let url = build_resource_url(
+                    let url = build_list_url(
                         &base_url,
                         &["apis", "apps", "v1", "namespaces", ns, "replicasets"],
                         None,
@@ -1077,7 +1076,7 @@ impl KubernetesPodDiscovery {
 
         if attach.cronjob {
             if namespaces.is_empty() {
-                let url = build_resource_url(&base_url, &["apis", "batch", "v1", "jobs"], None)?;
+                let url = build_list_url(&base_url, &["apis", "batch", "v1", "jobs"], None)?;
                 let list: JobList = self.get_json(&client, url, &effective_http).await?;
                 for job in list.items {
                     metadata.jobs.insert(
@@ -1087,7 +1086,7 @@ impl KubernetesPodDiscovery {
                 }
             } else {
                 for ns in &namespaces {
-                    let url = build_resource_url(
+                    let url = build_list_url(
                         &base_url,
                         &["apis", "batch", "v1", "namespaces", ns, "jobs"],
                         None,
@@ -1781,6 +1780,18 @@ fn build_resource_url(
     Ok(url)
 }
 
+/// Builds a Kubernetes LIST request URL with `resourceVersion=0` so the API server answers from
+/// its watch cache instead of performing a quorum read from etcd on every discovery poll.
+fn build_list_url(
+    base_url: &str,
+    segments: &[&str],
+    selector: Option<&KubernetesSelectorConfig>,
+) -> Result<reqwest::Url, DiscoveryError> {
+    let mut url = build_resource_url(base_url, segments, selector)?;
+    url.query_pairs_mut().append_pair("resourceVersion", "0");
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1839,6 +1850,20 @@ mod tests {
         assert_eq!(
             with_field_only.as_str(),
             "https://k8s.local/api/v1/pods?fieldSelector=status.phase%3DRunning"
+        );
+
+        let list_no_sel =
+            build_list_url("https://k8s.local", &["api", "v1", "pods"], None).unwrap();
+        assert_eq!(
+            list_no_sel.as_str(),
+            "https://k8s.local/api/v1/pods?resourceVersion=0"
+        );
+
+        let list_with_sel =
+            build_list_url("https://k8s.local", &["api", "v1", "pods"], Some(&sel)).unwrap();
+        assert_eq!(
+            list_with_sel.as_str(),
+            "https://k8s.local/api/v1/pods?labelSelector=app%3Dweb&resourceVersion=0"
         );
     }
 
