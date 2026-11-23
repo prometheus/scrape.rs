@@ -496,10 +496,12 @@ fn kubernetes_model_and_validation_edge_cases() {
         serde_json::from_str(r#"{"role": "pod", "api_server": "kubernetes:443"}"#).unwrap();
     host_port_api.validate().unwrap();
     assert!(KubernetesPodDiscovery::new(host_port_api).is_err());
-    let mut bad_query: KubernetesSdConfig =
-        serde_json::from_str(r#"{"role": "pod", "api_server": "https://k8s.local?watch=true"}"#)
-            .unwrap();
-    assert!(bad_query.validate().is_err());
+    let mut api_with_query: KubernetesSdConfig = serde_json::from_str(
+        r#"{"role": "pod", "api_server": "https://k8s.local?watch=true#frag"}"#,
+    )
+    .unwrap();
+    api_with_query.validate().unwrap();
+    KubernetesPodDiscovery::new(api_with_query).unwrap();
     let mut bad_ns: KubernetesSdConfig =
         serde_json::from_str(r#"{"role": "pod", "namespaces": {"names": ["default?watch=true"]}}"#)
             .unwrap();

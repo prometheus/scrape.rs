@@ -21,7 +21,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::http_config::{HttpClientConfig, deserialize_string_or_scalar, join_dir};
+use crate::http_config::{
+    HttpClientConfig, deserialize_string_or_scalar, join_dir, validate_go_url,
+};
 
 use super::{
     ADDRESS_LABEL, DiscoveryError, LabelSet, TargetGroup, deserialize_null_default, is_false,
@@ -287,16 +289,7 @@ impl KubernetesSdConfig {
             self.api_server = None;
         }
         if let Some(api_server) = &self.api_server {
-            if let Ok(parsed) = reqwest::Url::parse(api_server) {
-                if parsed.query().is_some() || parsed.fragment().is_some() {
-                    return Err(DiscoveryError::InvalidConfig(format!(
-                        "api_server URL {api_server:?} must not contain query parameters or fragments"
-                    )));
-                }
-            } else {
-                crate::http_config::validate_go_url(api_server)
-                    .map_err(DiscoveryError::InvalidConfig)?;
-            }
+            validate_go_url(api_server).map_err(DiscoveryError::InvalidConfig)?;
         }
 
         for ns in &self.namespaces.names {
@@ -1123,7 +1116,7 @@ impl KubernetesPodDiscovery {
                 None => self.config.http_client_config.build_client()?,
             };
             return Ok((
-                api_server.trim_end_matches('/').to_owned(),
+                api_server.clone(),
                 client,
                 self.config.http_client_config.clone(),
             ));
@@ -1326,6 +1319,11 @@ fn build_resource_url(
             url.scheme()
         )));
     }
+    // Strip any query or fragment carried by `api_server` before appending selector query pairs
+    // because `query_pairs_mut().append_pair` appends rather than overwriting, matching `client-go`
+    // `Request.URL()`.
+    url.set_query(None);
+    url.set_fragment(None);
     {
         let mut path_segs = url.path_segments_mut().map_err(|()| {
             DiscoveryError::InvalidConfig(format!(
@@ -1350,6 +1348,33 @@ fn build_resource_url(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_resource_url_strips_base_query_and_fragment() {
+        let sel = KubernetesSelectorConfig {
+            role: Some(KubernetesRole::Pod),
+            label: "app=web".to_owned(),
+            field: String::new(),
+        };
+        let with_sel = build_resource_url(
+            "https://k8s.local/prefix/?watch=true#frag",
+            &["api", "v1", "pods"],
+            Some(&sel),
+        )
+        .unwrap();
+        assert_eq!(
+            with_sel.as_str(),
+            "https://k8s.local/prefix/api/v1/pods?labelSelector=app%3Dweb"
+        );
+
+        let without_sel = build_resource_url(
+            "https://k8s.local/?watch=true#frag",
+            &["api", "v1", "pods"],
+            None,
+        )
+        .unwrap();
+        assert_eq!(without_sel.as_str(), "https://k8s.local/api/v1/pods");
+    }
 
     #[test]
     fn resolve_namespaces_rejects_empty_own_namespace_file() {
