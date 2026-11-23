@@ -1045,6 +1045,11 @@ impl KubernetesPodDiscovery {
 
     /// Queries the Kubernetes API server over HTTP(S) using `reqwest` and returns the discovered
     /// pod [`TargetGroup`]s.
+    ///
+    /// Unlike Prometheus Go (which runs a separate informer per namespace in `Discovery.Run`),
+    /// `discover` returns a single snapshot `Result` and fails fast if any configured namespace
+    /// query errors so callers can surface RBAC/API errors and keep their last known-good targets
+    /// instead of silently dropping targets from a failing namespace.
     pub async fn discover(&self) -> Result<Vec<TargetGroup>, DiscoveryError> {
         let (base_url, client, effective_http) = self.resolve_endpoint_and_auth()?;
         let namespaces = self.resolve_namespaces()?;
