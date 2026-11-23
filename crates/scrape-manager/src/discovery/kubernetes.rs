@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -24,7 +25,8 @@ use std::time::Duration;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::http_config::{
-    HttpClientConfig, deserialize_string_or_scalar, join_dir, validate_go_url,
+    HttpClientConfig, deserialize_string_or_scalar, join_dir, redact_url, serialize_opt_url,
+    validate_go_url,
 };
 
 use super::{
@@ -239,11 +241,16 @@ impl KubernetesAttachMetadataConfig {
 }
 
 /// Kubernetes service discovery configuration matching Prometheus `kubernetes.SDConfig`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// [`fmt::Debug`] and [`serde::Serialize`] redact passwords embedded in `api_server` to `"xxxxx"`.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KubernetesSdConfig {
     /// Kubernetes API server URL. If omitted, in-cluster environment variables are used.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_opt_url"
+    )]
     pub api_server: Option<String>,
     /// Kubernetes discovery role (`"pod"`, `"service"`, `"endpoints"`, `"endpointslice"`,
     /// `"node"`, or `"ingress"`).
@@ -270,6 +277,21 @@ pub struct KubernetesSdConfig {
     /// Additional metadata attachment flags.
     #[serde(skip_serializing_if = "KubernetesAttachMetadataConfig::is_empty")]
     pub attach_metadata: KubernetesAttachMetadataConfig,
+}
+
+impl fmt::Debug for KubernetesSdConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted_api_server = self.api_server.as_deref().map(redact_url);
+        f.debug_struct("KubernetesSdConfig")
+            .field("api_server", &redacted_api_server)
+            .field("role", &self.role)
+            .field("kubeconfig_file", &self.kubeconfig_file)
+            .field("http_client_config", &self.http_client_config)
+            .field("namespaces", &self.namespaces)
+            .field("selectors", &self.selectors)
+            .field("attach_metadata", &self.attach_metadata)
+            .finish()
+    }
 }
 
 impl KubernetesSdConfig {
@@ -1628,7 +1650,10 @@ fn validate_pod_runner_config(config: &mut KubernetesSdConfig) -> Result<(), Dis
     }
     if let Some(api_server) = &config.api_server {
         let parsed = reqwest::Url::parse(api_server).map_err(|e| {
-            DiscoveryError::InvalidConfig(format!("invalid api_server URL {api_server:?}: {e}"))
+            DiscoveryError::InvalidConfig(format!(
+                "invalid api_server URL {:?}: {e}",
+                redact_url(api_server)
+            ))
         })?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(DiscoveryError::InvalidConfig(format!(
@@ -1638,7 +1663,8 @@ fn validate_pod_runner_config(config: &mut KubernetesSdConfig) -> Result<(), Dis
         }
         if parsed.cannot_be_a_base() {
             return Err(DiscoveryError::InvalidConfig(format!(
-                "Kubernetes base URL {api_server:?} cannot be a base"
+                "Kubernetes base URL {:?} cannot be a base",
+                redact_url(api_server)
             )));
         }
     }
@@ -1651,7 +1677,10 @@ fn build_resource_url(
     selector: Option<&KubernetesSelectorConfig>,
 ) -> Result<reqwest::Url, DiscoveryError> {
     let mut url = reqwest::Url::parse(base_url).map_err(|e| {
-        DiscoveryError::InvalidConfig(format!("invalid Kubernetes base URL {base_url:?}: {e}"))
+        DiscoveryError::InvalidConfig(format!(
+            "invalid Kubernetes base URL {:?}: {e}",
+            redact_url(base_url)
+        ))
     })?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(DiscoveryError::InvalidConfig(format!(
@@ -1667,7 +1696,8 @@ fn build_resource_url(
     {
         let mut path_segs = url.path_segments_mut().map_err(|()| {
             DiscoveryError::InvalidConfig(format!(
-                "Kubernetes base URL {base_url:?} cannot be a base"
+                "Kubernetes base URL {:?} cannot be a base",
+                redact_url(base_url)
             ))
         })?;
         path_segs.pop_if_empty();

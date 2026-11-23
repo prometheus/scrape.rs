@@ -1629,7 +1629,7 @@ fn redact_authority_password(raw: &str, authority_start: usize) -> Option<String
     Some(format!("{prefix}xxxxx{suffix}"))
 }
 
-fn redact_url(raw: &str) -> String {
+pub(crate) fn redact_url(raw: &str) -> String {
     let authority_start = raw
         .find("://")
         .filter(|&idx| is_valid_url_scheme(&raw[..idx]))
@@ -1667,7 +1667,7 @@ fn redact_url(raw: &str) -> String {
     raw.to_owned()
 }
 
-fn serialize_opt_url<S: Serializer>(
+pub(crate) fn serialize_opt_url<S: Serializer>(
     url: &Option<String>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {

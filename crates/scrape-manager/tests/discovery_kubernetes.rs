@@ -559,6 +559,45 @@ fn kubernetes_model_and_validation_edge_cases() {
         serde_json::from_str(r#"{"role": "pod", "api_server": "kubernetes:443"}"#).unwrap();
     host_port_api.validate().unwrap();
     assert!(KubernetesPodDiscovery::new(host_port_api).is_err());
+    // api_server credentials are redacted in Debug, Serialize, and runner URL errors.
+    let secret_cfg: KubernetesSdConfig = serde_json::from_str(
+        r#"{"role": "pod", "api_server": "https://prom:k8s-secret@k8s.local:6443"}"#,
+    )
+    .unwrap();
+    let cfg_debug = format!("{secret_cfg:?}");
+    let cfg_json = serde_json::to_string(&secret_cfg).unwrap();
+    assert!(
+        !cfg_debug.contains("k8s-secret"),
+        "leaked in Debug: {cfg_debug}"
+    );
+    assert!(cfg_debug.contains("https://prom:xxxxx@k8s.local:6443"));
+    assert!(
+        !cfg_json.contains("k8s-secret"),
+        "leaked in JSON: {cfg_json}"
+    );
+    assert!(cfg_json.contains("https://prom:xxxxx@k8s.local:6443"));
+    let secret_disc = KubernetesPodDiscovery::new(secret_cfg).unwrap();
+    let disc_debug = format!("{secret_disc:?}");
+    assert!(
+        !disc_debug.contains("k8s-secret"),
+        "leaked in discovery Debug: {disc_debug}"
+    );
+    let bad_cred_cfg: KubernetesSdConfig = serde_json::from_str(
+        r#"{"role": "pod", "api_server": "user_1:k8s-secret@k8s.local:6443"}"#,
+    )
+    .unwrap();
+    let bad_cred_err = KubernetesPodDiscovery::new(bad_cred_cfg)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !bad_cred_err.contains("k8s-secret"),
+        "leaked password in runner URL error: {bad_cred_err}"
+    );
+    assert!(
+        bad_cred_err.contains("xxxxx"),
+        "expected redacted URL in error: {bad_cred_err}"
+    );
+
     let mut api_with_query: KubernetesSdConfig = serde_json::from_str(
         r#"{"role": "pod", "api_server": "https://k8s.local?watch=true#frag"}"#,
     )
