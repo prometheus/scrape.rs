@@ -118,12 +118,26 @@ fn kubernetes_sd_config_validation_matches_prometheus() {
         "duplicated selector role: pod"
     );
 
-    // Disallowed selector role for pod.
+    // Disallowed selector role for pod (including omitted selector role, matching Go).
     let mut cfg: KubernetesSdConfig = serde_json::from_str(
         r#"{
             "role": "pod",
             "selectors": [
                 { "role": "service", "label": "app=web" }
+            ]
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.validate().unwrap_err().to_string(),
+        "pod role supports only pod, node selectors"
+    );
+
+    let mut cfg: KubernetesSdConfig = serde_json::from_str(
+        r#"{
+            "role": "pod",
+            "selectors": [
+                { "label": "app=web" }
             ]
         }"#,
     )

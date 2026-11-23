@@ -330,7 +330,7 @@ impl KubernetesSdConfig {
         for selector in &self.selectors {
             let Some(sel_role) = selector.role else {
                 return Err(DiscoveryError::InvalidConfig(
-                    "role missing in selector (one of: pod, service, endpoints, endpointslice, node, ingress)".to_owned(),
+                    role.allowed_selector_error_msg().to_owned(),
                 ));
             };
             if !seen_selector_roles.insert(sel_role) {
