@@ -550,12 +550,25 @@ pub struct Pod {
     pub status: PodStatus,
 }
 
-/// Kubernetes `corev1.PodList` response payload.
+/// Kubernetes `metav1.ListMeta` pagination metadata.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-pub(crate) struct PodList {
-    /// List of pods.
+pub(crate) struct ListMeta {
+    #[serde(
+        rename = "continue",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub continue_token: String,
+}
+
+/// Generic Kubernetes `*List` response payload.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+pub(crate) struct K8sList<T> {
     #[serde(default, deserialize_with = "deserialize_null_default")]
-    pub items: Vec<Pod>,
+    pub metadata: ListMeta,
+    #[serde(default = "Vec::new", deserialize_with = "deserialize_null_default")]
+    pub items: Vec<T>,
 }
 
 /// Kubernetes `corev1.Node` resource.
@@ -567,14 +580,6 @@ pub struct Node {
     pub metadata: ObjectMeta,
 }
 
-/// Kubernetes `corev1.NodeList` response payload.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-pub(crate) struct NodeList {
-    /// List of nodes.
-    #[serde(default, deserialize_with = "deserialize_null_default")]
-    pub items: Vec<Node>,
-}
-
 /// Kubernetes `corev1.Namespace` resource.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -582,14 +587,6 @@ pub struct Namespace {
     /// Standard object metadata.
     #[serde(default)]
     pub metadata: ObjectMeta,
-}
-
-/// Kubernetes `corev1.NamespaceList` response payload.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-pub(crate) struct NamespaceList {
-    /// List of namespaces.
-    #[serde(default, deserialize_with = "deserialize_null_default")]
-    pub items: Vec<Namespace>,
 }
 
 /// Kubernetes `appsv1.ReplicaSet` resource.
@@ -601,14 +598,6 @@ pub struct ReplicaSet {
     pub metadata: ObjectMeta,
 }
 
-/// Kubernetes `appsv1.ReplicaSetList` response payload.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-pub(crate) struct ReplicaSetList {
-    /// List of ReplicaSets.
-    #[serde(default, deserialize_with = "deserialize_null_default")]
-    pub items: Vec<ReplicaSet>,
-}
-
 /// Kubernetes `batchv1.Job` resource.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -616,14 +605,6 @@ pub struct Job {
     /// Standard object metadata.
     #[serde(default)]
     pub metadata: ObjectMeta,
-}
-
-/// Kubernetes `batchv1.JobList` response payload.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-pub(crate) struct JobList {
-    /// List of Jobs.
-    #[serde(default, deserialize_with = "deserialize_null_default")]
-    pub items: Vec<Job>,
 }
 
 /// Auxiliary cluster metadata indexed for `attach_metadata` enrichment during pod discovery.
@@ -999,18 +980,28 @@ impl KubernetesPodDiscovery {
 
         let mut all_pods = Vec::new();
         if namespaces.is_empty() {
-            let url = build_list_url(&base_url, &["api", "v1", "pods"], pod_selector)?;
-            let list: PodList = self.get_json(&client, url, &effective_http).await?;
-            all_pods.extend(list.items);
+            all_pods.extend(
+                self.get_list_items::<Pod>(
+                    &client,
+                    &base_url,
+                    &["api", "v1", "pods"],
+                    pod_selector,
+                    &effective_http,
+                )
+                .await?,
+            );
         } else {
             for ns in &namespaces {
-                let url = build_list_url(
-                    &base_url,
-                    &["api", "v1", "namespaces", ns, "pods"],
-                    pod_selector,
-                )?;
-                let list: PodList = self.get_json(&client, url, &effective_http).await?;
-                all_pods.extend(list.items);
+                all_pods.extend(
+                    self.get_list_items::<Pod>(
+                        &client,
+                        &base_url,
+                        &["api", "v1", "namespaces", ns, "pods"],
+                        pod_selector,
+                        &effective_http,
+                    )
+                    .await?,
+                );
             }
         }
 
@@ -1018,18 +1009,32 @@ impl KubernetesPodDiscovery {
         let attach = &self.config.attach_metadata;
 
         if attach.node {
-            let url = build_list_url(&base_url, &["api", "v1", "nodes"], node_selector)?;
-            let list: NodeList = self.get_json(&client, url, &effective_http).await?;
-            for node in list.items {
+            for node in self
+                .get_list_items::<Node>(
+                    &client,
+                    &base_url,
+                    &["api", "v1", "nodes"],
+                    node_selector,
+                    &effective_http,
+                )
+                .await?
+            {
                 metadata.nodes.insert(node.metadata.name.clone(), node);
             }
         }
 
         if attach.namespace {
             if namespaces.is_empty() {
-                let url = build_list_url(&base_url, &["api", "v1", "namespaces"], None)?;
-                let list: NamespaceList = self.get_json(&client, url, &effective_http).await?;
-                for ns in list.items {
+                for ns in self
+                    .get_list_items::<Namespace>(
+                        &client,
+                        &base_url,
+                        &["api", "v1", "namespaces"],
+                        None,
+                        &effective_http,
+                    )
+                    .await?
+                {
                     metadata.namespaces.insert(ns.metadata.name.clone(), ns);
                 }
             } else {
@@ -1048,9 +1053,16 @@ impl KubernetesPodDiscovery {
 
         if attach.deployment {
             if namespaces.is_empty() {
-                let url = build_list_url(&base_url, &["apis", "apps", "v1", "replicasets"], None)?;
-                let list: ReplicaSetList = self.get_json(&client, url, &effective_http).await?;
-                for rs in list.items {
+                for rs in self
+                    .get_list_items::<ReplicaSet>(
+                        &client,
+                        &base_url,
+                        &["apis", "apps", "v1", "replicasets"],
+                        None,
+                        &effective_http,
+                    )
+                    .await?
+                {
                     metadata.replicasets.insert(
                         namespaced_name(&rs.metadata.namespace, &rs.metadata.name),
                         rs,
@@ -1058,13 +1070,16 @@ impl KubernetesPodDiscovery {
                 }
             } else {
                 for ns in &namespaces {
-                    let url = build_list_url(
-                        &base_url,
-                        &["apis", "apps", "v1", "namespaces", ns, "replicasets"],
-                        None,
-                    )?;
-                    let list: ReplicaSetList = self.get_json(&client, url, &effective_http).await?;
-                    for rs in list.items {
+                    for rs in self
+                        .get_list_items::<ReplicaSet>(
+                            &client,
+                            &base_url,
+                            &["apis", "apps", "v1", "namespaces", ns, "replicasets"],
+                            None,
+                            &effective_http,
+                        )
+                        .await?
+                    {
                         metadata.replicasets.insert(
                             namespaced_name(&rs.metadata.namespace, &rs.metadata.name),
                             rs,
@@ -1076,9 +1091,16 @@ impl KubernetesPodDiscovery {
 
         if attach.cronjob {
             if namespaces.is_empty() {
-                let url = build_list_url(&base_url, &["apis", "batch", "v1", "jobs"], None)?;
-                let list: JobList = self.get_json(&client, url, &effective_http).await?;
-                for job in list.items {
+                for job in self
+                    .get_list_items::<Job>(
+                        &client,
+                        &base_url,
+                        &["apis", "batch", "v1", "jobs"],
+                        None,
+                        &effective_http,
+                    )
+                    .await?
+                {
                     metadata.jobs.insert(
                         namespaced_name(&job.metadata.namespace, &job.metadata.name),
                         job,
@@ -1086,13 +1108,16 @@ impl KubernetesPodDiscovery {
                 }
             } else {
                 for ns in &namespaces {
-                    let url = build_list_url(
-                        &base_url,
-                        &["apis", "batch", "v1", "namespaces", ns, "jobs"],
-                        None,
-                    )?;
-                    let list: JobList = self.get_json(&client, url, &effective_http).await?;
-                    for job in list.items {
+                    for job in self
+                        .get_list_items::<Job>(
+                            &client,
+                            &base_url,
+                            &["apis", "batch", "v1", "namespaces", ns, "jobs"],
+                            None,
+                            &effective_http,
+                        )
+                        .await?
+                    {
                         metadata.jobs.insert(
                             namespaced_name(&job.metadata.namespace, &job.metadata.name),
                             job,
@@ -1117,6 +1142,38 @@ impl KubernetesPodDiscovery {
             .header("User-Agent", USER_AGENT)
             .timeout(self.request_timeout);
         Ok(http_cfg.apply_to_request(req)?)
+    }
+
+    async fn get_list_items<T: for<'de> Deserialize<'de>>(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        segments: &[&str],
+        selector: Option<&KubernetesSelectorConfig>,
+        http_cfg: &HttpClientConfig,
+    ) -> Result<Vec<T>, DiscoveryError> {
+        const MAX_LIST_PAGES: usize = 10_000;
+
+        let mut items = Vec::new();
+        let mut continue_token: Option<String> = None;
+        let mut seen_tokens = BTreeSet::new();
+        for _ in 0..MAX_LIST_PAGES {
+            let url = build_list_url(base_url, segments, selector, continue_token.as_deref())?;
+            let page: K8sList<T> = self.get_json(client, url, http_cfg).await?;
+            items.extend(page.items);
+            if page.metadata.continue_token.is_empty() {
+                return Ok(items);
+            }
+            if !seen_tokens.insert(page.metadata.continue_token.clone()) {
+                return Err(DiscoveryError::InvalidConfig(
+                    "Kubernetes list pagination returned a repeated continue token".to_owned(),
+                ));
+            }
+            continue_token = Some(page.metadata.continue_token);
+        }
+        Err(DiscoveryError::InvalidConfig(format!(
+            "Kubernetes list pagination exceeded {MAX_LIST_PAGES} pages"
+        )))
     }
 
     async fn get_json<T: for<'de> Deserialize<'de>>(
@@ -1780,15 +1837,24 @@ fn build_resource_url(
     Ok(url)
 }
 
-/// Builds a Kubernetes LIST request URL with `resourceVersion=0` so the API server answers from
-/// its watch cache instead of performing a quorum read from etcd on every discovery poll.
+/// Builds a Kubernetes LIST request URL.
+///
+/// The first page sends `resourceVersion=0` so the API server answers from its watch cache instead
+/// of performing a quorum read from etcd on every poll. Subsequent pages pass only `continue`
+/// (matching Kubernetes API / `client-go` pager rules, which disallow combining `resourceVersion=0`
+/// with a `continue` token).
 fn build_list_url(
     base_url: &str,
     segments: &[&str],
     selector: Option<&KubernetesSelectorConfig>,
+    continue_token: Option<&str>,
 ) -> Result<reqwest::Url, DiscoveryError> {
     let mut url = build_resource_url(base_url, segments, selector)?;
-    url.query_pairs_mut().append_pair("resourceVersion", "0");
+    if let Some(token) = continue_token {
+        url.query_pairs_mut().append_pair("continue", token);
+    } else {
+        url.query_pairs_mut().append_pair("resourceVersion", "0");
+    }
     Ok(url)
 }
 
@@ -1853,17 +1919,34 @@ mod tests {
         );
 
         let list_no_sel =
-            build_list_url("https://k8s.local", &["api", "v1", "pods"], None).unwrap();
+            build_list_url("https://k8s.local", &["api", "v1", "pods"], None, None).unwrap();
         assert_eq!(
             list_no_sel.as_str(),
             "https://k8s.local/api/v1/pods?resourceVersion=0"
         );
 
-        let list_with_sel =
-            build_list_url("https://k8s.local", &["api", "v1", "pods"], Some(&sel)).unwrap();
+        let list_with_sel = build_list_url(
+            "https://k8s.local",
+            &["api", "v1", "pods"],
+            Some(&sel),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             list_with_sel.as_str(),
             "https://k8s.local/api/v1/pods?labelSelector=app%3Dweb&resourceVersion=0"
+        );
+
+        let list_continued = build_list_url(
+            "https://k8s.local",
+            &["api", "v1", "pods"],
+            Some(&sel),
+            Some("tok-2"),
+        )
+        .unwrap();
+        assert_eq!(
+            list_continued.as_str(),
+            "https://k8s.local/api/v1/pods?labelSelector=app%3Dweb&continue=tok-2"
         );
     }
 
@@ -2069,8 +2152,8 @@ ZCXcq24++2iU8RQHuAIgTvD813EN4j4Wd++SFXpG+evSLLk+fyJse98OIktvI/E=\n\
             });
 
             let url = reqwest::Url::parse(&format!("http://{addr}/api/v1/pods")).unwrap();
-            let _: PodList = disc.get_json(&client1, url.clone(), &eff_http).await.unwrap();
-            let _: PodList = disc.get_json(&client2, url, &eff_http2).await.unwrap();
+            let _: K8sList<Pod> = disc.get_json(&client1, url.clone(), &eff_http).await.unwrap();
+            let _: K8sList<Pod> = disc.get_json(&client2, url, &eff_http2).await.unwrap();
             assert_eq!(
                 accepts.load(Ordering::SeqCst),
                 1,

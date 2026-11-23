@@ -1238,3 +1238,95 @@ async fn kubernetes_pod_discovery_enforces_per_request_timeout() {
         "expected timeout error on get_optional_json, got: {err:?}"
     );
 }
+
+#[tokio::test]
+async fn kubernetes_pod_discovery_follows_list_pagination_and_rejects_cycles() {
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut req_buf = vec![0u8; 4096];
+                let n = stream.read(&mut req_buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                let first_line = req_str.lines().next().unwrap_or("");
+                let body = if first_line
+                    .starts_with("GET /api/v1/pods?labelSelector=app%3Dweb&resourceVersion=0 ")
+                {
+                    r#"{"metadata":{"continue":"page-2"},"items":[{"metadata":{"name":"pod-1","namespace":"default"},"spec":{"nodeName":"node-1","containers":[{"name":"app","image":"app:1","ports":[{"containerPort":8080,"protocol":"TCP"}]}]},"status":{"phase":"Running","podIP":"10.0.0.1"}}]}"#
+                } else if first_line
+                    .starts_with("GET /api/v1/pods?labelSelector=app%3Dweb&continue=page-2 ")
+                {
+                    r#"{"metadata":{"continue":""},"items":[{"metadata":{"name":"pod-2","namespace":"default"},"spec":{"nodeName":"node-2","containers":[{"name":"app","image":"app:1","ports":[{"containerPort":8080,"protocol":"TCP"}]}]},"status":{"phase":"Running","podIP":"10.0.0.2"}}]}"#
+                } else if first_line.starts_with("GET /api/v1/nodes?resourceVersion=0 ") {
+                    r#"{"metadata":{"continue":"nodes-2"},"items":[{"metadata":{"name":"node-1","labels":{"zone":"a"}}}]}"#
+                } else if first_line.starts_with("GET /api/v1/nodes?continue=nodes-2 ") {
+                    r#"{"metadata":{"continue":null},"items":[{"metadata":{"name":"node-2","labels":{"zone":"b"}}}]}"#
+                } else if first_line
+                    .starts_with("GET /api/v1/namespaces/loop/pods?resourceVersion=0 ")
+                    || first_line.starts_with("GET /api/v1/namespaces/loop/pods?continue=stuck ")
+                {
+                    r#"{"metadata":{"continue":"stuck"},"items":[]}"#
+                } else {
+                    panic!("unexpected request line: {first_line}");
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let paginated = KubernetesPodDiscovery::new(KubernetesSdConfig {
+        api_server: Some(format!("http://{addr}")),
+        role: Some(KubernetesRole::Pod),
+        selectors: vec![KubernetesSelectorConfig {
+            role: Some(KubernetesRole::Pod),
+            label: "app=web".to_owned(),
+            field: String::new(),
+        }],
+        attach_metadata: KubernetesAttachMetadataConfig {
+            node: true,
+            ..KubernetesAttachMetadataConfig::default()
+        },
+        ..KubernetesSdConfig::default()
+    })
+    .unwrap();
+    let groups = paginated.discover().await.unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].source, "pod/default/pod-1");
+    assert_eq!(
+        groups[0].labels.get("__meta_kubernetes_node_label_zone"),
+        Some(&"a".to_owned())
+    );
+    assert_eq!(groups[1].source, "pod/default/pod-2");
+    assert_eq!(
+        groups[1].labels.get("__meta_kubernetes_node_label_zone"),
+        Some(&"b".to_owned())
+    );
+
+    let cyclic = KubernetesPodDiscovery::new(KubernetesSdConfig {
+        api_server: Some(format!("http://{addr}")),
+        role: Some(KubernetesRole::Pod),
+        namespaces: KubernetesNamespaceDiscovery {
+            own_namespace: false,
+            names: vec!["loop".to_owned()],
+        },
+        ..KubernetesSdConfig::default()
+    })
+    .unwrap();
+    let err = cyclic.discover().await.unwrap_err().to_string();
+    assert!(
+        err.contains("repeated continue token"),
+        "expected cycle error, got: {err}"
+    );
+}
