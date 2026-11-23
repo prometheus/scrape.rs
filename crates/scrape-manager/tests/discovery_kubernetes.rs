@@ -227,6 +227,49 @@ fn kubernetes_sd_config_validation_matches_prometheus() {
         );
     }
 
+    // Field selector validation matches `k8s.io/apimachinery/pkg/fields.ParseSelector`.
+    for valid_field in [
+        "status.phase=Running",
+        "x=a,y=b,z=c",
+        "x!=a,y==b",
+        r"x=a||y\=b",
+        r"x=a\=\=b",
+        r"metadata.name=foo\,bar",
+        r"k=\,,k2=\\v",
+        ",status.phase=Running,",
+    ] {
+        let mut cfg: KubernetesSdConfig = serde_json::from_value(serde_json::json!({
+            "role": "pod",
+            "selectors": [{ "role": "pod", "field": valid_field }]
+        }))
+        .unwrap();
+        cfg.validate()
+            .unwrap_or_else(|e| panic!("expected valid field selector {valid_field:?}, got {e}"));
+    }
+
+    for invalid_field in [
+        "x=a||y=b",
+        "x==a==b",
+        "x=a,b",
+        "x in (a)",
+        "x",
+        r"status.phase=Running\x",
+        r"status.phase=Running\",
+        r"status.phase=Running\\\",
+        " ",
+        "status.phase=Running, ",
+    ] {
+        let mut cfg: KubernetesSdConfig = serde_json::from_value(serde_json::json!({
+            "role": "pod",
+            "selectors": [{ "role": "pod", "field": invalid_field }]
+        }))
+        .unwrap();
+        assert!(
+            cfg.validate().is_err(),
+            "expected invalid field selector {invalid_field:?} to fail validation"
+        );
+    }
+
     // Valid pod config with pod + node selectors, TLS, and custom header.
     let mut cfg = KubernetesSdConfig {
         api_server: Some("https://127.0.0.1:6443".to_owned()),

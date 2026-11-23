@@ -1282,17 +1282,81 @@ fn validate_namespace_path_segment(ns: &str) -> Result<(), DiscoveryError> {
     Ok(())
 }
 
+/// Validates a Kubernetes field selector matching `k8s.io/apimachinery/pkg/fields.ParseSelector`.
 fn validate_k8s_field_selector(selector: &str) -> Result<(), DiscoveryError> {
-    for term in selector.split(',') {
-        let term = term.trim();
-        if term.is_empty() {
+    if selector.is_empty() {
+        return Ok(());
+    }
+
+    // Split on unescaped commas, keeping backslash escapes intact for RHS validation.
+    let mut terms = Vec::new();
+    let mut start = 0;
+    let mut in_slash = false;
+    for (i, c) in selector.char_indices() {
+        if in_slash {
+            in_slash = false;
+        } else if c == '\\' {
+            in_slash = true;
+        } else if c == ',' {
+            terms.push(&selector[start..i]);
+            start = i + 1;
+        }
+    }
+    terms.push(&selector[start..]);
+    terms.sort_unstable();
+
+    for part in terms {
+        if part.is_empty() {
             continue;
         }
-        if !term.contains('=') {
+        let Some(rhs) = split_k8s_field_term_rhs(part) else {
             return Err(DiscoveryError::InvalidConfig(format!(
-                "invalid selector: '{selector}'; can't understand '{term}'"
+                "invalid selector: '{selector}'; can't understand '{part}'"
             )));
+        };
+        validate_k8s_field_value_escapes(rhs)?;
+    }
+    Ok(())
+}
+
+fn split_k8s_field_term_rhs(term: &str) -> Option<&str> {
+    for (i, _) in term.char_indices() {
+        let rem = &term[i..];
+        for op in ["!=", "==", "="] {
+            if let Some(rhs) = rem.strip_prefix(op) {
+                return Some(rhs);
+            }
         }
+    }
+    None
+}
+
+fn validate_k8s_field_value_escapes(rhs: &str) -> Result<(), DiscoveryError> {
+    let mut in_slash = false;
+    for c in rhs.chars() {
+        if in_slash {
+            if !matches!(c, '\\' | ',' | '=') {
+                return Err(DiscoveryError::InvalidConfig(format!(
+                    "invalid field selector: invalid escape sequence: \\{c}"
+                )));
+            }
+            in_slash = false;
+            continue;
+        }
+        match c {
+            '\\' => in_slash = true,
+            ',' | '=' => {
+                return Err(DiscoveryError::InvalidConfig(format!(
+                    "invalid field selector: unescaped character in value: {c}"
+                )));
+            }
+            _ => {}
+        }
+    }
+    if in_slash {
+        return Err(DiscoveryError::InvalidConfig(
+            "invalid field selector: invalid escape sequence: \\".to_owned(),
+        ));
     }
     Ok(())
 }
