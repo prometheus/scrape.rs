@@ -20,9 +20,10 @@ use prometheus_scrape_manager::config::load as load_prometheus_config;
 use prometheus_scrape_manager::discovery::kubernetes::{
     Job, KubernetesAttachMetadataConfig, KubernetesMetadataContext, KubernetesNamespaceDiscovery,
     KubernetesPodDiscovery, KubernetesRole, KubernetesSdConfig, KubernetesSelectorConfig,
-    Namespace, Node, OwnerReference, ReplicaSet, build_pod_target_group, build_pod_target_groups,
+    Namespace, Node, OwnerReference, Pod, ReplicaSet, build_pod_target_group,
+    build_pod_target_groups,
 };
-use prometheus_scrape_manager::discovery::{ADDRESS_LABEL, DiscoveryConfigs, LabelSet, Pod};
+use prometheus_scrape_manager::discovery::{ADDRESS_LABEL, DiscoveryConfigs, LabelSet};
 use prometheus_scrape_manager::http_config::{
     Authorization, BasicAuth, Header, Headers, HttpClientConfig, OAuth2, Secret, TlsConfig,
     TlsVersion,
