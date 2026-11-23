@@ -15,6 +15,8 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use prometheus_scrape_manager::config::load as load_prometheus_config;
 use prometheus_scrape_manager::discovery::kubernetes::{
@@ -30,6 +32,49 @@ use prometheus_scrape_manager::http_config::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(label: &str) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("scrape-rs-k8s-{label}-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+async fn read_http_head<S: AsyncReadExt + Unpin>(stream: &mut S) -> Option<String> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 512];
+    loop {
+        let n = stream.read(&mut chunk).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    if buf.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    }
+}
 
 fn label_set(pairs: &[(&str, &str)]) -> LabelSet {
     pairs
@@ -825,12 +870,9 @@ async fn kubernetes_pod_discovery_reqwest_end_to_end() {
                 break;
             };
             tokio::spawn(async move {
-                let mut req_buf = vec![0u8; 4096];
-                let n = stream.read(&mut req_buf).await.unwrap_or(0);
-                if n == 0 {
+                let Some(req_str) = read_http_head(&mut stream).await else {
                     return;
-                }
-                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                };
                 let first_line = req_str.lines().next().unwrap_or("");
                 assert!(
                     req_str
@@ -988,12 +1030,13 @@ fn https_mtls_all_namespaces_404_tolerance_and_localset_execution() {
     let local = tokio::task::LocalSet::new();
 
     local.block_on(&rt, async {
-        let dir =
-            std::env::temp_dir().join(format!("scrape-rs-https-k8s-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let user_file = dir.join("user.txt");
-        let pass_file = dir.join("pass.txt");
-        let hdr_file = dir.join("hdr.txt");
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let dir = TempDir::new("https");
+        let user_file = dir.path().join("user.txt");
+        let pass_file = dir.path().join("pass.txt");
+        let hdr_file = dir.path().join("hdr.txt");
         std::fs::write(&user_file, "prom-user\n").unwrap();
         std::fs::write(&pass_file, "prom-pass\n").unwrap();
         std::fs::write(&hdr_file, "from-file\n").unwrap();
@@ -1019,21 +1062,24 @@ fn https_mtls_all_namespaces_404_tolerance_and_localset_execution() {
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
+        let seen_paths = Rc::new(RefCell::new(Vec::<String>::new()));
+        let seen_srv = Rc::clone(&seen_paths);
 
         tokio::task::spawn_local(async move {
             while let Ok((tcp, _)) = listener.accept().await {
                 let acceptor = acceptor.clone();
+                let seen_srv = Rc::clone(&seen_srv);
                 tokio::task::spawn_local(async move {
                     let Ok(mut tls_stream) = acceptor.accept(tcp).await else {
                         return;
                     };
-                    let mut req_buf = vec![0u8; 4096];
-                    let n = tls_stream.read(&mut req_buf).await.unwrap_or(0);
-                    if n == 0 {
+                    let Some(req_str) = read_http_head(&mut tls_stream).await else {
                         return;
-                    }
-                    let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                    };
                     let first_line = req_str.lines().next().unwrap_or("");
+                    if let Some(path) = first_line.split_whitespace().nth(1) {
+                        seen_srv.borrow_mut().push(path.to_owned());
+                    }
                     assert!(
                         req_str.lines().any(|l| l.eq_ignore_ascii_case(
                             "authorization: Basic cHJvbS11c2VyOnByb20tcGFzcw=="
@@ -1186,8 +1232,14 @@ fn https_mtls_all_namespaces_404_tolerance_and_localset_execution() {
                 .get("__meta_kubernetes_namespace_label_tier"),
             Some(&"batch".to_owned())
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            seen_paths
+                .borrow()
+                .iter()
+                .any(|p| p == "/api/v1/namespaces/missing-ns"),
+            "expected 404 namespace metadata route to be requested, saw: {:?}",
+            seen_paths.borrow()
+        );
     });
 }
 
@@ -1204,12 +1256,9 @@ async fn kubernetes_pod_discovery_enforces_per_request_timeout() {
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
-                let mut req_buf = vec![0u8; 4096];
-                let n = stream.read(&mut req_buf).await.unwrap_or(0);
-                if n == 0 {
+                let Some(req_str) = read_http_head(&mut stream).await else {
                     return;
-                }
-                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                };
                 let first_line = req_str.lines().next().unwrap_or("");
                 if first_line.starts_with("GET /api/v1/namespaces/slow-ns/pods?resourceVersion=0 ")
                 {
@@ -1236,12 +1285,12 @@ async fn kubernetes_pod_discovery_enforces_per_request_timeout() {
         ..KubernetesSdConfig::default()
     })
     .unwrap()
-    .with_request_timeout(Duration::from_millis(100));
+    .with_request_timeout(Duration::from_millis(200));
 
     let err = stall_pods.discover().await.unwrap_err();
     assert!(
-        matches!(&err, DiscoveryError::Http(e) if e.is_timeout()),
-        "expected timeout error on get_json, got: {err:?}"
+        matches!(&err, DiscoveryError::Http(e) if e.is_timeout() && e.url().map(|u| u.path()) == Some("/api/v1/pods")),
+        "expected timeout error on /api/v1/pods, got: {err:?}"
     );
 
     // 2. Timeout on `get_optional_json` (`/api/v1/namespaces/slow-ns`).
@@ -1259,12 +1308,12 @@ async fn kubernetes_pod_discovery_enforces_per_request_timeout() {
         ..KubernetesSdConfig::default()
     })
     .unwrap()
-    .with_request_timeout(Duration::from_millis(100));
+    .with_request_timeout(Duration::from_millis(200));
 
     let err = stall_ns.discover().await.unwrap_err();
     assert!(
-        matches!(&err, DiscoveryError::Http(e) if e.is_timeout()),
-        "expected timeout error on get_optional_json, got: {err:?}"
+        matches!(&err, DiscoveryError::Http(e) if e.is_timeout() && e.url().map(|u| u.path()) == Some("/api/v1/namespaces/slow-ns")),
+        "expected timeout error on /api/v1/namespaces/slow-ns, got: {err:?}"
     );
 }
 
@@ -1278,12 +1327,9 @@ async fn kubernetes_pod_discovery_follows_list_pagination_and_rejects_cycles() {
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
-                let mut req_buf = vec![0u8; 4096];
-                let n = stream.read(&mut req_buf).await.unwrap_or(0);
-                if n == 0 {
+                let Some(req_str) = read_http_head(&mut stream).await else {
                     return;
-                }
-                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                };
                 let first_line = req_str.lines().next().unwrap_or("");
                 let body = if first_line
                     .starts_with("GET /api/v1/pods?labelSelector=app%3Dweb&resourceVersion=0 ")
@@ -1372,8 +1418,7 @@ async fn discovery_error_redacts_url_password_and_converts_http_config_errors() 
 
     tokio::spawn(async move {
         if let Ok((mut stream, _)) = listener.accept().await {
-            let mut buf = [0u8; 2048];
-            let _ = stream.read(&mut buf).await;
+            let _ = read_http_head(&mut stream).await;
             let resp =
                 "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ = stream.write_all(resp.as_bytes()).await;
@@ -1427,12 +1472,9 @@ async fn kubernetes_pod_discovery_http_json_errors_remaining_endpoints_and_with_
         while let Ok((mut stream, _)) = listener.accept().await {
             let seen_srv = Arc::clone(&seen_srv);
             tokio::spawn(async move {
-                let mut req_buf = vec![0u8; 4096];
-                let n = stream.read(&mut req_buf).await.unwrap_or(0);
-                if n == 0 {
+                let Some(req_str) = read_http_head(&mut stream).await else {
                     return;
-                }
-                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                };
                 let first_line = req_str.lines().next().unwrap_or("");
                 let path = first_line
                     .split_whitespace()

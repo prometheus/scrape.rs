@@ -2109,6 +2109,26 @@ mod tests {
 
     #[test]
     fn in_cluster_auth_ca_and_namespace_validation() {
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct TestTempDir(PathBuf);
+        impl TestTempDir {
+            fn new() -> Self {
+                static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+                let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir()
+                    .join(format!("scrape-rs-k8s-unit-{}-{id}", std::process::id()));
+                fs::create_dir_all(&path).unwrap();
+                Self(path)
+            }
+        }
+        impl Drop for TestTempDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
         let kubeconfig_cfg = KubernetesSdConfig {
             role: Some(KubernetesRole::Pod),
             kubeconfig_file: "/etc/kubeconfig".to_owned(),
@@ -2122,8 +2142,8 @@ mod tests {
         };
         assert!(KubernetesPodDiscovery::new(node_cfg).is_err());
 
-        let dir = std::env::temp_dir().join(format!("scrape-rs-k8s-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir_guard = TestTempDir::new();
+        let dir = &dir_guard.0;
         let ns_file = dir.join("namespace");
         let tok_file = dir.join("token");
         let ca_file = dir.join("ca.crt");
@@ -2280,12 +2300,23 @@ ZCXcq24++2iU8RQHuAIgTvD813EN4j4Wd++SFXpG+evSLLk+fyJse98OIktvI/E=\n\
                 while let Ok((mut stream, _)) = listener.accept().await {
                     accepts_srv.fetch_add(1, Ordering::SeqCst);
                     tokio::spawn(async move {
-                        let mut buf = vec![0u8; 4096];
+                        let mut pending = Vec::with_capacity(1024);
+                        let mut chunk = [0u8; 512];
                         loop {
-                            let n = stream.read(&mut buf).await.unwrap_or(0);
-                            if n == 0 {
-                                break;
+                            while !pending.windows(4).any(|w| w == b"\r\n\r\n") {
+                                let n = stream.read(&mut chunk).await.unwrap_or(0);
+                                if n == 0 {
+                                    return;
+                                }
+                                pending.extend_from_slice(&chunk[..n]);
                             }
+                            let head_end = pending
+                                .windows(4)
+                                .position(|w| w == b"\r\n\r\n")
+                                .unwrap()
+                                + 4;
+                            pending.drain(..head_end);
+
                             let body = r#"{"items":[]}"#;
                             let resp = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
@@ -2309,7 +2340,5 @@ ZCXcq24++2iU8RQHuAIgTvD813EN4j4Wd++SFXpG+evSLLk+fyJse98OIktvI/E=\n\
                 "expected cached in-cluster client to reuse pooled connection across polls"
             );
         });
-
-        let _ = fs::remove_dir_all(&dir);
     }
 }
