@@ -25,8 +25,8 @@ use std::time::Duration;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::http_config::{
-    HttpClientConfig, deserialize_string_or_scalar, join_dir, redact_url, serialize_opt_url,
-    validate_go_url,
+    HttpClientConfig, Secret, deserialize_string_or_scalar, join_dir, redact_url,
+    serialize_opt_url, validate_go_url,
 };
 
 use super::{
@@ -1336,15 +1336,16 @@ impl KubernetesPodDiscovery {
                     self.in_cluster_token_file
                 ))
             })?;
-            if token.trim().is_empty() {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
                 return Err(DiscoveryError::InvalidConfig(format!(
                     "in-cluster token file {} is empty",
                     self.in_cluster_token_file
                 )));
             }
-            http_cfg
-                .bearer_token_file
-                .clone_from(&self.in_cluster_token_file);
+            // Reuse the token read for this poll across all HTTP requests in the cycle instead of
+            // re-reading the file on every request, while still picking up rotations on the next poll.
+            http_cfg.bearer_token = Secret::new(trimmed);
         }
         let client = if let Some(c) = self.client.get() {
             c.clone()
@@ -2182,17 +2183,28 @@ ZCXcq24++2iU8RQHuAIgTvD813EN4j4Wd++SFXpG+evSLLk+fyJse98OIktvI/E=\n\
             .resolve_in_cluster_endpoint_and_auth("fd00::1", "6443")
             .unwrap();
         assert_eq!(base_url, "https://[fd00::1]:6443");
-        assert_eq!(eff_http.bearer_token_file, disc.in_cluster_token_file);
+        assert_eq!(eff_http.bearer_token.as_str(), "in-cluster-jwt");
+        assert!(eff_http.bearer_token_file.is_empty());
         assert_eq!(eff_http.tls_config.ca_file, disc.in_cluster_ca_file);
 
         // Subsequent in-cluster polls (including clones) must reuse the cached client without
-        // re-reading the CA bundle or rebuilding the connection pool.
+        // re-reading the CA bundle or rebuilding the connection pool, while picking up rotated tokens.
         fs::remove_file(&ca_file).unwrap();
+        fs::write(&tok_file, "  rotated-jwt \n").unwrap();
         let (_base_url2, client2, eff_http2) = disc
             .clone()
             .resolve_in_cluster_endpoint_and_auth("fd00::1", "6443")
             .unwrap();
-        assert_eq!(eff_http2.bearer_token_file, disc.in_cluster_token_file);
+        assert_eq!(eff_http2.bearer_token.as_str(), "rotated-jwt");
+        assert!(eff_http2.bearer_token_file.is_empty());
+
+        // Empty/whitespace token file is rejected.
+        fs::write(&tok_file, "   \n").unwrap();
+        assert!(
+            disc.resolve_in_cluster_endpoint_and_auth("fd00::1", "6443")
+                .is_err()
+        );
+        fs::write(&tok_file, "  rotated-jwt \n").unwrap();
 
         // Verify both resolved clients share the same underlying connection pool.
         let rt = tokio::runtime::Builder::new_current_thread()
