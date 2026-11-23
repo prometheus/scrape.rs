@@ -76,7 +76,7 @@ impl From<HttpConfigError> for DiscoveryError {
         match err {
             HttpConfigError::InvalidConfig(msg) => Self::InvalidConfig(msg),
             HttpConfigError::Io(e) => Self::Io(e),
-            HttpConfigError::Http(e) => Self::Http(e),
+            HttpConfigError::Http(e) => Self::from(e),
         }
     }
 }

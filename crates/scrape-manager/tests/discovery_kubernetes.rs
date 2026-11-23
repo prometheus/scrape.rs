@@ -1358,3 +1358,54 @@ async fn kubernetes_pod_discovery_follows_list_pagination_and_rejects_cycles() {
         "expected cycle error, got: {err}"
     );
 }
+
+#[tokio::test]
+async fn discovery_error_redacts_url_password_and_converts_http_config_errors() {
+    use prometheus_scrape_manager::discovery::DiscoveryError;
+    use prometheus_scrape_manager::http_config::HttpConfigError;
+
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf).await;
+            let resp =
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(resp.as_bytes()).await;
+        }
+    });
+
+    let disc = KubernetesPodDiscovery::new(KubernetesSdConfig {
+        api_server: Some(format!("http://prom:top-secret-pw@{addr}")),
+        role: Some(KubernetesRole::Pod),
+        ..KubernetesSdConfig::default()
+    })
+    .unwrap();
+    let err = disc.discover().await.unwrap_err();
+    let display = err.to_string();
+    let debug = format!("{err:?}");
+    assert!(
+        matches!(&err, DiscoveryError::Http(e) if e.status() == Some(reqwest::StatusCode::UNAUTHORIZED)),
+        "expected 401 HTTP error, got: {debug}"
+    );
+    assert!(
+        !display.contains("top-secret-pw"),
+        "password leaked in Display: {display}"
+    );
+    assert!(
+        !debug.contains("top-secret-pw"),
+        "password leaked in Debug: {debug}"
+    );
+
+    let io_err = DiscoveryError::from(HttpConfigError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "missing cred file",
+    )));
+    assert!(matches!(io_err, DiscoveryError::Io(_)));
+    let cfg_err = DiscoveryError::from(HttpConfigError::InvalidConfig("bad http cfg".to_owned()));
+    assert!(matches!(cfg_err, DiscoveryError::InvalidConfig(m) if m == "bad http cfg"));
+}
