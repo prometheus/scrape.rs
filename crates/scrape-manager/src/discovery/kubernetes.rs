@@ -1242,12 +1242,17 @@ impl KubernetesPodDiscovery {
     }
 }
 
-// Reject dot-segments and path delimiters at discovery time (matching `client-go`
-// `IsValidPathSegmentName`) because `url::PathSegmentsMut::push("..")` pops the preceding
-// segment instead of percent-encoding it, which would turn a namespaced query into a
-// cluster-wide `/api/v1/pods` request.
+// Reject dot-segments, path delimiters, backslashes, and ASCII control characters at discovery
+// time (matching `client-go` `IsValidPathSegmentName`) because `url::PathSegmentsMut` strips
+// `\t`, `\r`, and `\n` before checking dot-segments and pops the preceding segment on `".."`,
+// which would turn a namespaced query into a cluster-wide `/api/v1/pods` request.
 fn validate_namespace_path_segment(ns: &str) -> Result<(), DiscoveryError> {
-    if ns.is_empty() || ns == "." || ns == ".." || ns.contains(['/', '%']) {
+    if ns.is_empty()
+        || ns == "."
+        || ns == ".."
+        || ns.contains(['/', '%', '\\'])
+        || ns.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
         return Err(DiscoveryError::InvalidConfig(format!(
             "invalid Kubernetes namespace name {ns:?}"
         )));
@@ -1734,7 +1739,21 @@ mod tests {
         assert_eq!(url.query(), None);
         assert_eq!(url.path(), "/api/v1/namespaces/default%3Fwatch=true/pods");
 
-        for bad in ["", ".", "..", "a/b", "a%2Fb"] {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a%2Fb",
+            "a\\b",
+            ".\n.",
+            "\t..",
+            "..\r",
+            ".\t",
+            "\n",
+            "default\n",
+            "bad\x7f",
+        ] {
             let bad_cfg = KubernetesSdConfig {
                 role: Some(KubernetesRole::Pod),
                 namespaces: KubernetesNamespaceDiscovery {
