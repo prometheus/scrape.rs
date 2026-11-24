@@ -15,19 +15,25 @@
 //! with `prometheus/prometheus/discovery`.
 
 pub mod dns;
+pub mod kubernetes;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration as StdDuration;
 
 pub use dns::{DnsDiscovery, DnsRecord, DnsRecordType, DnsSdConfig, ResolvConf};
+pub use kubernetes::{
+    KubernetesAttachMetadataConfig, KubernetesNamespaceDiscovery, KubernetesPodDiscovery,
+    KubernetesRole, KubernetesSdConfig, KubernetesSelectorConfig,
+};
 pub use prometheus_relabel::{ADDRESS_LABEL, LabelSet, ValidationScheme};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::http_config::{
-    Duration, HTTP_CLIENT_CONFIG_FIELDS, HttpClientConfig, Secret, TlsConfig, check_allowed_fields,
-    check_http_client_config_fields, deserialize_string_or_scalar, join_dir, validate_go_url,
+    Duration, HTTP_CLIENT_CONFIG_FIELDS, HttpClientConfig, HttpConfigError, Secret, TlsConfig,
+    check_allowed_fields, check_http_client_config_fields, deserialize_string_or_scalar, join_dir,
+    validate_go_url,
 };
 
 /// Error returned when validating or running target discovery.
@@ -40,12 +46,38 @@ pub enum DiscoveryError {
     /// I/O or filesystem error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// HTTP client or transport error during discovery (with any embedded URL password stripped).
+    #[error("HTTP error: {0}")]
+    Http(#[source] reqwest::Error),
     /// DNS protocol or lookup error.
     #[error("DNS error: {0}")]
     Dns(String),
     /// JSON payload decoding error.
     #[error("JSON decode error: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+impl From<reqwest::Error> for DiscoveryError {
+    fn from(mut err: reqwest::Error) -> Self {
+        // Strip passwords from `reqwest::Error`'s embedded URL so error strings never leak
+        // proxy or target credentials.
+        if let Some(url) = err.url_mut()
+            && url.password().is_some()
+        {
+            let _ = url.set_password(None);
+        }
+        Self::Http(err)
+    }
+}
+
+impl From<HttpConfigError> for DiscoveryError {
+    fn from(err: HttpConfigError) -> Self {
+        match err {
+            HttpConfigError::InvalidConfig(msg) => Self::InvalidConfig(msg),
+            HttpConfigError::Io(e) => Self::Io(e),
+            HttpConfigError::Http(e) => Self::from(e),
+        }
+    }
 }
 
 /// Internal noncharacter prefix used to represent decoded `!!binary` YAML scalars whose raw bytes
@@ -1565,205 +1597,8 @@ impl IonosSdConfig {
     }
 }
 
-/// Kubernetes namespace discovery configuration (`discovery/kubernetes.NamespaceDiscovery`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct KubernetesNamespaceDiscovery {
-    /// Includes the pod's own namespace.
-    #[serde(skip_serializing_if = "is_false")]
-    pub own_namespace: bool,
-    /// Explicit list of namespace names to watch.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub names: Vec<String>,
-}
-
-fn is_false(b: &bool) -> bool {
+pub(crate) fn is_false(b: &bool) -> bool {
     !*b
-}
-
-impl KubernetesNamespaceDiscovery {
-    /// Returns `true` when both `own_namespace` is `false` and `names` is empty.
-    pub fn is_empty(&self) -> bool {
-        !self.own_namespace && self.names.is_empty()
-    }
-}
-
-/// Kubernetes label/field selector configuration (`discovery/kubernetes.SelectorConfig`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct KubernetesSelectorConfig {
-    /// Role that this selector applies to.
-    #[serde(
-        skip_serializing_if = "String::is_empty",
-        deserialize_with = "deserialize_string_or_scalar"
-    )]
-    pub role: String,
-    /// Kubernetes label selector expression.
-    #[serde(
-        skip_serializing_if = "String::is_empty",
-        deserialize_with = "deserialize_string_or_scalar"
-    )]
-    pub label: String,
-    /// Kubernetes field selector expression.
-    #[serde(
-        skip_serializing_if = "String::is_empty",
-        deserialize_with = "deserialize_string_or_scalar"
-    )]
-    pub field: String,
-}
-
-/// Optional metadata attachment settings for Kubernetes SD (`discovery/kubernetes.AttachMetadataConfig`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct KubernetesAttachMetadataConfig {
-    /// Attaches node metadata to discovered pod/endpoint targets.
-    #[serde(skip_serializing_if = "is_false")]
-    pub node: bool,
-    /// Attaches namespace metadata to discovered targets.
-    #[serde(skip_serializing_if = "is_false")]
-    pub namespace: bool,
-}
-
-impl KubernetesAttachMetadataConfig {
-    /// Returns `true` when all flags are `false`.
-    pub fn is_empty(&self) -> bool {
-        !self.node && !self.namespace
-    }
-}
-
-/// Kubernetes service discovery configuration (`discovery/kubernetes.SDConfig`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct KubernetesSdConfig {
-    /// Kubernetes API server URL.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_server: Option<String>,
-    /// Kubernetes discovery role (`node`, `pod`, `service`, `endpoints`, `endpointslice`, `ingress`).
-    #[serde(
-        skip_serializing_if = "String::is_empty",
-        deserialize_with = "deserialize_string_or_scalar"
-    )]
-    pub role: String,
-    /// Path to kubeconfig file.
-    #[serde(
-        skip_serializing_if = "String::is_empty",
-        deserialize_with = "deserialize_string_or_scalar"
-    )]
-    pub kubeconfig_file: String,
-    /// Namespace discovery configuration.
-    #[serde(skip_serializing_if = "KubernetesNamespaceDiscovery::is_empty")]
-    pub namespaces: KubernetesNamespaceDiscovery,
-    /// Resource label/field selectors.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub selectors: Vec<KubernetesSelectorConfig>,
-    /// Extra metadata attachment flags.
-    #[serde(skip_serializing_if = "KubernetesAttachMetadataConfig::is_empty")]
-    pub attach_metadata: KubernetesAttachMetadataConfig,
-    /// HTTP client configuration.
-    #[serde(flatten)]
-    pub http_client_config: HttpClientConfig,
-}
-
-impl KubernetesSdConfig {
-    /// Validates the Kubernetes SD configuration (`kubernetes.SDConfig.UnmarshalYAML`).
-    pub fn validate(&mut self) -> Result<(), String> {
-        self.http_client_config.validate()?;
-        if let Some(s) = &self.api_server
-            && s.is_empty()
-        {
-            self.api_server = None;
-        }
-        if let Some(s) = &self.api_server {
-            validate_go_url(s)?;
-        }
-        match self.role.as_str() {
-            "node" | "pod" | "service" | "endpoints" | "endpointslice" | "ingress" => {}
-            "" => {
-                return Err(
-                    "role missing (one of: pod, service, endpoints, endpointslice, node, ingress)"
-                        .to_owned(),
-                );
-            }
-            other => return Err(format!("unknown Kubernetes SD role {other:?}")),
-        }
-        if self.api_server.is_none()
-            && self.kubeconfig_file.is_empty()
-            && !self.http_client_config.is_default()
-        {
-            return Err(
-                "to use custom HTTP client configuration please provide the 'api_server' URL explicitly"
-                    .to_owned(),
-            );
-        }
-        if self.api_server.is_some() && !self.kubeconfig_file.is_empty() {
-            return Err("cannot use 'kubeconfig_file' and 'api_server' simultaneously".to_owned());
-        }
-        if !self.kubeconfig_file.is_empty() && !self.http_client_config.is_default() {
-            return Err(
-                "cannot use a custom HTTP client configuration together with 'kubeconfig_file'"
-                    .to_owned(),
-            );
-        }
-        if self.namespaces.own_namespace && !self.kubeconfig_file.is_empty() {
-            return Err(
-                "cannot use 'kubeconfig_file' and 'namespaces.own_namespace' simultaneously"
-                    .to_owned(),
-            );
-        }
-        if self.namespaces.own_namespace && self.api_server.is_some() {
-            return Err(
-                "cannot use 'api_server' and 'namespaces.own_namespace' simultaneously".to_owned(),
-            );
-        }
-
-        let allowed_selectors: &[&str] = match self.role.as_str() {
-            "pod" => &["pod", "node"],
-            "service" => &["service"],
-            "endpointslice" => &["pod", "service", "endpointslice"],
-            "endpoints" => &["pod", "service", "endpoints"],
-            "node" => &["node"],
-            "ingress" => &["ingress"],
-            _ => &[],
-        };
-        let mut seen_roles = BTreeSet::new();
-        for selector in &self.selectors {
-            if !seen_roles.insert(selector.role.as_str()) {
-                return Err(format!("duplicated selector role: {}", selector.role));
-            }
-            if !allowed_selectors.contains(&selector.role.as_str()) {
-                return Err(format!(
-                    "{} role supports only {} selectors",
-                    self.role,
-                    allowed_selectors.join(", ")
-                ));
-            }
-            if !selector.field.is_empty() {
-                validate_k8s_field_selector(&selector.field)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Joins relative file paths with `dir`.
-    pub fn set_directory(&mut self, dir: &str) {
-        self.http_client_config.set_directory(dir);
-        self.kubeconfig_file = join_dir(dir, &self.kubeconfig_file);
-    }
-}
-
-fn validate_k8s_field_selector(selector: &str) -> Result<(), String> {
-    for term in selector.split(',') {
-        let term = term.trim();
-        if term.is_empty() {
-            continue;
-        }
-        if !term.contains('=') {
-            return Err(format!(
-                "invalid selector: '{selector}'; can't understand '{term}'"
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Kuma xDS service discovery configuration (`discovery/xds.KumaSDConfig`).
@@ -3469,7 +3304,7 @@ impl DiscoveryConfigs {
             c.validate()?;
         }
         for c in &mut self.kubernetes_sd_configs {
-            c.validate()?;
+            c.validate().map_err(|e| e.to_string())?;
         }
         for c in &mut self.kuma_sd_configs {
             c.validate()?;
