@@ -43,6 +43,12 @@ var om2Unextractable = map[string]string{
 	"TestOpenMetrics2ParseExemplarExceedsOM1Limit": "the input is built with strings.Repeat",
 }
 
+// om2InputWrappers lists the TestOpenMetrics2Parse* functions that wrap each table
+// input before parsing, as the prefix and suffix the Go test adds in its loop.
+var om2InputWrappers = map[string][2]string{
+	"TestOpenMetrics2ParseNativeHistogramIntVsFloatDiscriminator": {"# TYPE h histogram\n", "\n# EOF\n"},
+}
+
 // writeOM2Cases writes the inputs of every TestOpenMetrics2Parse* function to
 // testdata/textparse/, one file per table case. TestOpenMetrics2ParseErrors inputs go
 // to testdata/om2errors/<index>.om2.txt, next to the error text Go asserts in <index>.err.
@@ -100,8 +106,9 @@ func writeOM2Cases(outRoot, srcFile string) ([]string, error) {
 		if len(inputs) == 0 {
 			return nil, fmt.Errorf("%s: no input to extract, add it to om2Unextractable if that is expected: %w", fn.Name.Name, err)
 		}
+		wrap := om2InputWrappers[fn.Name.Name]
 		for index, input := range inputs {
-			if err := write(fmt.Sprintf("textparse/%s_%02d.om2.txt", fn.Name.Name, index), input); err != nil {
+			if err := write(fmt.Sprintf("textparse/%s_%02d.om2.txt", fn.Name.Name, index), wrap[0]+input+wrap[1]); err != nil {
 				return nil, err
 			}
 		}
@@ -150,12 +157,18 @@ func writeOM2ParseExpected(outRoot string) ([]string, error) {
 
 	var written []string
 	for _, input := range inputs {
+		var rendered string
 		err := writeExpected(outRoot, "om2parse", input, func(data []byte) string {
 			parser := textparse.NewOpenMetrics2Parser(data, labels.NewSymbolTable(), textparse.ParserOptions{})
-			return renderEntries(parser, true)
+			rendered = renderEntries(parser, true)
+			return rendered
 		})
 		if err != nil {
 			return nil, err
+		}
+		// Every textparse/ input is valid in Go, so an error means the extraction is wrong.
+		if strings.HasPrefix(input, "textparse/") && strings.HasPrefix(rendered, "error") {
+			return nil, fmt.Errorf("%s: Go parser returned an error for a valid input:\n%s", input, rendered)
 		}
 		written = append(written, "om2parse/"+input)
 	}

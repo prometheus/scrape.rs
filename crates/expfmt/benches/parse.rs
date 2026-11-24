@@ -14,7 +14,7 @@
 //! OpenMetrics 1.0 and 2.0 parser benchmarks; each op reads every sample like Go's scrape loop.
 //! Recommended CLI invocation:
 //! ```sh
-//! cargo bench -p prometheus-expfmt --bench parse -- -bench '^BenchmarkParse' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt
+//! cargo bench -p prometheus-expfmt --features __bench --bench parse -- -bench '^BenchmarkParse' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt
 //! ```
 
 use std::fs;
@@ -41,7 +41,10 @@ fn read_all<'a>(mut parser: impl Parser<'a>, labels: &mut LabelsBuffer<'a>) {
             _ => continue,
         }
         parser.labels(labels);
-        while parser.exemplar(labels).is_some() {}
+        black_box(&*labels);
+        while let Some(exemplar) = parser.exemplar(labels) {
+            black_box((exemplar, &*labels));
+        }
         black_box(parser.start_timestamp());
     }
 }

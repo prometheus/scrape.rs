@@ -18,6 +18,8 @@ exclude = [
 default = ["arrow", "dto"]
 arrow = ["dep:arrow-array", "dep:arrow-buffer", "dep:arrow-schema"]
 dto = ["dep:prost", "dep:prost-types"]
+# Exposes the internal parsers to benches/parse.rs. Not a stable API.
+__bench = []
 
 [dependencies]
 arrow-array = { workspace = true, optional = true }
@@ -40,6 +42,7 @@ required-features = ["arrow"]
 [[bench]]
 name = "parse"
 harness = false
+required-features = ["__bench"]
 
 [lints]
 workspace = true

@@ -452,7 +452,10 @@ impl<'a> OpenMetrics2Parser<'a> {
             let raw = std::str::from_utf8(raw).map_err(|_| ParseError::InvalidUtf8 {
                 offset: raw_span.start,
             })?;
-            return self.parse_composite_value(raw).map_err(Self::invalid_value);
+            return self
+                .parse_composite_value(raw)
+                .inspect_err(|_| self.pending.clear())
+                .map_err(Self::invalid_value);
         }
         if matches!(
             self.metric_type,
@@ -1107,6 +1110,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rejected_composite_line_leaves_no_pending_series() {
+        let input = b"# TYPE h histogram\nh {count:1,sum:1,bucket:[1:1]}\nb 2\n# EOF\n";
+        let mut parser = OpenMetrics2Parser::new(input);
+        assert_eq!(parser.next_entry(), Ok(Some(Entry::Type)));
+        assert!(parser.next_entry().is_err());
+        assert_eq!(parser.next_entry(), Ok(Some(Entry::Series)));
+        assert_eq!(parser.series().0, b"b");
+        assert_eq!(parser.series().2, 2.0);
+    }
+
     /// Parses one native histogram with `fields` after the shared required fields.
     fn native_histogram(fields: &str) -> Result<Option<Entry>, ParseError> {
         let input = format!(
@@ -1141,6 +1155,10 @@ mod tests {
             ),
             (
                 "count:2,sum:NaN,positive_spans:[0:1],positive_buckets:[1]",
+                Ok(Some(Entry::Histogram)),
+            ),
+            (
+                "count:2,sum:1,positive_spans:[-2:1,1:1],positive_buckets:[1,1]",
                 Ok(Some(Entry::Histogram)),
             ),
             (

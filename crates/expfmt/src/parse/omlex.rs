@@ -504,6 +504,12 @@ mod tests {
                 Eof
             ]
         );
+        assert_eq!(
+            lex_all_openmetrics2(b"a 1 # {} 2 st@3\n"),
+            [
+                MName, Value, Comment, BraceClose, Value, Timestamp, Linebreak, Eof
+            ]
+        );
         // Like golex, `st@` with nothing after it is a plain timestamp.
         assert_eq!(
             lex_all_openmetrics2(b"a 1 st@\n"),

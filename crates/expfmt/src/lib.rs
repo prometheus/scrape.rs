@@ -24,6 +24,7 @@ pub(crate) mod parse;
 
 /// Parser access for `benches/parse.rs`, which cannot reach the crate-internal `parse` module.
 /// Not a stable API.
+#[cfg(feature = "__bench")]
 #[doc(hidden)]
 pub mod __bench {
     pub use crate::parse::{Entry, LabelsBuffer, OpenMetrics2Parser, OpenMetricsParser, Parser};
