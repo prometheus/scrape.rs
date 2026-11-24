@@ -978,6 +978,12 @@ fn pod_source(namespace: &str, name: &str) -> String {
     format!("pod/{}", namespaced_name(namespace, name))
 }
 
+struct ListRequestCtx<'a> {
+    base_url: &'a str,
+    client: &'a reqwest::Client,
+    http_cfg: &'a HttpClientConfig,
+}
+
 /// `reqwest`-based Kubernetes Pod service discovery runner (`role: pod`).
 #[derive(Clone, Debug)]
 pub struct KubernetesPodDiscovery {
@@ -1059,49 +1065,25 @@ impl KubernetesPodDiscovery {
     pub async fn discover(&self) -> Result<Vec<TargetGroup>, DiscoveryError> {
         let (base_url, client, effective_http) = self.resolve_endpoint_and_auth()?;
         let namespaces = self.resolve_namespaces()?;
+        let req_ctx = ListRequestCtx {
+            base_url: &base_url,
+            client: &client,
+            http_cfg: &effective_http,
+        };
 
         let pod_selector = self.config.selector_for(KubernetesRole::Pod);
         let node_selector = self.config.selector_for(KubernetesRole::Node);
 
-        let mut all_pods = Vec::new();
-        if namespaces.is_empty() {
-            all_pods.extend(
-                self.get_list_items::<Pod>(
-                    &client,
-                    &base_url,
-                    &["api", "v1", "pods"],
-                    pod_selector,
-                    &effective_http,
-                )
-                .await?,
-            );
-        } else {
-            for ns in &namespaces {
-                all_pods.extend(
-                    self.get_list_items::<Pod>(
-                        &client,
-                        &base_url,
-                        &["api", "v1", "namespaces", ns, "pods"],
-                        pod_selector,
-                        &effective_http,
-                    )
-                    .await?,
-                );
-            }
-        }
+        let all_pods: Vec<Pod> = self
+            .list_namespaced_resource(&req_ctx, &["api", "v1"], "pods", &namespaces, pod_selector)
+            .await?;
 
         let mut metadata = KubernetesMetadataContext::default();
         let attach = &self.config.attach_metadata;
 
         if attach.node {
             for node in self
-                .get_list_items::<Node>(
-                    &client,
-                    &base_url,
-                    &["api", "v1", "nodes"],
-                    node_selector,
-                    &effective_http,
-                )
+                .get_list_items::<Node>(&req_ctx, &["api", "v1", "nodes"], node_selector)
                 .await?
             {
                 metadata.nodes.insert(node.metadata.name.clone(), node);
@@ -1111,13 +1093,7 @@ impl KubernetesPodDiscovery {
         if attach.namespace {
             if namespaces.is_empty() {
                 for ns in self
-                    .get_list_items::<Namespace>(
-                        &client,
-                        &base_url,
-                        &["api", "v1", "namespaces"],
-                        None,
-                        &effective_http,
-                    )
+                    .get_list_items::<Namespace>(&req_ctx, &["api", "v1", "namespaces"], None)
                     .await?
                 {
                     metadata.namespaces.insert(ns.metadata.name.clone(), ns);
@@ -1137,78 +1113,38 @@ impl KubernetesPodDiscovery {
         }
 
         if attach.deployment {
-            if namespaces.is_empty() {
-                for rs in self
-                    .get_list_items::<ReplicaSet>(
-                        &client,
-                        &base_url,
-                        &["apis", "apps", "v1", "replicasets"],
-                        None,
-                        &effective_http,
-                    )
-                    .await?
-                {
-                    metadata.replicasets.insert(
-                        namespaced_name(&rs.metadata.namespace, &rs.metadata.name),
-                        rs,
-                    );
-                }
-            } else {
-                for ns in &namespaces {
-                    for rs in self
-                        .get_list_items::<ReplicaSet>(
-                            &client,
-                            &base_url,
-                            &["apis", "apps", "v1", "namespaces", ns, "replicasets"],
-                            None,
-                            &effective_http,
-                        )
-                        .await?
-                    {
-                        metadata.replicasets.insert(
-                            namespaced_name(&rs.metadata.namespace, &rs.metadata.name),
-                            rs,
-                        );
-                    }
-                }
+            for rs in self
+                .list_namespaced_resource::<ReplicaSet>(
+                    &req_ctx,
+                    &["apis", "apps", "v1"],
+                    "replicasets",
+                    &namespaces,
+                    None,
+                )
+                .await?
+            {
+                metadata.replicasets.insert(
+                    namespaced_name(&rs.metadata.namespace, &rs.metadata.name),
+                    rs,
+                );
             }
         }
 
         if attach.cronjob {
-            if namespaces.is_empty() {
-                for job in self
-                    .get_list_items::<Job>(
-                        &client,
-                        &base_url,
-                        &["apis", "batch", "v1", "jobs"],
-                        None,
-                        &effective_http,
-                    )
-                    .await?
-                {
-                    metadata.jobs.insert(
-                        namespaced_name(&job.metadata.namespace, &job.metadata.name),
-                        job,
-                    );
-                }
-            } else {
-                for ns in &namespaces {
-                    for job in self
-                        .get_list_items::<Job>(
-                            &client,
-                            &base_url,
-                            &["apis", "batch", "v1", "namespaces", ns, "jobs"],
-                            None,
-                            &effective_http,
-                        )
-                        .await?
-                    {
-                        metadata.jobs.insert(
-                            namespaced_name(&job.metadata.namespace, &job.metadata.name),
-                            job,
-                        );
-                    }
-                }
+            for job in self
+                .list_namespaced_resource::<Job>(
+                    &req_ctx,
+                    &["apis", "batch", "v1"],
+                    "jobs",
+                    &namespaces,
+                    None,
+                )
+                .await?
+            {
+                metadata.jobs.insert(
+                    namespaced_name(&job.metadata.namespace, &job.metadata.name),
+                    job,
+                );
             }
         }
 
@@ -1229,13 +1165,35 @@ impl KubernetesPodDiscovery {
         Ok(http_cfg.apply_to_request(req)?)
     }
 
+    async fn list_namespaced_resource<T: for<'de> Deserialize<'de>>(
+        &self,
+        ctx: &ListRequestCtx<'_>,
+        api_prefix: &[&str],
+        resource: &str,
+        namespaces: &[String],
+        selector: Option<&KubernetesSelectorConfig>,
+    ) -> Result<Vec<T>, DiscoveryError> {
+        let mut segments = Vec::with_capacity(api_prefix.len() + 3);
+        if namespaces.is_empty() {
+            segments.extend_from_slice(api_prefix);
+            segments.push(resource);
+            return self.get_list_items(ctx, &segments, selector).await;
+        }
+        let mut items = Vec::new();
+        for ns in namespaces {
+            segments.clear();
+            segments.extend_from_slice(api_prefix);
+            segments.extend_from_slice(&["namespaces", ns.as_str(), resource]);
+            items.extend(self.get_list_items::<T>(ctx, &segments, selector).await?);
+        }
+        Ok(items)
+    }
+
     async fn get_list_items<T: for<'de> Deserialize<'de>>(
         &self,
-        client: &reqwest::Client,
-        base_url: &str,
+        ctx: &ListRequestCtx<'_>,
         segments: &[&str],
         selector: Option<&KubernetesSelectorConfig>,
-        http_cfg: &HttpClientConfig,
     ) -> Result<Vec<T>, DiscoveryError> {
         const MAX_LIST_PAGES: usize = 10_000;
 
@@ -1243,8 +1201,8 @@ impl KubernetesPodDiscovery {
         let mut continue_token: Option<String> = None;
         let mut seen_tokens = BTreeSet::new();
         for _ in 0..MAX_LIST_PAGES {
-            let url = build_list_url(base_url, segments, selector, continue_token.as_deref())?;
-            let page: K8sList<T> = self.get_json(client, url, http_cfg).await?;
+            let url = build_list_url(ctx.base_url, segments, selector, continue_token.as_deref())?;
+            let page: K8sList<T> = self.get_json(ctx.client, url, ctx.http_cfg).await?;
             items.extend(page.items);
             if page.metadata.continue_token.is_empty() {
                 return Ok(items);
