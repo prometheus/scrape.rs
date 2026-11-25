@@ -182,7 +182,11 @@ impl<'a> Pending<'a> {
         let out = &mut self.series_bytes;
         for (label, label_value) in &self.line_labels {
             while let Some((special_label, special_value)) =
-                special.next_if(|(special_label, _)| *special_label <= label.as_ref())
+                special.next_if(|(special_label, _)| {
+                    // An injected bound goes after a line label of the same name, like Go's sort.
+                    *special_label < label.as_ref()
+                        || (*special_label == METRIC_NAME_LABEL && *special_label == label.as_ref())
+                })
             {
                 append_series_label(out, special_label, special_value);
             }
@@ -1108,6 +1112,113 @@ mod tests {
             assert_eq!(parser.next_entry(), Ok(Some(Entry::Series)));
             assert_eq!(parser.metric_type().1, MetricType::Unknown);
         }
+    }
+
+    #[test]
+    fn injected_bound_follows_a_line_label_of_the_same_name() {
+        let input = b"# TYPE h histogram\nh{le=\"0.5\"} {count:1,sum:1,bucket:[+Inf:1]}\n# EOF\n";
+        let mut parser = OpenMetrics2Parser::new(input);
+        let mut labels = LabelsBuffer::new();
+        assert_eq!(parser.next_entry(), Ok(Some(Entry::Type)));
+        for _ in 0..3 {
+            assert_eq!(parser.next_entry(), Ok(Some(Entry::Series)));
+        }
+        assert_eq!(parser.series().0, b"h_bucket\xffle\xff0.5\xffle\xff+Inf");
+        parser.labels(&mut labels);
+        let values: Vec<&str> = labels.iter().map(|(_, value)| value).collect();
+        assert_eq!(values, ["h_bucket", "0.5", "+Inf"]);
+    }
+
+    #[test]
+    fn composite_fields_follow_the_metric_type() {
+        let unknown = |key: &str| {
+            Err(ParseError::InvalidValue(format!(
+                "unknown composite field {key:?}"
+            )))
+        };
+        for (input, expected) in [
+            (
+                "# TYPE s summary\ns {count:1,sum:1,schema:0}\n# EOF\n",
+                unknown("schema"),
+            ),
+            (
+                "# TYPE s summary\ns {count:1,sum:1,bucket:[+Inf:1]}\n# EOF\n",
+                unknown("bucket"),
+            ),
+            (
+                "# TYPE h histogram\nh {count:1,sum:1,quantile:[0.5:1]}\n# EOF\n",
+                unknown("quantile"),
+            ),
+        ] {
+            let mut parser = OpenMetrics2Parser::new(input.as_bytes());
+            assert_eq!(parser.next_entry(), Ok(Some(Entry::Type)), "{input}");
+            assert_eq!(parser.next_entry(), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn rejects_misplaced_quoted_names() {
+        let label_name_expected = Err(ParseError::UnexpectedToken {
+            expected: "expected label name",
+            offset: 10,
+        });
+        let invalid_name = Err(ParseError::InvalidMetricName { offset: 0 });
+        for (input, expected) in [
+            (&b"a 1 # {\"x\"} 1 2\n# EOF\n"[..], label_name_expected),
+            (b"foo{\"bar\"} 1\n# EOF\n", invalid_name.clone()),
+            (b"{a=\"b\"} 1\n# EOF\n", invalid_name),
+        ] {
+            let mut parser = OpenMetrics2Parser::new(input);
+            assert_eq!(
+                parser.next_entry(),
+                expected,
+                "{}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    #[test]
+    fn consecutive_native_histograms_keep_no_state() {
+        let input = b"# TYPE h histogram\n\
+            h{a=\"b\"} {count:3,sum:1,schema:0,zero_threshold:0,zero_count:0,positive_spans:[0:1],positive_buckets:[1],negative_spans:[0:1],negative_buckets:[2]} 5 st@4 # {x=\"y\"} 1 6\n\
+            h{a=\"c\"} {count:1,sum:1,schema:0,zero_threshold:0,zero_count:0,positive_spans:[0:1],positive_buckets:[1]}\n\
+            # EOF\n";
+        let mut parser = OpenMetrics2Parser::new(input);
+        let mut labels = LabelsBuffer::new();
+        let label_value = |labels: &LabelsBuffer<'_>, name: &str| {
+            labels
+                .iter()
+                .find(|(label, _)| *label == name)
+                .map(|(_, value)| value.to_string())
+        };
+        assert_eq!(parser.next_entry(), Ok(Some(Entry::Type)));
+
+        assert_eq!(parser.next_entry(), Ok(Some(Entry::Histogram)));
+        let (_, timestamp, histogram) = parser.histogram();
+        assert_eq!(timestamp, Some(5000));
+        let HistogramRef::Int(histogram) = histogram else {
+            panic!("expected an integer histogram")
+        };
+        assert_eq!(histogram.negative_buckets, [2]);
+        assert_eq!(parser.start_timestamp(), Some(4000));
+        parser.labels(&mut labels);
+        assert_eq!(label_value(&labels, "a").as_deref(), Some("b"));
+        assert_eq!(parser.exemplar(&mut labels), Some((1.0, Some(6000))));
+        assert_eq!(label_value(&labels, "x").as_deref(), Some("y"));
+
+        assert_eq!(parser.next_entry(), Ok(Some(Entry::Histogram)));
+        let (_, timestamp, histogram) = parser.histogram();
+        assert_eq!(timestamp, None);
+        let HistogramRef::Int(histogram) = histogram else {
+            panic!("expected an integer histogram")
+        };
+        assert!(histogram.negative_spans.is_empty());
+        assert!(histogram.negative_buckets.is_empty());
+        assert_eq!(parser.start_timestamp(), None);
+        parser.labels(&mut labels);
+        assert_eq!(label_value(&labels, "a").as_deref(), Some("c"));
+        assert_eq!(parser.exemplar(&mut labels), None);
     }
 
     #[test]

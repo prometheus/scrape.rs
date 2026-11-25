@@ -82,8 +82,14 @@ func writeOM2Cases(outRoot, srcFile string) ([]string, error) {
 			continue
 		}
 		if fn.Name.Name == om2TestPrefix+"Errors" {
-			inputs := keyedStrings(fn.Body, "input")
-			errs := keyedStrings(fn.Body, "err")
+			inputs, err := keyedStrings(fset, fn.Body, "input")
+			if err != nil {
+				return nil, err
+			}
+			errs, err := keyedStrings(fset, fn.Body, "err")
+			if err != nil {
+				return nil, err
+			}
 			if len(inputs) != len(errs) {
 				return nil, fmt.Errorf("%s: %d inputs but %d errors", fn.Name.Name, len(inputs), len(errs))
 			}
@@ -107,7 +113,10 @@ func writeOM2Cases(outRoot, srcFile string) ([]string, error) {
 			}
 			continue
 		}
-		inputs := keyedStrings(fn.Body, "input")
+		inputs, keyedErr := keyedStrings(fset, fn.Body, "input")
+		if keyedErr != nil {
+			return nil, keyedErr
+		}
 		if len(inputs) == 0 {
 			return nil, fmt.Errorf("%s: no input to extract, add it to om2Unextractable if that is expected: %w", fn.Name.Name, err)
 		}
@@ -122,22 +131,30 @@ func writeOM2Cases(outRoot, srcFile string) ([]string, error) {
 }
 
 // keyedStrings returns the string literal values of every `key: "..."` field in
-// the composite literals under node, in source order.
-func keyedStrings(node ast.Node, key string) []string {
+// the composite literals under node, in source order. A value that is not a string
+// literal is an error, so an upstream table case cannot be dropped silently.
+func keyedStrings(fset *token.FileSet, node ast.Node, key string) ([]string, error) {
 	var out []string
+	var err error
 	ast.Inspect(node, func(n ast.Node) bool {
+		if err != nil {
+			return false
+		}
 		kv, ok := n.(*ast.KeyValueExpr)
 		if !ok {
 			return true
 		}
 		if ident, ok := kv.Key.(*ast.Ident); ok && ident.Name == key {
-			if val, ok := evalStringExpr(kv.Value); ok {
-				out = append(out, val)
+			val, ok := evalStringExpr(kv.Value)
+			if !ok {
+				err = fmt.Errorf("%s: %s is not a string literal", fset.Position(kv.Value.Pos()), key)
+				return false
 			}
+			out = append(out, val)
 		}
 		return true
 	})
-	return out
+	return out, err
 }
 
 // writeOM2ParseExpected runs textparse.NewOpenMetrics2Parser with default options

@@ -341,7 +341,7 @@ pub trait Parser<'a> {
     }
 
     /// Clears `buf` and fills it with the current sample's labels, sorted by name, matching Go:
-    /// the metric name is stored under [`METRIC_NAME_LABEL`], and `le` on histograms and
+    /// the metric name is stored under `__name__`, and `le` on histograms and
     /// `quantile` on summaries use OpenMetrics float formatting.
     fn labels(&self, buf: &mut LabelsBuffer<'a>);
 
