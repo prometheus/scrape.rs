@@ -792,6 +792,10 @@ impl<'v> CompositeFields<'v> {
             .and_then(|inner| inner.strip_suffix('}'))
             .ok_or_else(|| format!("composite value must be wrapped in {{}}: {raw:?}"))?;
         let mut fields = Self::default();
+        // Go reports an unknown field only after `kvMap` has checked every part for a
+        // missing ':' and for duplicates, so keep unknown keys until the loop ends. This
+        // allocates only for input that is rejected.
+        let mut unknown: Vec<&str> = Vec::new();
         for part in split_top_level(inner) {
             let part = part.trim();
             if part.is_empty() {
@@ -815,11 +819,20 @@ impl<'v> CompositeFields<'v> {
                 ("positive_buckets", false) => &mut fields.positive_buckets,
                 ("negative_spans", false) => &mut fields.negative_spans,
                 ("negative_buckets", false) => &mut fields.negative_buckets,
-                _ => return Err(format!("unknown composite field {key:?}")),
+                _ if unknown.contains(&key) => {
+                    return Err(format!("duplicate composite field {key:?}"));
+                }
+                _ => {
+                    unknown.push(key);
+                    continue;
+                }
             };
             if slot.replace(value.trim()).is_some() {
                 return Err(format!("duplicate composite field {key:?}"));
             }
+        }
+        if let Some(key) = unknown.first() {
+            return Err(format!("unknown composite field {key:?}"));
         }
         Ok(fields)
     }
@@ -1091,6 +1104,37 @@ mod tests {
         assert_eq!(parser.exemplar(&mut buf), Some((4.0, Some(5000))));
         assert_eq!(buf.get("id"), Some("y"));
         assert_eq!(parser.exemplar(&mut buf), None);
+    }
+
+    // Go's TestOpenMetrics2ParseExemplarExceedsOM1Limit, which the Go harness can't extract.
+    #[test]
+    fn accepts_exemplar_over_the_openmetrics1_limit() {
+        let long_value = "x".repeat(200);
+        let input = format!(
+            "# TYPE foo_total counter\nfoo_total 1.0 # {{data=\"{long_value}\"}} 1.0 1234567.0\n# EOF\n"
+        );
+        let mut parser = OpenMetrics2Parser::new(input.as_bytes());
+        let mut buf = LabelsBuffer::new();
+        assert_eq!(parser.next_entry(), Ok(Some(Entry::Type)));
+        assert_eq!(parser.next_entry(), Ok(Some(Entry::Series)));
+        assert_eq!(parser.exemplar(&mut buf), Some((1.0, Some(1234567000))));
+        assert_eq!(buf.get("data"), Some(long_value.as_str()));
+        assert_eq!(parser.next_entry(), Ok(None));
+    }
+
+    // Go's TestOpenMetrics2ParseEOFHandling, which the Go harness can't extract.
+    #[test]
+    fn eof_only_input_has_no_entries() {
+        let mut parser = OpenMetrics2Parser::new(b"# EOF\n");
+        assert_eq!(parser.next_entry(), Ok(None));
+    }
+
+    #[test]
+    fn composite_field_errors_follow_go_order() {
+        let reason = |raw| CompositeFields::parse(raw, false).err().unwrap();
+        assert!(reason("{bad:1,count}").starts_with("invalid composite field (missing ':')"));
+        assert!(reason("{bad:1,bad:2}").starts_with("duplicate composite field \"bad\""));
+        assert!(reason("{bad:1,count:1}").starts_with("unknown composite field \"bad\""));
     }
 
     #[test]
