@@ -43,6 +43,11 @@ var om2Unextractable = map[string]string{
 	"TestOpenMetrics2ParseExemplarExceedsOM1Limit": "the input is built with strings.Repeat",
 }
 
+// om2Rejected lists the textparse/ inputs that Go's parser rejects on purpose, with the reason.
+var om2Rejected = map[string]string{
+	"textparse/TestOpenMetrics2ParseUnsortedClassicBucketsRejected.om2.txt": "classic histogram buckets must be sorted",
+}
+
 // om2InputWrappers lists the TestOpenMetrics2Parse* functions that wrap each table
 // input before parsing, as the prefix and suffix the Go test adds in its loop.
 var om2InputWrappers = map[string][2]string{
@@ -166,8 +171,10 @@ func writeOM2ParseExpected(outRoot string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Every textparse/ input is valid in Go, so an error means the extraction is wrong.
-		if strings.HasPrefix(input, "textparse/") && strings.HasPrefix(rendered, "error") {
+		// An error in a textparse/ golden means the extraction is wrong, unless Go
+		// rejects that input on purpose. renderEntries writes the error last.
+		_, rejected := om2Rejected[input]
+		if strings.HasPrefix(input, "textparse/") && !rejected && strings.HasSuffix(rendered, "error\n") {
 			return nil, fmt.Errorf("%s: Go parser returned an error for a valid input:\n%s", input, rendered)
 		}
 		written = append(written, "om2parse/"+input)
