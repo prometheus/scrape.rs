@@ -14,6 +14,8 @@
 package main
 
 import (
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"testing"
@@ -73,6 +75,17 @@ func TestExtractFuncInputLiteral(t *testing.T) {
 				t.Fatalf("got %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestKeyedStringsRejectsNonLiteral(t *testing.T) {
+	fset := token.NewFileSet()
+	expr, err := parser.ParseExprFrom(fset, "", `[]tc{{input: "a"}, {input: strings.Repeat("b", 2)}}`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := keyedStrings(fset, expr, "input"); err == nil {
+		t.Fatalf("keyedStrings = %q, want an error for the non-literal input", got)
 	}
 }
 

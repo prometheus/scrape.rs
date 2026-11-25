@@ -1,0 +1,3 @@
+# TYPE foo_total counter
+foo_total NaN
+# EOF

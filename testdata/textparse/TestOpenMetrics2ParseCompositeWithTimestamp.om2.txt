@@ -1,0 +1,3 @@
+# TYPE req_duration histogram
+req_duration {count:2,sum:4.0,bucket:[+Inf:2]} 1234567.0 st@1000.0
+# EOF

@@ -1,0 +1,7 @@
+type "foo" summary
+series "foo_countÿa=bÿvÿjobÿapi" 3ff0000000000000 - "__name__"="foo_count" "a=b"="v" "job"="api"
+st 0
+series "foo_sumÿa=bÿvÿjobÿapi" 4000000000000000 - "__name__"="foo_sum" "a=b"="v" "job"="api"
+st 0
+series "fooÿa=bÿvÿjobÿapiÿquantileÿ0.5" 3ff0000000000000 - "__name__"="foo" "a=b"="v" "job"="api" "quantile"="0.5"
+st 0

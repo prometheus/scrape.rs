@@ -1,0 +1,3 @@
+# TYPE foo histogram
+foo 5
+# EOF

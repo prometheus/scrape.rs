@@ -1,0 +1,4 @@
+# HELP rpc_duration_seconds RPC duration.
+# TYPE rpc_duration_seconds summary
+rpc_duration_seconds {count:100,sum:30000.0,quantile:[0.5:100.0,0.9:200.0,0.99:300.0]}
+# EOF

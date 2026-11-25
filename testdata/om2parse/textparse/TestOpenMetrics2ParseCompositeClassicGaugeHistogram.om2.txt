@@ -1,0 +1,13 @@
+type "foo" gaugehistogram
+series "foo_gcount" 4045000000000000 - "__name__"="foo_gcount"
+st 0
+series "foo_gsum" 40a9b2999999999a - "__name__"="foo_gsum"
+st 0
+series "foo_bucketÿleÿ0.01" 4034000000000000 - "__name__"="foo_bucket" "le"="0.01"
+st 0
+series "foo_bucketÿleÿ0.1" 4039000000000000 - "__name__"="foo_bucket" "le"="0.1"
+st 0
+series "foo_bucketÿleÿ1.0" 4041000000000000 - "__name__"="foo_bucket" "le"="1.0"
+st 0
+series "foo_bucketÿleÿ+Inf" 4045000000000000 - "__name__"="foo_bucket" "le"="+Inf"
+st 0

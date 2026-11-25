@@ -1,0 +1,4 @@
+# HELP test_histogram Native histogram.
+# TYPE test_histogram histogram
+test_histogram {count:6,sum:12.1,schema:0,zero_threshold:0.001,zero_count:2,positive_spans:[0:3],positive_buckets:[1,2,1],negative_spans:[],negative_buckets:[]}
+# EOF

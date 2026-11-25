@@ -1,0 +1,7 @@
+type "foo" histogram
+series "foo_count" 3ff0000000000000 - "__name__"="foo_count"
+st 0
+series "foo_sum" 3ff0000000000000 - "__name__"="foo_sum"
+st 0
+series "foo_bucketÿleÿ+Inf" 3ff0000000000000 - "__name__"="foo_bucket" "le"="+Inf"
+st 0

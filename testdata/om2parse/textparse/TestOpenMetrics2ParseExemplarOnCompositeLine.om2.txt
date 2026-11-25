@@ -1,0 +1,10 @@
+type "req_duration" histogram
+series "req_duration_count" 4000000000000000 - "__name__"="req_duration_count"
+exemplar 400e666666666666 9999999000 "id"="req-1"
+st 0
+series "req_duration_sum" 4010000000000000 - "__name__"="req_duration_sum"
+st 0
+series "req_duration_bucketÿleÿ1.0" 3ff0000000000000 - "__name__"="req_duration_bucket" "le"="1.0"
+st 0
+series "req_duration_bucketÿleÿ+Inf" 4000000000000000 - "__name__"="req_duration_bucket" "le"="+Inf"
+st 0

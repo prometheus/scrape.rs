@@ -1,0 +1,6 @@
+type "http_requests" counter
+unit "http_requests" "requests"
+series "http_requests" 3ff0000000000000 - "__name__"="http_requests"
+st 0
+series "bare_metric" 4000000000000000 - "__name__"="bare_metric"
+st 0

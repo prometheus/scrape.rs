@@ -1,0 +1,4 @@
+# HELP req_duration Request duration histogram.
+# TYPE req_duration histogram
+req_duration {count:3,sum:6.0,bucket:[0.1:1,1.0:2,+Inf:3]}
+# EOF

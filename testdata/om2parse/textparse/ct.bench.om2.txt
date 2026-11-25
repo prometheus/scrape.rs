@@ -1,0 +1,149 @@
+help "http_requests_total" "Total HTTP requests."
+type "http_requests_total" counter
+unit "http_requests_total" "requests"
+series "http_requests_total{method=\"GET\"}" 40c7810000000000 1710000000000 "__name__"="http_requests_total" "method"="GET"
+st 1709900000000
+series "http_requests_total{method=\"POST\"}" 40b1a90000000000 1710000000000 "__name__"="http_requests_total" "method"="POST"
+st 1709900000000
+series "http_requests_total{method=\"PUT\"}" 4073800000000000 1710000000000 "__name__"="http_requests_total" "method"="PUT"
+st 1709900000000
+help "grpc_calls_total" "Total gRPC calls."
+type "grpc_calls_total" counter
+series "grpc_calls_total{service=\"catalog\"}" 40d2c88000000000 1710000000000 "__name__"="grpc_calls_total" "service"="catalog"
+st 1709800000000
+series "grpc_calls_total{service=\"orders\"}" 40c0138000000000 1710000000000 "__name__"="grpc_calls_total" "service"="orders"
+st 1709800000000
+help "db_queries_total" "Total database queries."
+type "db_queries_total" counter
+series "db_queries_total" 411d797800000000 1710000000000 "__name__"="db_queries_total"
+st 1709700000000
+help "cache_evictions_total" "Total cache evictions."
+type "cache_evictions_total" counter
+series "cache_evictions_total{cache=\"lru\"}" 409cc80000000000 1710000000000 "__name__"="cache_evictions_total" "cache"="lru"
+st 1709600000000
+series "cache_evictions_total{cache=\"arc\"}" 408cc80000000000 1710000000000 "__name__"="cache_evictions_total" "cache"="arc"
+st 1709600000000
+help "errors_total" "Total errors by code."
+type "errors_total" counter
+series "errors_total{code=\"EINVAL\"}" 4037000000000000 1710000000000 "__name__"="errors_total" "code"="EINVAL"
+st 1709500000000
+series "errors_total{code=\"ETIMEDOUT\"}" 401c000000000000 1710000000000 "__name__"="errors_total" "code"="ETIMEDOUT"
+st 1709500000000
+series "errors_total{code=\"ECONNRESET\"}" 402c000000000000 1710000000000 "__name__"="errors_total" "code"="ECONNRESET"
+st 1709500000000
+help "request_duration_seconds" "Request duration."
+type "request_duration_seconds" histogram
+unit "request_duration_seconds" "seconds"
+series "request_duration_seconds_countÿhandlerÿ/api/query" 40c0728000000000 1710000000000 "__name__"="request_duration_seconds_count" "handler"="/api/query"
+st 1709400000000
+series "request_duration_seconds_sumÿhandlerÿ/api/query" 40934a0000000000 1710000000000 "__name__"="request_duration_seconds_sum" "handler"="/api/query"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.005" 405e000000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.005"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.01" 4081800000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.01"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.025" 40a0680000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.025"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.05" 40b4be0000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.05"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.1" 40bc200000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.1"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.25" 40bfa40000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.25"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.5" 40c04f0000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.5"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ1.0" 40c06d0000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="1.0"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ2.5" 40c0720000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="2.5"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ5.0" 40c0728000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="5.0"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ+Inf" 40c0728000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="+Inf"
+st 1709400000000
+series "request_duration_seconds_countÿhandlerÿ/api/write" 40b0720000000000 1710000000000 "__name__"="request_duration_seconds_count" "handler"="/api/write"
+st 1709400000000
+series "request_duration_seconds_sumÿhandlerÿ/api/write" 4080026666666666 1710000000000 "__name__"="request_duration_seconds_sum" "handler"="/api/write"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.005" 4054000000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.005"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.01" 4073800000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.01"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.025" 4091300000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.025"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.05" 40a2c00000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.05"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.1" 40adb00000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.1"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.25" 40b0040000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.25"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.5" 40b0540000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.5"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ1.0" 40b06d0000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="1.0"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ2.5" 40b0720000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="2.5"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ5.0" 40b0720000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="5.0"
+st 1709400000000
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ+Inf" 40b0720000000000 1710000000000 "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="+Inf"
+st 1709400000000
+help "db_query_duration_seconds" "Database query duration."
+type "db_query_duration_seconds" histogram
+unit "db_query_duration_seconds" "seconds"
+series "db_query_duration_seconds_count" 411d797800000000 1710000000000 "__name__"="db_query_duration_seconds_count"
+st 1709300000000
+series "db_query_duration_seconds_sum" 40a860cccccccccd 1710000000000 "__name__"="db_query_duration_seconds_sum"
+st 1709300000000
+series "db_query_duration_seconds_bucketÿleÿ0.001" 40fd4c0000000000 1710000000000 "__name__"="db_query_duration_seconds_bucket" "le"="0.001"
+st 1709300000000
+series "db_query_duration_seconds_bucketÿleÿ0.005" 4117318000000000 1710000000000 "__name__"="db_query_duration_seconds_bucket" "le"="0.005"
+st 1709300000000
+series "db_query_duration_seconds_bucketÿleÿ0.01" 411b292000000000 1710000000000 "__name__"="db_query_duration_seconds_bucket" "le"="0.01"
+st 1709300000000
+series "db_query_duration_seconds_bucketÿleÿ0.05" 411d2cc000000000 1710000000000 "__name__"="db_query_duration_seconds_bucket" "le"="0.05"
+st 1709300000000
+series "db_query_duration_seconds_bucketÿleÿ0.1" 411d6b4000000000 1710000000000 "__name__"="db_query_duration_seconds_bucket" "le"="0.1"
+st 1709300000000
+series "db_query_duration_seconds_bucketÿleÿ0.5" 411d77c000000000 1710000000000 "__name__"="db_query_duration_seconds_bucket" "le"="0.5"
+st 1709300000000
+series "db_query_duration_seconds_bucketÿleÿ1.0" 411d797800000000 1710000000000 "__name__"="db_query_duration_seconds_bucket" "le"="1.0"
+st 1709300000000
+series "db_query_duration_seconds_bucketÿleÿ+Inf" 411d797800000000 1710000000000 "__name__"="db_query_duration_seconds_bucket" "le"="+Inf"
+st 1709300000000
+help "gc_duration_seconds" "GC duration summary."
+type "gc_duration_seconds" summary
+unit "gc_duration_seconds" "seconds"
+series "gc_duration_seconds_count" 40b2d50000000000 1710000000000 "__name__"="gc_duration_seconds_count"
+st 1709200000000
+series "gc_duration_seconds_sum" 4028cccccccccccd 1710000000000 "__name__"="gc_duration_seconds_sum"
+st 1709200000000
+series "gc_duration_secondsÿquantileÿ0.5" 3f62d77318fc5048 1710000000000 "__name__"="gc_duration_seconds" "quantile"="0.5"
+st 1709200000000
+series "gc_duration_secondsÿquantileÿ0.9" 3f8096bb98c7e282 1710000000000 "__name__"="gc_duration_seconds" "quantile"="0.9"
+st 1709200000000
+series "gc_duration_secondsÿquantileÿ0.99" 3f8db22d0e560419 1710000000000 "__name__"="gc_duration_seconds" "quantile"="0.99"
+st 1709200000000
+series "gc_duration_secondsÿquantileÿ1.0" 3f9ff2e48e8a71de 1710000000000 "__name__"="gc_duration_seconds" "quantile"="1.0"
+st 1709200000000
+help "allocation_duration_seconds" "Allocation duration summary."
+type "allocation_duration_seconds" summary
+unit "allocation_duration_seconds" "seconds"
+series "allocation_duration_seconds_countÿpoolÿsmall" 41cbbef760000000 1710000000000 "__name__"="allocation_duration_seconds_count" "pool"="small"
+st 1709100000000
+series "allocation_duration_seconds_sumÿpoolÿsmall" 4061c9999999999a 1710000000000 "__name__"="allocation_duration_seconds_sum" "pool"="small"
+st 1709100000000
+series "allocation_duration_secondsÿpoolÿsmallÿquantileÿ0.5" 3f1f75104d551d69 1710000000000 "__name__"="allocation_duration_seconds" "pool"="small" "quantile"="0.5"
+st 1709100000000
+series "allocation_duration_secondsÿpoolÿsmallÿquantileÿ0.9" 3f364840e1719f80 1710000000000 "__name__"="allocation_duration_seconds" "pool"="small" "quantile"="0.9"
+st 1709100000000
+series "allocation_duration_secondsÿpoolÿsmallÿquantileÿ0.99" 3f4dd1a21ea35936 1710000000000 "__name__"="allocation_duration_seconds" "pool"="small" "quantile"="0.99"
+st 1709100000000
+series "allocation_duration_seconds_countÿpoolÿmedium" 416b159800000000 1710000000000 "__name__"="allocation_duration_seconds_count" "pool"="medium"
+st 1709100000000
+series "allocation_duration_seconds_sumÿpoolÿmedium" 4055066666666666 1710000000000 "__name__"="allocation_duration_seconds_sum" "pool"="medium"
+st 1709100000000
+series "allocation_duration_secondsÿpoolÿmediumÿquantileÿ0.5" 3f3adea897635e74 1710000000000 "__name__"="allocation_duration_seconds" "pool"="medium" "quantile"="0.5"
+st 1709100000000
+series "allocation_duration_secondsÿpoolÿmediumÿquantileÿ0.9" 3f53a92a30553261 1710000000000 "__name__"="allocation_duration_seconds" "pool"="medium" "quantile"="0.9"
+st 1709100000000
+series "allocation_duration_secondsÿpoolÿmediumÿquantileÿ0.99" 3f6bda5119ce075f 1710000000000 "__name__"="allocation_duration_seconds" "pool"="medium" "quantile"="0.99"
+st 1709100000000

@@ -1,0 +1,4 @@
+help "un" "Some unknown metric."
+type "un" unknown
+series "un" 3ff0000000000000 - "__name__"="un"
+st 0

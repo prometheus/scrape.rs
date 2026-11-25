@@ -1,0 +1,4 @@
+# TYPE http_request_duration_seconds histogram
+# UNIT http_request_duration_seconds seconds
+http_request_duration_seconds {count:3,sum:6.0,bucket:[0.1:1,0.5:2,+Inf:3]}
+# EOF

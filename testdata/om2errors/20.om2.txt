@@ -1,0 +1,3 @@
+# TYPE foo histogram
+foo {count:5,sum:2.0,buckets:[1:3,+Inf:5]}
+# EOF

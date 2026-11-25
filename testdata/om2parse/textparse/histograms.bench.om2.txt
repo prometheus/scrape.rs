@@ -1,0 +1,315 @@
+help "request_duration_seconds" "Request duration."
+type "request_duration_seconds" histogram
+unit "request_duration_seconds" "seconds"
+series "request_duration_seconds_countÿhandlerÿ/api/query" 40c0728000000000 - "__name__"="request_duration_seconds_count" "handler"="/api/query"
+st 0
+series "request_duration_seconds_sumÿhandlerÿ/api/query" 40934a0000000000 - "__name__"="request_duration_seconds_sum" "handler"="/api/query"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.005" 405e000000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.005"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.01" 4081800000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.01"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.025" 40a0680000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.025"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.05" 40b4be0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.05"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.1" 40bc200000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.1"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.25" 40bfa40000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.25"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ0.5" 40c04f0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="0.5"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ1.0" 40c06d0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="1.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ2.5" 40c0720000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="2.5"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ5.0" 40c0728000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="5.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ10.0" 40c0728000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="10.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/queryÿleÿ+Inf" 40c0728000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/query" "le"="+Inf"
+st 0
+series "request_duration_seconds_countÿhandlerÿ/api/write" 40b0720000000000 - "__name__"="request_duration_seconds_count" "handler"="/api/write"
+st 0
+series "request_duration_seconds_sumÿhandlerÿ/api/write" 4080026666666666 - "__name__"="request_duration_seconds_sum" "handler"="/api/write"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.005" 4054000000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.005"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.01" 4073800000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.01"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.025" 4091300000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.025"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.05" 40a2c00000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.05"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.1" 40adb00000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.1"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.25" 40b0040000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.25"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ0.5" 40b0540000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="0.5"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ1.0" 40b06d0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="1.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ2.5" 40b0720000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="2.5"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ5.0" 40b0720000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="5.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ10.0" 40b0720000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="10.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/writeÿleÿ+Inf" 40b0720000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/write" "le"="+Inf"
+st 0
+series "request_duration_seconds_countÿhandlerÿ/api/health" 40fd4c0000000000 - "__name__"="request_duration_seconds_count" "handler"="/api/health"
+st 0
+series "request_duration_seconds_sumÿhandlerÿ/api/health" 404819999999999a - "__name__"="request_duration_seconds_sum" "handler"="/api/health"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ0.005" 40fd3f8000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="0.005"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ0.01" 40fd4ac000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="0.01"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ0.025" 40fd4bf000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="0.025"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ0.05" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="0.05"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ0.1" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="0.1"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ0.25" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="0.25"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ0.5" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="0.5"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ1.0" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="1.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ2.5" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="2.5"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ5.0" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="5.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ10.0" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="10.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/healthÿleÿ+Inf" 40fd4c0000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/health" "le"="+Inf"
+st 0
+series "request_duration_seconds_countÿhandlerÿ/api/admin" 4073800000000000 - "__name__"="request_duration_seconds_count" "handler"="/api/admin"
+st 0
+series "request_duration_seconds_sumÿhandlerÿ/api/admin" 4053b9999999999a - "__name__"="request_duration_seconds_sum" "handler"="/api/admin"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/adminÿleÿ0.005" 4024000000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/admin" "le"="0.005"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/adminÿleÿ0.01" 4045000000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/admin" "le"="0.01"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/adminÿleÿ0.025" 405e000000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/admin" "le"="0.025"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/adminÿleÿ0.05" 4069000000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/admin" "le"="0.05"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/adminÿleÿ0.1" 4070400000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/admin" "le"="0.1"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/adminÿleÿ0.25" 4072700000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/admin" "le"="0.25"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/adminÿleÿ0.5" 4073400000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/admin" "le"="0.5"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/adminÿleÿ1.0" 4073700000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/admin" "le"="1.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/adminÿleÿ2.5" 4073800000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/admin" "le"="2.5"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/adminÿleÿ5.0" 4073800000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/admin" "le"="5.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/adminÿleÿ10.0" 4073800000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/admin" "le"="10.0"
+st 0
+series "request_duration_seconds_bucketÿhandlerÿ/api/adminÿleÿ+Inf" 4073800000000000 - "__name__"="request_duration_seconds_bucket" "handler"="/api/admin" "le"="+Inf"
+st 0
+help "response_size_bytes" "Response size."
+type "response_size_bytes" histogram
+unit "response_size_bytes" "bytes"
+series "response_size_bytes_countÿhandlerÿ/api/query" 40c0728000000000 - "__name__"="response_size_bytes_count" "handler"="/api/query"
+st 0
+series "response_size_bytes_sumÿhandlerÿ/api/query" 41c8c406e0000000 - "__name__"="response_size_bytes_sum" "handler"="/api/query"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/queryÿleÿ128.0" 405e000000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/query" "le"="128.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/queryÿleÿ512.0" 408a400000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/query" "le"="512.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/queryÿleÿ2048.0" 40a2c00000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/query" "le"="2048.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/queryÿleÿ8192.0" 40b3ec0000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/query" "le"="8192.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/queryÿleÿ32768.0" 40be780000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/query" "le"="32768.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/queryÿleÿ131072.0" 40c04f0000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/query" "le"="131072.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/queryÿleÿ524288.0" 40c0720000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/query" "le"="524288.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/queryÿleÿ2.097152e+06" 40c0728000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/query" "le"="2.097152e+06"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/queryÿleÿ+Inf" 40c0728000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/query" "le"="+Inf"
+st 0
+series "response_size_bytes_countÿhandlerÿ/api/write" 40b0720000000000 - "__name__"="response_size_bytes_count" "handler"="/api/write"
+st 0
+series "response_size_bytes_sumÿhandlerÿ/api/write" 41a9643e80000000 - "__name__"="response_size_bytes_sum" "handler"="/api/write"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/writeÿleÿ128.0" 4054000000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/write" "le"="128.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/writeÿleÿ512.0" 4077c00000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/write" "le"="512.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/writeÿleÿ2048.0" 4097700000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/write" "le"="2048.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/writeÿleÿ8192.0" 40a8380000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/write" "le"="8192.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/writeÿleÿ32768.0" 40ae780000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/write" "le"="32768.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/writeÿleÿ131072.0" 40b0540000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/write" "le"="131072.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/writeÿleÿ524288.0" 40b06d0000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/write" "le"="524288.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/writeÿleÿ2.097152e+06" 40b0720000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/write" "le"="2.097152e+06"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/writeÿleÿ+Inf" 40b0720000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/write" "le"="+Inf"
+st 0
+series "response_size_bytes_countÿhandlerÿ/api/health" 40fd4c0000000000 - "__name__"="response_size_bytes_count" "handler"="/api/health"
+st 0
+series "response_size_bytes_sumÿhandlerÿ/api/health" 41724f8000000000 - "__name__"="response_size_bytes_sum" "handler"="/api/health"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/healthÿleÿ128.0" 40fd0d8000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/health" "le"="128.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/healthÿleÿ512.0" 40fd4c0000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/health" "le"="512.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/healthÿleÿ2048.0" 40fd4c0000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/health" "le"="2048.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/healthÿleÿ8192.0" 40fd4c0000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/health" "le"="8192.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/healthÿleÿ32768.0" 40fd4c0000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/health" "le"="32768.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/healthÿleÿ131072.0" 40fd4c0000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/health" "le"="131072.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/healthÿleÿ524288.0" 40fd4c0000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/health" "le"="524288.0"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/healthÿleÿ2.097152e+06" 40fd4c0000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/health" "le"="2.097152e+06"
+st 0
+series "response_size_bytes_bucketÿhandlerÿ/api/healthÿleÿ+Inf" 40fd4c0000000000 - "__name__"="response_size_bytes_bucket" "handler"="/api/health" "le"="+Inf"
+st 0
+help "db_query_duration_seconds" "Database query duration."
+type "db_query_duration_seconds" histogram
+unit "db_query_duration_seconds" "seconds"
+series "db_query_duration_seconds_count" 411d797800000000 - "__name__"="db_query_duration_seconds_count"
+st 0
+series "db_query_duration_seconds_sum" 40a860cccccccccd - "__name__"="db_query_duration_seconds_sum"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ0.001" 40fd4c0000000000 - "__name__"="db_query_duration_seconds_bucket" "le"="0.001"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ0.005" 4117318000000000 - "__name__"="db_query_duration_seconds_bucket" "le"="0.005"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ0.01" 411b292000000000 - "__name__"="db_query_duration_seconds_bucket" "le"="0.01"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ0.05" 411d2cc000000000 - "__name__"="db_query_duration_seconds_bucket" "le"="0.05"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ0.1" 411d6b4000000000 - "__name__"="db_query_duration_seconds_bucket" "le"="0.1"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ0.5" 411d77c000000000 - "__name__"="db_query_duration_seconds_bucket" "le"="0.5"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ1.0" 411d797800000000 - "__name__"="db_query_duration_seconds_bucket" "le"="1.0"
+st 0
+series "db_query_duration_seconds_bucketÿleÿ+Inf" 411d797800000000 - "__name__"="db_query_duration_seconds_bucket" "le"="+Inf"
+st 0
+help "cache_lookup_duration_seconds" "Cache lookup duration."
+type "cache_lookup_duration_seconds" histogram
+unit "cache_lookup_duration_seconds" "seconds"
+series "cache_lookup_duration_seconds_countÿcacheÿlru" 412c21cc00000000 - "__name__"="cache_lookup_duration_seconds_count" "cache"="lru"
+st 0
+series "cache_lookup_duration_seconds_sumÿcacheÿlru" 40458ccccccccccd - "__name__"="cache_lookup_duration_seconds_sum" "cache"="lru"
+st 0
+series "cache_lookup_duration_seconds_bucketÿcacheÿlruÿleÿ1e-06" 41124f8000000000 - "__name__"="cache_lookup_duration_seconds_bucket" "cache"="lru" "le"="1e-06"
+st 0
+series "cache_lookup_duration_seconds_bucketÿcacheÿlruÿleÿ1e-05" 4127cdc000000000 - "__name__"="cache_lookup_duration_seconds_bucket" "cache"="lru" "le"="1e-05"
+st 0
+series "cache_lookup_duration_seconds_bucketÿcacheÿlruÿleÿ0.0001" 412bc56000000000 - "__name__"="cache_lookup_duration_seconds_bucket" "cache"="lru" "le"="0.0001"
+st 0
+series "cache_lookup_duration_seconds_bucketÿcacheÿlruÿleÿ0.001" 412c138000000000 - "__name__"="cache_lookup_duration_seconds_bucket" "cache"="lru" "le"="0.001"
+st 0
+series "cache_lookup_duration_seconds_bucketÿcacheÿlruÿleÿ0.01" 412c219000000000 - "__name__"="cache_lookup_duration_seconds_bucket" "cache"="lru" "le"="0.01"
+st 0
+series "cache_lookup_duration_seconds_bucketÿcacheÿlruÿleÿ0.1" 412c21cc00000000 - "__name__"="cache_lookup_duration_seconds_bucket" "cache"="lru" "le"="0.1"
+st 0
+series "cache_lookup_duration_seconds_bucketÿcacheÿlruÿleÿ+Inf" 412c21cc00000000 - "__name__"="cache_lookup_duration_seconds_bucket" "cache"="lru" "le"="+Inf"
+st 0
+series "cache_lookup_duration_seconds_countÿcacheÿarc" 411312d000000000 - "__name__"="cache_lookup_duration_seconds_count" "cache"="arc"
+st 0
+series "cache_lookup_duration_seconds_sumÿcacheÿarc" 4032666666666666 - "__name__"="cache_lookup_duration_seconds_sum" "cache"="arc"
+st 0
+series "cache_lookup_duration_seconds_bucketÿcacheÿarcÿleÿ1e-06" 40fd4c0000000000 - "__name__"="cache_lookup_duration_seconds_bucket" "cache"="arc" "le"="1e-06"
+st 0
+series "cache_lookup_duration_seconds_bucketÿcacheÿarcÿleÿ1e-05" 4111170000000000 - "__name__"="cache_lookup_duration_seconds_bucket" "cache"="arc" "le"="1e-05"
+st 0
+series "cache_lookup_duration_seconds_bucketÿcacheÿarcÿleÿ0.0001" 4112cc8000000000 - "__name__"="cache_lookup_duration_seconds_bucket" "cache"="arc" "le"="0.0001"
+st 0
+series "cache_lookup_duration_seconds_bucketÿcacheÿarcÿleÿ0.001" 41130b0000000000 - "__name__"="cache_lookup_duration_seconds_bucket" "cache"="arc" "le"="0.001"
+st 0
+series "cache_lookup_duration_seconds_bucketÿcacheÿarcÿleÿ0.01" 411312d000000000 - "__name__"="cache_lookup_duration_seconds_bucket" "cache"="arc" "le"="0.01"
+st 0
+series "cache_lookup_duration_seconds_bucketÿcacheÿarcÿleÿ0.1" 411312d000000000 - "__name__"="cache_lookup_duration_seconds_bucket" "cache"="arc" "le"="0.1"
+st 0
+series "cache_lookup_duration_seconds_bucketÿcacheÿarcÿleÿ+Inf" 411312d000000000 - "__name__"="cache_lookup_duration_seconds_bucket" "cache"="arc" "le"="+Inf"
+st 0
+help "queue_wait_seconds" "Queue wait time."
+type "queue_wait_seconds" histogram
+unit "queue_wait_seconds" "seconds"
+series "queue_wait_seconds_count" 40d1ce8000000000 - "__name__"="queue_wait_seconds_count"
+st 0
+series "queue_wait_seconds_sum" 408cca6666666666 - "__name__"="queue_wait_seconds_sum"
+st 0
+series "queue_wait_seconds_bucketÿleÿ0.001" 40a0680000000000 - "__name__"="queue_wait_seconds_bucket" "le"="0.001"
+st 0
+series "queue_wait_seconds_bucketÿleÿ0.01" 40c0680000000000 - "__name__"="queue_wait_seconds_bucket" "le"="0.01"
+st 0
+series "queue_wait_seconds_bucketÿleÿ0.1" 40cbbc0000000000 - "__name__"="queue_wait_seconds_bucket" "le"="0.1"
+st 0
+series "queue_wait_seconds_bucketÿleÿ1.0" 40d1620000000000 - "__name__"="queue_wait_seconds_bucket" "le"="1.0"
+st 0
+series "queue_wait_seconds_bucketÿleÿ10.0" 40d1cd8000000000 - "__name__"="queue_wait_seconds_bucket" "le"="10.0"
+st 0
+series "queue_wait_seconds_bucketÿleÿ60.0" 40d1ce8000000000 - "__name__"="queue_wait_seconds_bucket" "le"="60.0"
+st 0
+series "queue_wait_seconds_bucketÿleÿ+Inf" 40d1ce8000000000 - "__name__"="queue_wait_seconds_bucket" "le"="+Inf"
+st 0
+help "gc_duration_seconds" "GC duration summary."
+type "gc_duration_seconds" summary
+unit "gc_duration_seconds" "seconds"
+series "gc_duration_seconds_count" 40b2d50000000000 - "__name__"="gc_duration_seconds_count"
+st 0
+series "gc_duration_seconds_sum" 4028cccccccccccd - "__name__"="gc_duration_seconds_sum"
+st 0
+series "gc_duration_secondsÿquantileÿ0.5" 3f62d77318fc5048 - "__name__"="gc_duration_seconds" "quantile"="0.5"
+st 0
+series "gc_duration_secondsÿquantileÿ0.9" 3f8096bb98c7e282 - "__name__"="gc_duration_seconds" "quantile"="0.9"
+st 0
+series "gc_duration_secondsÿquantileÿ0.99" 3f8db22d0e560419 - "__name__"="gc_duration_seconds" "quantile"="0.99"
+st 0
+series "gc_duration_secondsÿquantileÿ1.0" 3f9ff2e48e8a71de - "__name__"="gc_duration_seconds" "quantile"="1.0"
+st 0
+help "allocation_duration_seconds" "Allocation duration summary."
+type "allocation_duration_seconds" summary
+unit "allocation_duration_seconds" "seconds"
+series "allocation_duration_seconds_countÿpoolÿsmall" 41cbbef760000000 - "__name__"="allocation_duration_seconds_count" "pool"="small"
+st 0
+series "allocation_duration_seconds_sumÿpoolÿsmall" 4061c9999999999a - "__name__"="allocation_duration_seconds_sum" "pool"="small"
+st 0
+series "allocation_duration_secondsÿpoolÿsmallÿquantileÿ0.5" 3f1f75104d551d69 - "__name__"="allocation_duration_seconds" "pool"="small" "quantile"="0.5"
+st 0
+series "allocation_duration_secondsÿpoolÿsmallÿquantileÿ0.9" 3f364840e1719f80 - "__name__"="allocation_duration_seconds" "pool"="small" "quantile"="0.9"
+st 0
+series "allocation_duration_secondsÿpoolÿsmallÿquantileÿ0.99" 3f4dd1a21ea35936 - "__name__"="allocation_duration_seconds" "pool"="small" "quantile"="0.99"
+st 0
+series "allocation_duration_seconds_countÿpoolÿmedium" 416b159800000000 - "__name__"="allocation_duration_seconds_count" "pool"="medium"
+st 0
+series "allocation_duration_seconds_sumÿpoolÿmedium" 4055066666666666 - "__name__"="allocation_duration_seconds_sum" "pool"="medium"
+st 0
+series "allocation_duration_secondsÿpoolÿmediumÿquantileÿ0.5" 3f3adea897635e74 - "__name__"="allocation_duration_seconds" "pool"="medium" "quantile"="0.5"
+st 0
+series "allocation_duration_secondsÿpoolÿmediumÿquantileÿ0.9" 3f53a92a30553261 - "__name__"="allocation_duration_seconds" "pool"="medium" "quantile"="0.9"
+st 0
+series "allocation_duration_secondsÿpoolÿmediumÿquantileÿ0.99" 3f6bda5119ce075f - "__name__"="allocation_duration_seconds" "pool"="medium" "quantile"="0.99"
+st 0
+series "allocation_duration_seconds_countÿpoolÿlarge" 408a000000000000 - "__name__"="allocation_duration_seconds_count" "pool"="large"
+st 0
+series "allocation_duration_seconds_sumÿpoolÿlarge" 4035b33333333333 - "__name__"="allocation_duration_seconds_sum" "pool"="large"
+st 0
+series "allocation_duration_secondsÿpoolÿlargeÿquantileÿ0.5" 3f613404ea4a8c15 - "__name__"="allocation_duration_seconds" "pool"="large" "quantile"="0.5"
+st 0
+series "allocation_duration_secondsÿpoolÿlargeÿquantileÿ0.9" 3f813404ea4a8c15 - "__name__"="allocation_duration_seconds" "pool"="large" "quantile"="0.9"
+st 0
+series "allocation_duration_secondsÿpoolÿlargeÿquantileÿ0.99" 3f93a92a30553261 - "__name__"="allocation_duration_seconds" "pool"="large" "quantile"="0.99"
+st 0

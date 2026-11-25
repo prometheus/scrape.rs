@@ -1,0 +1,3 @@
+# TYPE foo summary
+foo 5
+# EOF

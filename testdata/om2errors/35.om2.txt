@@ -1,0 +1,3 @@
+# TYPE foo histogram
+foo {count:1,bucket:[+Inf:1]}
+# EOF

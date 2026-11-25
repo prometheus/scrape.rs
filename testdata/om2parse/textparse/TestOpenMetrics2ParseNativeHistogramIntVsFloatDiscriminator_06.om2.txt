@@ -1,0 +1,3 @@
+type "h" histogram
+histogram "h" - int schema=0 count=5 sum=4029000000000000 zero_threshold=3f50624dd2f1a9fc zero_count=2 hint=0 pos_spans=[0:2] pos=[2,-1] neg_spans=[] neg=[] custom=[] "__name__"="h"
+st 0

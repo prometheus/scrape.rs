@@ -1,0 +1,13 @@
+type "http_requests_total" counter
+unit "http_requests_total" "requests"
+series "http_requests_total{method=\"get\"}" 4014000000000000 - "__name__"="http_requests_total" "method"="get"
+st 0
+type "build_info" info
+series "build_info{version=\"1.0\"}" 3ff0000000000000 - "__name__"="build_info" "version"="1.0"
+st 0
+type "subsystem_enabled" stateset
+series "subsystem_enabled{subsystem_enabled=\"auth\"}" 0000000000000000 - "__name__"="subsystem_enabled" "subsystem_enabled"="auth"
+st 0
+type "unknown_metric" unknown
+series "unknown_metric" 4045000000000000 - "__name__"="unknown_metric"
+st 0

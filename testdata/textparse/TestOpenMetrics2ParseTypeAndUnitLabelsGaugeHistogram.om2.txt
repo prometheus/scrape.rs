@@ -1,0 +1,4 @@
+# TYPE response_size_bytes gaugehistogram
+# UNIT response_size_bytes bytes
+response_size_bytes {gcount:4,gsum:1024.0,bucket:[100:1,500:3,+Inf:4]}
+# EOF

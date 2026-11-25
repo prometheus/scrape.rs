@@ -1,0 +1,2 @@
+type "req_duration" histogram
+error

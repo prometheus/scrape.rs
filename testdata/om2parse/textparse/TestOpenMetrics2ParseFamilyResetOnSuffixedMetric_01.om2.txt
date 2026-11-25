@@ -1,0 +1,3 @@
+type "foo_total" counter
+series "foo_total" 3ff0000000000000 - "__name__"="foo_total"
+st 0

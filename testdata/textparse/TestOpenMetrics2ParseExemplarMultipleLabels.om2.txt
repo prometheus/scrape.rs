@@ -1,0 +1,3 @@
+# TYPE http_requests_total counter
+http_requests_total 1027 1710000000.0 # {trace_id="abc123",span_id="def456"} 1.0 1709999999.0
+# EOF

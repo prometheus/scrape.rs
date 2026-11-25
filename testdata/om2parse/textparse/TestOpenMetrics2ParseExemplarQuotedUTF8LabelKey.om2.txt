@@ -1,0 +1,4 @@
+type "hits" gauge
+series "hits" 4031000000000000 - "__name__"="hits"
+exemplar 4014000000000000 1520879600789 "my.id"="abc"
+st 0

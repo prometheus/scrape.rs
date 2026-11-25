@@ -1,0 +1,12 @@
+type "process_open_fds" gauge
+unit "process_open_fds" "fds"
+series "process_open_fds" 4020000000000000 - "__name__"="process_open_fds"
+st 0
+type "rpc_duration_seconds" summary
+unit "rpc_duration_seconds" "seconds"
+series "rpc_duration_seconds_count" 4024000000000000 - "__name__"="rpc_duration_seconds_count"
+st 0
+series "rpc_duration_seconds_sum" 4014000000000000 - "__name__"="rpc_duration_seconds_sum"
+st 0
+series "rpc_duration_secondsÿquantileÿ0.5" 3ff0000000000000 - "__name__"="rpc_duration_seconds" "quantile"="0.5"
+st 0

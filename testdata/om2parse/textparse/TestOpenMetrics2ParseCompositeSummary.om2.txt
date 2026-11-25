@@ -1,0 +1,12 @@
+help "rpc_duration_seconds" "RPC duration."
+type "rpc_duration_seconds" summary
+series "rpc_duration_seconds_count" 4059000000000000 - "__name__"="rpc_duration_seconds_count"
+st 0
+series "rpc_duration_seconds_sum" 40dd4c0000000000 - "__name__"="rpc_duration_seconds_sum"
+st 0
+series "rpc_duration_secondsÿquantileÿ0.5" 4059000000000000 - "__name__"="rpc_duration_seconds" "quantile"="0.5"
+st 0
+series "rpc_duration_secondsÿquantileÿ0.9" 4069000000000000 - "__name__"="rpc_duration_seconds" "quantile"="0.9"
+st 0
+series "rpc_duration_secondsÿquantileÿ0.99" 4072c00000000000 - "__name__"="rpc_duration_seconds" "quantile"="0.99"
+st 0

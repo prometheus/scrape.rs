@@ -1,0 +1,2 @@
+# TYPE "aÿb" counter
+# EOF

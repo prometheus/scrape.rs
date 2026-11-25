@@ -103,8 +103,9 @@ func renderEntries(parser textparse.Parser, startTimestamps bool) string {
 			parser.Labels(&labelSet)
 			writeLabels(&out, labelSet)
 			var ex exemplar.Exemplar
-			if parser.Exemplar(&ex) {
+			for parser.Exemplar(&ex) {
 				writeExemplar(&out, ex)
+				ex = exemplar.Exemplar{}
 			}
 			writeStartTimestamp(&out, parser, startTimestamps)
 		case textparse.EntryHistogram:

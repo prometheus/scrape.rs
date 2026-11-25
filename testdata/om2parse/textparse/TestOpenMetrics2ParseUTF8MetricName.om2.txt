@@ -1,0 +1,3 @@
+type "metric.name" gauge
+series "{\"metric.name\",label=\"value\"}" 3ff0000000000000 - "__name__"="metric.name" "label"="value"
+st 0

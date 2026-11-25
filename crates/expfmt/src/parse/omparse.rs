@@ -267,20 +267,11 @@ impl<'a> OpenMetricsParser<'a> {
     }
 
     fn unexpected(&self, expected: &'static str) -> ParseError {
-        ParseError::UnexpectedToken {
-            expected,
-            offset: self.lexer.token_start,
-        }
+        unexpected(&self.lexer, expected)
     }
 
     fn utf8_span(&self, start: usize, end: usize) -> Result<ByteSpan, ParseError> {
-        let input = self.lexer.input;
-        if std::str::from_utf8(&input[start..end]).is_err() {
-            return Err(ParseError::InvalidUtf8 {
-                offset: self.lexer.token_start,
-            });
-        }
-        Ok(ByteSpan::new(start, end))
+        utf8_span(&self.lexer, start, end)
     }
 
     fn parse_metadata(&mut self, kind: Token) -> Result<Entry, ParseError> {
@@ -297,16 +288,7 @@ impl<'a> OpenMetricsParser<'a> {
         if self.lexer.lex() != Token::Text {
             return Err(self.unexpected("expected text"));
         }
-        let text_span = self.lexer.token_span();
-        let text = &self.lexer.input[text_span];
-        // The text token starts with a blank and ends with a linebreak, which the lexer
-        // can follow with NUL bytes.
-        let end = text
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .unwrap_or(text.len());
-        let text_end = text_span.start + end;
-        self.text = ByteSpan::new((text_span.start + 1).min(text_end), text_end);
+        self.text = metadata_text(&self.lexer);
         let raw_text = &self.lexer.input[self.text];
         match kind {
             Token::Type => {
@@ -390,21 +372,7 @@ impl<'a> OpenMetricsParser<'a> {
             if self.lexer.lex() != Token::LValue {
                 return Err(self.unexpected("expected label value"));
             }
-            let val_token_start = self.lexer.token_start;
-            let value =
-                std::str::from_utf8(self.lexer.token()).map_err(|_| ParseError::InvalidUtf8 {
-                    offset: val_token_start,
-                })?;
-            // The token can end in NUL bytes after the closing quote. Go drops only the last
-            // byte, so it keeps the quote and all but the last NUL in the value. We cut at the
-            // quote.
-            let close = value.rfind('"').unwrap_or(0);
-            let span = LabelSpan {
-                name_start: start,
-                name_end: end,
-                val_start: val_token_start + 1,
-                val_end: val_token_start + close.max(1),
-            };
+            let span = label_value_span(&self.lexer, start, end)?;
             if exemplar {
                 self.exemplar_labels.push(span);
             } else {
@@ -492,23 +460,12 @@ impl<'a> OpenMetricsParser<'a> {
         let raw = &self.lexer.token()[1..];
         let value = parse_sample_value(raw)
             .ok_or_else(|| ParseError::InvalidValue(String::from_utf8_lossy(raw).into_owned()))?;
-        Ok(if value.is_nan() {
-            f64::from_bits(NORMAL_NAN)
-        } else {
-            value
-        })
+        Ok(normalize_nan(value))
     }
 
     /// Parses the current timestamp token, float seconds after a blank, into milliseconds.
     fn timestamp_value(&self) -> Result<i64, ParseError> {
-        let raw = &self.lexer.token()[1..];
-        let seconds = parse_sample_value(raw)
-            .filter(|seconds| seconds.is_finite())
-            .ok_or_else(|| {
-                ParseError::InvalidTimestamp(String::from_utf8_lossy(raw).into_owned())
-            })?;
-        // NOTE: Rust saturates out-of-range casts, Go's int64() is platform-specific there.
-        Ok((seconds * 1000.0) as i64)
+        timestamp_ms(&self.lexer.token()[1..])
     }
 
     #[inline]
@@ -527,11 +484,7 @@ impl<'a> OpenMetricsParser<'a> {
         let input = self.lexer.input;
         self.labels
             .iter()
-            .filter(|span| {
-                let name =
-                    std::str::from_utf8(&input[span.name_start..span.name_end]).unwrap_or_default();
-                !is_float_label(self.metric_type, name)
-            })
+            .filter(|span| !is_float_label(self.metric_type, span.name(input)))
             .flat_map(|span| {
                 [
                     &input[span.name_start..span.name_end],
@@ -621,12 +574,9 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
         buf.push(Cow::Borrowed(METRIC_NAME_LABEL), unescape_label(name));
         let input = self.lexer.input;
         for span in &self.labels {
-            let raw_name =
-                std::str::from_utf8(&input[span.name_start..span.name_end]).unwrap_or_default();
-            let raw_val =
-                std::str::from_utf8(&input[span.val_start..span.val_end]).unwrap_or_default();
-            let name = unescape_label(raw_name);
-            let value = normalize_float_label(self.metric_type, &name, unescape_label(raw_val));
+            let name = unescape_label(span.name(input));
+            let value =
+                normalize_float_label(self.metric_type, &name, unescape_label(span.value(input)));
             buf.push(name, value);
         }
         buf.sort();
@@ -639,11 +589,10 @@ impl<'a> Parser<'a> for OpenMetricsParser<'a> {
         // series labels, as Go's OpenMetrics 2.0 parser does.
         let input = self.lexer.input;
         for span in &self.exemplar_labels {
-            let raw_name =
-                std::str::from_utf8(&input[span.name_start..span.name_end]).unwrap_or_default();
-            let raw_val =
-                std::str::from_utf8(&input[span.val_start..span.val_end]).unwrap_or_default();
-            buf.push(unescape_label(raw_name), unescape_label(raw_val));
+            buf.push(
+                unescape_label(span.name(input)),
+                unescape_label(span.value(input)),
+            );
         }
         buf.sort();
         Some(exemplar)
@@ -713,7 +662,7 @@ fn is_float_label(metric_type: MetricType, name: &str) -> bool {
 
 /// Go's `normalizeFloatsInLabelValues`: `le` on histograms and `quantile` on summaries
 /// use OpenMetrics float formatting. Keeps `value` borrowed when it is already canonical.
-fn normalize_float_label<'v>(
+pub(super) fn normalize_float_label<'v>(
     metric_type: MetricType,
     name: &str,
     value: Cow<'v, str>,
@@ -736,7 +685,7 @@ fn normalize_float_label<'v>(
 }
 
 /// Maps a `# TYPE` value to a [`MetricType`].
-fn parse_metric_type(text: &[u8]) -> Result<MetricType, ParseError> {
+pub(super) fn parse_metric_type(text: &[u8]) -> Result<MetricType, ParseError> {
     [
         MetricType::Counter,
         MetricType::Gauge,
@@ -753,7 +702,7 @@ fn parse_metric_type(text: &[u8]) -> Result<MetricType, ParseError> {
 }
 
 /// Go's `lvalReplacer`, which replaces `\"`, `\\`, and `\n`.
-fn unescape(raw: &[u8]) -> Cow<'_, [u8]> {
+pub(super) fn unescape(raw: &[u8]) -> Cow<'_, [u8]> {
     if !raw.contains(&b'\\') {
         return Cow::Borrowed(raw);
     }
@@ -775,7 +724,7 @@ fn unescape(raw: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(out)
 }
 
-fn unescape_label(raw: &str) -> Cow<'_, str> {
+pub(super) fn unescape_label(raw: &str) -> Cow<'_, str> {
     match unescape(raw.as_bytes()) {
         Cow::Borrowed(_) => Cow::Borrowed(raw),
         // Replacing ASCII escapes keeps valid UTF-8 valid, so nothing is lost here.
@@ -786,8 +735,80 @@ fn unescape_label(raw: &str) -> Cow<'_, str> {
     }
 }
 
+/// Replaces any NaN with Go's `value.NormalNaN`.
+pub(super) fn normalize_nan(value: f64) -> f64 {
+    if value.is_nan() {
+        f64::from_bits(NORMAL_NAN)
+    } else {
+        value
+    }
+}
+
+pub(super) fn unexpected(lexer: &Lexer<'_>, expected: &'static str) -> ParseError {
+    ParseError::UnexpectedToken {
+        expected,
+        offset: lexer.token_start,
+    }
+}
+
+pub(super) fn utf8_span(
+    lexer: &Lexer<'_>,
+    start: usize,
+    end: usize,
+) -> Result<ByteSpan, ParseError> {
+    if std::str::from_utf8(&lexer.input[start..end]).is_err() {
+        return Err(ParseError::InvalidUtf8 {
+            offset: lexer.token_start,
+        });
+    }
+    Ok(ByteSpan::new(start, end))
+}
+
+/// The text of the current `# HELP`, `# TYPE`, or `# UNIT` token. The token starts with a
+/// blank and ends with a linebreak, which the lexer can follow with NUL bytes.
+pub(super) fn metadata_text(lexer: &Lexer<'_>) -> ByteSpan {
+    let span = lexer.token_span();
+    let text = &lexer.input[span];
+    let end = span.start
+        + text
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .unwrap_or(text.len());
+    ByteSpan::new((span.start + 1).min(end), end)
+}
+
+/// The label at `name_start..name_end` with the current label value token.
+pub(super) fn label_value_span(
+    lexer: &Lexer<'_>,
+    name_start: usize,
+    name_end: usize,
+) -> Result<LabelSpan, ParseError> {
+    let token_start = lexer.token_start;
+    let value = std::str::from_utf8(lexer.token()).map_err(|_| ParseError::InvalidUtf8 {
+        offset: token_start,
+    })?;
+    // The token can end in NUL bytes after the closing quote. Go drops only the last byte, so
+    // it keeps the quote and all but the last NUL in the value. We cut at the quote.
+    let close = value.rfind('"').unwrap_or(0);
+    Ok(LabelSpan {
+        name_start,
+        name_end,
+        val_start: token_start + 1,
+        val_end: token_start + close.max(1),
+    })
+}
+
+/// Parses float seconds into milliseconds.
+pub(super) fn timestamp_ms(raw: &[u8]) -> Result<i64, ParseError> {
+    let seconds = parse_sample_value(raw)
+        .filter(|seconds| seconds.is_finite())
+        .ok_or_else(|| ParseError::InvalidTimestamp(String::from_utf8_lossy(raw).into_owned()))?;
+    // NOTE: Rust saturates out-of-range casts, Go's int64() is platform-specific there.
+    Ok((seconds * 1000.0) as i64)
+}
+
 /// Go's `parseFloat` in promparse.go, which rejects `pP_` before `strconv.ParseFloat`.
-fn parse_sample_value(raw: &[u8]) -> Option<f64> {
+pub(super) fn parse_sample_value(raw: &[u8]) -> Option<f64> {
     if raw.iter().any(|byte| matches!(byte, b'p' | b'P' | b'_')) {
         return None;
     }

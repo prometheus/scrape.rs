@@ -1,0 +1,2 @@
+bare_metric 42
+# EOF

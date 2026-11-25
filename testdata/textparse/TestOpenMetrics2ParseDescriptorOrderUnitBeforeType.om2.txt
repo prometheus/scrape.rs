@@ -1,0 +1,4 @@
+# UNIT http_requests requests
+# TYPE http_requests counter
+http_requests 1.0
+# EOF

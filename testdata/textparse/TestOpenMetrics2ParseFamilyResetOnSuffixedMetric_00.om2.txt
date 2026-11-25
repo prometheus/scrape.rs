@@ -1,0 +1,3 @@
+# TYPE foo counter
+foo_total 1.0
+# EOF

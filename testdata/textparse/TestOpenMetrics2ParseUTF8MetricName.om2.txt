@@ -1,0 +1,3 @@
+# TYPE "metric.name" gauge
+{"metric.name",label="value"} 1.0
+# EOF
