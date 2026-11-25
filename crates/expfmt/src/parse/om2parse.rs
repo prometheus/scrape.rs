@@ -16,6 +16,7 @@
 //! with default `ParserOptions`.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::ops::Range;
 
 use super::float::{FloatBuf, common_openmetrics_float, format_openmetrics_float, parse_go_float};
@@ -183,9 +184,13 @@ impl<'a> Pending<'a> {
         for (label, label_value) in &self.line_labels {
             while let Some((special_label, special_value)) =
                 special.next_if(|(special_label, _)| {
-                    // An injected bound goes after a line label of the same name, like Go's sort.
-                    *special_label < label.as_ref()
-                        || (*special_label == METRIC_NAME_LABEL && *special_label == label.as_ref())
+                    // On a name tie, Go puts `__name__` before the line label and the injected
+                    // bound after it.
+                    match (*special_label).cmp(label.as_ref()) {
+                        Ordering::Less => true,
+                        Ordering::Equal => *special_label == METRIC_NAME_LABEL,
+                        Ordering::Greater => false,
+                    }
                 })
             {
                 append_series_label(out, special_label, special_value);
@@ -1164,17 +1169,12 @@ mod tests {
         });
         let invalid_name = Err(ParseError::InvalidMetricName { offset: 0 });
         for (input, expected) in [
-            (&b"a 1 # {\"x\"} 1 2\n# EOF\n"[..], label_name_expected),
-            (b"foo{\"bar\"} 1\n# EOF\n", invalid_name.clone()),
-            (b"{a=\"b\"} 1\n# EOF\n", invalid_name),
+            ("a 1 # {\"x\"} 1 2\n# EOF\n", label_name_expected),
+            ("foo{\"bar\"} 1\n# EOF\n", invalid_name.clone()),
+            ("{a=\"b\"} 1\n# EOF\n", invalid_name),
         ] {
-            let mut parser = OpenMetrics2Parser::new(input);
-            assert_eq!(
-                parser.next_entry(),
-                expected,
-                "{}",
-                String::from_utf8_lossy(input)
-            );
+            let mut parser = OpenMetrics2Parser::new(input.as_bytes());
+            assert_eq!(parser.next_entry(), expected, "{input}");
         }
     }
 
@@ -1186,12 +1186,6 @@ mod tests {
             # EOF\n";
         let mut parser = OpenMetrics2Parser::new(input);
         let mut labels = LabelsBuffer::new();
-        let label_value = |labels: &LabelsBuffer<'_>, name: &str| {
-            labels
-                .iter()
-                .find(|(label, _)| *label == name)
-                .map(|(_, value)| value.to_string())
-        };
         assert_eq!(parser.next_entry(), Ok(Some(Entry::Type)));
 
         assert_eq!(parser.next_entry(), Ok(Some(Entry::Histogram)));
@@ -1203,9 +1197,9 @@ mod tests {
         assert_eq!(histogram.negative_buckets, [2]);
         assert_eq!(parser.start_timestamp(), Some(4000));
         parser.labels(&mut labels);
-        assert_eq!(label_value(&labels, "a").as_deref(), Some("b"));
+        assert_eq!(labels.get("a"), Some("b"));
         assert_eq!(parser.exemplar(&mut labels), Some((1.0, Some(6000))));
-        assert_eq!(label_value(&labels, "x").as_deref(), Some("y"));
+        assert_eq!(labels.get("x"), Some("y"));
 
         assert_eq!(parser.next_entry(), Ok(Some(Entry::Histogram)));
         let (_, timestamp, histogram) = parser.histogram();
@@ -1217,7 +1211,7 @@ mod tests {
         assert!(histogram.negative_buckets.is_empty());
         assert_eq!(parser.start_timestamp(), None);
         parser.labels(&mut labels);
-        assert_eq!(label_value(&labels, "a").as_deref(), Some("c"));
+        assert_eq!(labels.get("a"), Some("c"));
         assert_eq!(parser.exemplar(&mut labels), None);
     }
 
