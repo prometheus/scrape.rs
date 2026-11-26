@@ -43,10 +43,11 @@ use crate::parse::{
 
 use self::columns::{
     AttrEncoding, HistogramDpTable, MetricTable, NumberDpTable, ScratchBuffers, SummaryDpTable,
-    f64_to_u64_count, ms_to_ns, parse_hex_array,
+    f64_to_u64_count, parse_hex_array,
 };
 use self::family::{CurrentFamily, FamilyAssembly, SeriesRole};
 use self::intern::StringInterner;
+use self::options::ms_to_ns;
 pub use self::options::{
     CounterSuffixPolicy, DECODE_BUDGET_DURATION_CHECK_INTERVAL, DEFAULT_DECODE_BUDGET_MAX_BYTES,
     DEFAULT_DECODE_BUDGET_MAX_DURATION, DEFAULT_DECODE_BUDGET_MAX_ENTRIES,
@@ -978,6 +979,9 @@ impl ArrowDecoder {
         format: &Format,
         opts: &DecodeOptions,
     ) -> Result<(ActiveParser<'input>, Option<i64>), DecodeError> {
+        if !opts.honor_timestamps && opts.timestamp_ms.is_none() {
+            return Err(DecodeError::MissingFallbackTimestamp);
+        }
         let default_ts_ns = match opts.timestamp_ms {
             Some(ms) => Some(ms_to_ns(ms)?),
             None => None,
@@ -1419,7 +1423,9 @@ impl ArrowDecoder {
             | SeriesRole::HistogramCount
             | SeriesRole::SummaryQuantile
             | SeriesRole::SummarySum
-            | SeriesRole::SummaryCount => self.append_assembled_series(parser, role, default_ts_ns),
+            | SeriesRole::SummaryCount => {
+                self.append_assembled_series(parser, role, opts, default_ts_ns)
+            }
         }
     }
 
@@ -1476,10 +1482,7 @@ impl ArrowDecoder {
             .current_family
             .emit_into_batch(&mut self.metrics, opts)?;
         let start_ts_ns = start_ts_ms.and_then(|ms| ms.checked_mul(1_000_000));
-        let resolved_ts_ns = match sample_ts_ms {
-            Some(ms) => Some(ms_to_ns(ms)?),
-            None => default_ts_ns,
-        };
+        let resolved_ts_ns = opts.resolve_sample_ts_ns(sample_ts_ms, default_ts_ns)?;
         if !is_stale {
             self.num_dp
                 .base
@@ -1496,7 +1499,10 @@ impl ArrowDecoder {
         }
 
         if TRACKED && let Some(tr) = tracker.as_deref_mut() {
-            if sample_ts_ms.is_none() || opts.track_timestamps_staleness {
+            // As in Prometheus, an ignored wire timestamp makes the sample untimestamped,
+            // so it is tracked for staleness like any other untimestamped sample.
+            let has_honored_wire_ts = opts.honor_timestamps && sample_ts_ms.is_some();
+            if !has_honored_wire_ts || opts.track_timestamps_staleness {
                 tr.record_series(
                     &mut self.current_family,
                     DpKind::Number,
@@ -1516,6 +1522,7 @@ impl ArrowDecoder {
         &mut self,
         parser: &mut ActiveParser<'_>,
         role: SeriesRole,
+        opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
         let special_label = match role {
@@ -1531,10 +1538,11 @@ impl ArrowDecoder {
         };
 
         let group_idx = self.assembly.find_or_create_group(&self.temp_attrs);
-        let sample_ts_ns = match sample_ts_ms {
-            Some(ms) => Some(ms_to_ns(ms)?),
-            None => None,
-        };
+        // The scrape timestamp is applied per data point when the family is flushed,
+        // so no fallback is resolved here.
+        // Resolving one here would let this path and `append_scalar_series` disagree on which
+        // timestamp wins.
+        let sample_ts_ns = opts.resolve_sample_ts_ns(sample_ts_ms, None)?;
         let om_start_ts_ns = if !self.assembly.groups[group_idx].start_ts_checked {
             self.assembly.groups[group_idx].start_ts_checked = true;
             if parser.is_openmetrics() {

@@ -1288,13 +1288,6 @@ impl HistogramDpTable {
 }
 
 #[inline]
-pub(super) fn ms_to_ns(timestamp_ms: i64) -> Result<i64, DecodeError> {
-    timestamp_ms
-        .checked_mul(1_000_000)
-        .ok_or(DecodeError::TimestampOverflow { timestamp_ms })
-}
-
-#[inline]
 pub(super) fn f64_to_u64_count(value: f64) -> u64 {
     if value.is_sign_positive() && value.is_finite() {
         value as u64

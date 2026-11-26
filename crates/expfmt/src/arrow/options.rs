@@ -150,10 +150,26 @@ pub enum UntypedPolicy {
 
 /// Options controlling [`super::ArrowDecoder::decode`] and [`super::ArrowDecoder::decode_stream`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodeOptions {
     /// Default timestamp in milliseconds since the Unix epoch applied to samples that omit an
-    /// explicit wire timestamp. When `None`, untimestamped samples leave `time_unix_nano` unset.
+    /// explicit wire timestamp, or to every sample when [`Self::honor_timestamps`] is `false`.
+    /// This cannot be None when [`Self::honor_timestamps`] is `false`; decoding rejects that
+    /// combination with [`DecodeError::MissingFallbackTimestamp`].
     pub timestamp_ms: Option<i64>,
+    /// Whether to honor explicit wire sample timestamps. Defaults to `true`.
+    /// When `false`, every sample timestamp is [`Self::timestamp_ms`] instead, and the ignored
+    /// wire timestamp is never converted to nanoseconds, so an out-of-range value cannot fail
+    /// decoding. Wire syntax is still validated by the parser. Start timestamps and exemplar
+    /// timestamps that carry a wire value are unaffected; an exemplar without one falls back to
+    /// [`Self::timestamp_ms`]. Disabling the flag requires [`Self::timestamp_ms`]; decoding rejects
+    /// the combination without one.
+    ///
+    /// Consumers of this policy, such as staleness tracking or duplicate detection, must gate on
+    /// this flag together with wire-timestamp presence, not on the resolved timestamp: with the
+    /// flag equal to `false`, `time_unix_nano` is always populated from [`Self::timestamp_ms`],
+    /// yet every sample is untimestamped.
+    pub honor_timestamps: bool,
     /// Maximum number of data points materialized per [`super::OtapMetricRecords`] chunk yielded by
     /// [`super::ArrowDecoder::decode_stream`]. Values of `0` are clamped to `1`. Single-batch
     /// [`super::ArrowDecoder::decode`] ignores this limit.
@@ -184,6 +200,7 @@ impl DecodeOptions {
     pub const fn new() -> Self {
         Self {
             timestamp_ms: None,
+            honor_timestamps: true,
             max_data_points_per_batch: DEFAULT_MAX_DATA_POINTS_PER_BATCH,
             counter_suffix_policy: CounterSuffixPolicy::Keep,
             unit_suffix_policy: UnitSuffixPolicy::Keep,
@@ -192,10 +209,21 @@ impl DecodeOptions {
         }
     }
 
-    /// Sets the fallback timestamp in milliseconds for samples without an explicit wire timestamp.
+    /// Sets the fallback timestamp in milliseconds for samples without an honored wire timestamp.
     #[must_use]
     pub const fn with_timestamp_ms(mut self, timestamp_ms: i64) -> Self {
         self.timestamp_ms = Some(timestamp_ms);
+        self
+    }
+
+    /// Sets whether to honor explicit wire sample timestamps.
+    ///
+    /// Disable it to stamp every data point with [`Self::timestamp_ms`], which must then be set;
+    /// decoding rejects the combination otherwise. Start timestamps and exemplar timestamps that
+    /// carry a wire value are unaffected either way.
+    #[must_use]
+    pub const fn with_honor_timestamps(mut self, honor_timestamps: bool) -> Self {
+        self.honor_timestamps = honor_timestamps;
         self
     }
 
@@ -238,6 +266,36 @@ impl DecodeOptions {
         self.track_timestamps_staleness = track;
         self
     }
+
+    /// Resolves the `time_unix_nano` written for one data point.
+    ///
+    /// With [`Self::honor_timestamps`] set to `true`, a wire timestamp wins and one that does not fit in
+    /// nanoseconds is an error. With it set to `false`, the wire timestamp is ignored without being
+    /// converted and `fallback_ts_ns` is used instead. Callers that apply the fallback later, such
+    /// as assembled histogram and summary families, pass `None` here.
+    ///
+    /// Callers must not infer the policy from `wire_ts_ms`; see [`Self::honor_timestamps`].
+    #[inline]
+    pub(super) fn resolve_sample_ts_ns(
+        &self,
+        wire_ts_ms: Option<i64>,
+        fallback_ts_ns: Option<i64>,
+    ) -> Result<Option<i64>, DecodeError> {
+        if !self.honor_timestamps {
+            return Ok(fallback_ts_ns);
+        }
+        match wire_ts_ms {
+            Some(ms) => Ok(Some(ms_to_ns(ms)?)),
+            None => Ok(fallback_ts_ns),
+        }
+    }
+}
+
+#[inline]
+pub(super) fn ms_to_ns(timestamp_ms: i64) -> Result<i64, DecodeError> {
+    timestamp_ms
+        .checked_mul(1_000_000)
+        .ok_or(DecodeError::TimestampOverflow { timestamp_ms })
 }
 
 /// Errors returned by [`super::ArrowDecoder::decode`].
@@ -341,6 +399,15 @@ pub enum DecodeError {
         /// Offending label name.
         label: String,
     },
+
+    /// [`super::DecodeOptions::honor_timestamps`] was set to `false` without a fallback timestamp.
+    ///
+    /// Ignoring wire sample timestamps requires [`super::DecodeOptions::timestamp_ms`] to replace
+    /// them, so the combination is rejected before the format is dispatched and before any input is
+    /// parsed. Honoring timestamps does not require a fallback: samples that carry neither a wire
+    /// timestamp nor a default still leave `time_unix_nano` unset.
+    #[error("honor_timestamps = false requires timestamp_ms")]
+    MissingFallbackTimestamp,
 
     /// Converting a millisecond timestamp to nanoseconds overflowed `i64`.
     #[error("timestamp {timestamp_ms} ms overflows i64 nanoseconds")]

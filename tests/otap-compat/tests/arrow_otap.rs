@@ -98,6 +98,69 @@ fn number_dp(attrs: &[(&str, &str)], time_unix_nano: u64, val: f64) -> NumberDat
 }
 
 #[test]
+fn ignored_sample_timestamps_preserve_exemplars_through_otap_round_trip() {
+    let payload = concat!(
+        "# TYPE c counter\n",
+        "c_total 2 10.0 # {id=\"a\"} 1 7.0\n",
+        "# TYPE h histogram\n",
+        "h_bucket{le=\"+Inf\"} 2 10.0 # {id=\"a\"} 1 7.0\n",
+        "h_sum 1.5 10.0\nh_count 2 10.0\n# EOF\n",
+    );
+    let opts = DecodeOptions::new()
+        .with_timestamp_ms(20_000)
+        .with_honor_timestamps(false)
+        .with_max_data_points_per_batch(1);
+    let mut decoder = ArrowDecoder::new();
+    for streaming in [false, true] {
+        let chunks = if streaming {
+            decoder
+                .decode_stream(payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        } else {
+            vec![
+                decoder
+                    .decode(payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts)
+                    .unwrap(),
+            ]
+        };
+        let mut metric_count = 0;
+        for records in chunks {
+            let mut otap = to_otap_arrow_records(&records);
+            let plain = otap_to_otlp(&otap);
+            otap.encode_transport_optimized().unwrap();
+            otap.decode_transport_optimized_ids().unwrap();
+            let round_tripped = otap_to_otlp(&otap);
+            assert_equivalent(
+                std::slice::from_ref(&plain),
+                std::slice::from_ref(&round_tripped),
+            );
+            let OtlpProtoMessage::Metrics(metrics_data) = round_tripped else {
+                panic!("expected metrics");
+            };
+            for metric in &metrics_data.resource_metrics[0].scope_metrics[0].metrics {
+                let (timestamp, exemplars) = match metric.data.as_ref().unwrap() {
+                    metric::Data::Sum(sum) => {
+                        let point = &sum.data_points[0];
+                        (point.time_unix_nano, &point.exemplars)
+                    }
+                    metric::Data::Histogram(histogram) => {
+                        let point = &histogram.data_points[0];
+                        (point.time_unix_nano, &point.exemplars)
+                    }
+                    _ => panic!("unexpected metric type"),
+                };
+                assert_eq!(timestamp, 20_000_000_000);
+                assert_eq!(exemplars.len(), 1);
+                assert_eq!(exemplars[0].time_unix_nano, 7_000_000_000);
+                metric_count += 1;
+            }
+        }
+        assert_eq!(metric_count, 2);
+    }
+}
+
+#[test]
 fn metric_payload_type_discriminants_match_otap_proto() {
     let cases = [
         (

@@ -20,6 +20,328 @@ use arrow_schema::{DataType, TimeUnit};
 use super::schema::{OTAP_METRIC_TYPE_GAUGE, OTAP_METRIC_TYPE_SUM};
 use super::*;
 
+fn assert_timestamp_column(
+    batch: &arrow_array::RecordBatch,
+    column_name: &str,
+    expected: Option<i64>,
+) {
+    let column = batch.column_by_name(column_name);
+    let Some(expected) = expected else {
+        // An untimestamped batch omits the column entirely rather than materializing an all-null
+        // column, which is also what downstream OTAP consumers observe.
+        assert!(column.is_none(), "{column_name} should be omitted");
+        return;
+    };
+    let timestamps = column
+        .unwrap()
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    assert_eq!(timestamps.len(), batch.num_rows());
+    assert_eq!(timestamps.null_count(), 0);
+    assert!(timestamps.values().iter().all(|&value| value == expected));
+}
+
+#[test]
+fn sample_timestamp_policy_applies_to_single_and_streamed_data_points() {
+    assert!(DecodeOptions::new().honor_timestamps);
+    assert_eq!(DecodeOptions::new(), DecodeOptions::default());
+
+    let mut decoder = ArrowDecoder::new();
+    for (format, wire_timestamp, expected_wire_ns) in [
+        // An empty wire timestamp leaves every line untimestamped.
+        (Format::TEXT, "", None),
+        (Format::OPEN_METRICS_1_0_0, "", None),
+        (Format::TEXT, "10000", Some(10_000_000_000)),
+        (Format::TEXT, "0", Some(0)),
+        (Format::TEXT, "9223372036855", None),
+        (Format::OPEN_METRICS_1_0_0, "10.0", Some(10_000_000_000)),
+        (Format::OPEN_METRICS_1_0_0, "0.0", Some(0)),
+        (Format::OPEN_METRICS_1_0_0, "-10.0", Some(-10_000_000_000)),
+        (Format::OPEN_METRICS_1_0_0, "1000000000000.0", None),
+        (Format::OPEN_METRICS_1_0_0, "-1000000000000.0", None),
+    ] {
+        // Scalars and every component of assembled families carry the same wire timestamp, if any.
+        let has_wire_ts = !wire_timestamp.is_empty();
+        let mut payload = concat!(
+            "# TYPE c counter\nc_total 2 TS\n",
+            "# TYPE g gauge\ng 3 TS\nu 4 TS\n",
+            "# TYPE h histogram\n",
+            "h_bucket{le=\"1\"} 1 TS\nh_bucket{le=\"+Inf\"} 2 TS\n",
+            "h_sum 1.5 TS\nh_count 2 TS\n",
+            "# TYPE s summary\ns{quantile=\"0.5\"} 0.2 TS\n",
+            "s_sum 0.2 TS\ns_count 1 TS\n",
+        )
+        .replace(
+            " TS",
+            &if has_wire_ts {
+                format!(" {wire_timestamp}")
+            } else {
+                String::new()
+            },
+        );
+        if format == Format::OPEN_METRICS_1_0_0 {
+            payload.push_str("# EOF\n");
+        }
+
+        for honor_timestamps in [true, false] {
+            for timestamp_ms in [Some(20_000), None] {
+                let opts = DecodeOptions::new()
+                    .with_honor_timestamps(honor_timestamps)
+                    .with_max_data_points_per_batch(1);
+                let opts = match timestamp_ms {
+                    Some(ms) => opts.with_timestamp_ms(ms),
+                    None => opts,
+                };
+
+                for streaming in [false, true] {
+                    let result = if streaming {
+                        decoder
+                            .decode_stream(payload.as_bytes(), &format, &opts)
+                            .collect::<Result<Vec<_>, _>>()
+                    } else {
+                        decoder
+                            .decode(payload.as_bytes(), &format, &opts)
+                            .map(|records| vec![records])
+                    };
+                    if !honor_timestamps && timestamp_ms.is_none() {
+                        assert!(
+                            matches!(result, Err(DecodeError::MissingFallbackTimestamp)),
+                            "format={format:?}, timestamp={wire_timestamp}, streaming={streaming}"
+                        );
+                        continue;
+                    }
+                    if honor_timestamps && has_wire_ts && expected_wire_ns.is_none() {
+                        assert!(matches!(result, Err(DecodeError::TimestampOverflow { .. })));
+                        continue;
+                    }
+                    let chunks = result.unwrap_or_else(|err| {
+                        panic!(
+                            "format={format:?}, timestamp={wire_timestamp}, honor_timestamps={honor_timestamps}, fallback={timestamp_ms:?}, streaming={streaming}: {err:?}"
+                        )
+                    });
+                    assert_eq!(
+                        chunks
+                            .iter()
+                            .map(OtapMetricRecords::num_data_points)
+                            .sum::<usize>(),
+                        5
+                    );
+                    // Untimestamped samples, and every sample when wire timestamps are ignored,
+                    // fall back to `timestamp_ms`; with no fallback the column is omitted.
+                    let expected = if honor_timestamps && has_wire_ts {
+                        expected_wire_ns
+                    } else {
+                        timestamp_ms.map(|ms| ms * 1_000_000)
+                    };
+                    for records in chunks {
+                        for batch in [
+                            records.number_data_points(),
+                            records.histogram_data_points(),
+                            records.summary_data_points(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            assert_timestamp_column(batch, "time_unix_nano", expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn assembled_families_take_a_wire_timestamp_from_any_line() {
+    // Only a later line of each histogram and summary carries a wire timestamp, so the fallback
+    // must not be resolved on the first line, or it would win over the later wire timestamp.
+    let payload = concat!(
+        "# TYPE h histogram\n",
+        "h_bucket{le=\"+Inf\"} 2\nh_sum 1.5 TS\nh_count 2\n",
+        "# TYPE s summary\n",
+        "s{quantile=\"0.5\"} 0.2\ns_sum 0.2 TS\ns_count 1\n",
+    );
+    let mut decoder = ArrowDecoder::new();
+    for (wire_timestamp, expected_wire_ns) in [
+        ("10000", Some(10_000_000_000)),
+        // Fits in milliseconds but overflows nanoseconds; no scalar line precedes it.
+        ("9223372036855", None),
+    ] {
+        let payload = payload.replace("TS", wire_timestamp);
+        for honor_timestamps in [true, false] {
+            let opts = DecodeOptions::new()
+                .with_timestamp_ms(20_000)
+                .with_honor_timestamps(honor_timestamps)
+                .with_max_data_points_per_batch(1);
+            for streaming in [false, true] {
+                let result = if streaming {
+                    decoder
+                        .decode_stream(payload.as_bytes(), &Format::TEXT, &opts)
+                        .collect::<Result<Vec<_>, _>>()
+                } else {
+                    decoder
+                        .decode(payload.as_bytes(), &Format::TEXT, &opts)
+                        .map(|records| vec![records])
+                };
+                let context = format!(
+                    "timestamp={wire_timestamp}, honor_timestamps={honor_timestamps}, streaming={streaming}"
+                );
+                if honor_timestamps && expected_wire_ns.is_none() {
+                    assert!(
+                        matches!(result, Err(DecodeError::TimestampOverflow { .. })),
+                        "{context}"
+                    );
+                    continue;
+                }
+                let chunks = result.unwrap_or_else(|err| panic!("{context}: {err:?}"));
+                let expected = if honor_timestamps {
+                    expected_wire_ns
+                } else {
+                    Some(20_000_000_000)
+                };
+                let mut data_points = 0;
+                for records in chunks {
+                    for batch in [
+                        records.histogram_data_points(),
+                        records.summary_data_points(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        assert_timestamp_column(batch, "time_unix_nano", expected);
+                        data_points += batch.num_rows();
+                    }
+                }
+                assert_eq!(data_points, 2, "{context}");
+            }
+        }
+    }
+}
+
+#[test]
+fn ignoring_sample_timestamps_preserves_exemplar_and_start_timestamps() {
+    let payload = concat!(
+        "# TYPE c counter\n",
+        "c_total 2 10.0 # {trace_id=\"0123456789abcdef0123456789abcdef\"} 1 7.0\n",
+        "c_created 1.0\n",
+        "# TYPE h histogram\n",
+        "h_bucket{le=\"+Inf\"} 2 10.0 # {trace_id=\"0123456789abcdef0123456789abcdef\"} 1 7.0\n",
+        "h_sum 1.5 10.0\nh_count 2 10.0\nh_created 1.0\n",
+        "# TYPE s summary\ns{quantile=\"0.5\"} 0.2 10.0\n",
+        "s_sum 0.2 10.0\ns_count 1 10.0\ns_created 1.0\n# EOF\n",
+    );
+    let mut decoder = ArrowDecoder::new();
+    for honor_timestamps in [true, false] {
+        let opts = DecodeOptions::new()
+            .with_timestamp_ms(20_000)
+            .with_honor_timestamps(honor_timestamps)
+            .with_max_data_points_per_batch(1);
+        for streaming in [false, true] {
+            let chunks = if streaming {
+                decoder
+                    .decode_stream(payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts)
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            } else {
+                vec![
+                    decoder
+                        .decode(payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts)
+                        .unwrap(),
+                ]
+            };
+            let mut exemplar_count = 0;
+            for records in chunks {
+                for batch in [
+                    records.number_data_points(),
+                    records.histogram_data_points(),
+                    records.summary_data_points(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let expected = if honor_timestamps {
+                        10_000_000_000
+                    } else {
+                        20_000_000_000
+                    };
+                    assert_timestamp_column(batch, "time_unix_nano", Some(expected));
+                    assert_timestamp_column(batch, "start_time_unix_nano", Some(1_000_000_000));
+                }
+                for batch in [
+                    records.number_dp_exemplars(),
+                    records.histogram_dp_exemplars(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    assert_timestamp_column(batch, "time_unix_nano", Some(7_000_000_000));
+                    exemplar_count += batch.num_rows();
+                }
+            }
+            assert_eq!(exemplar_count, 2);
+        }
+    }
+}
+
+#[test]
+fn ignoring_sample_timestamps_still_validates_syntax_defaults_and_exemplars() {
+    let mut decoder = ArrowDecoder::new();
+    let opts = DecodeOptions::new()
+        .with_timestamp_ms(20_000)
+        .with_honor_timestamps(false);
+    // Like Go's Prometheus text lexer, signed wire timestamps are invalid syntax even when
+    // sample timestamps are ignored. OpenMetrics signed timestamps are covered above.
+    for payload in ["m 1 invalid\n", "m 1 -10000\n", "m 1 -9223372036855\n"] {
+        assert!(matches!(
+            decoder.decode(payload.as_bytes(), &Format::TEXT, &opts),
+            Err(DecodeError::Syntax { .. } | DecodeError::InvalidTimestamp(_))
+        ));
+    }
+    let opts = opts.with_timestamp_ms(9_223_372_036_855);
+    assert!(matches!(
+        decoder.decode(b"m 1 10000\n", &Format::TEXT, &opts),
+        Err(DecodeError::TimestampOverflow { .. })
+    ));
+
+    let opts = DecodeOptions::new()
+        .with_timestamp_ms(20_000)
+        .with_honor_timestamps(false);
+    for payload in [
+        "# TYPE c counter\nc_total 2 10.0 # {id=\"a\"} 1 1000000000000.0\n# EOF\n",
+        "# TYPE h histogram\nh_bucket{le=\"+Inf\"} 2 10.0 # {id=\"a\"} 1 1000000000000.0\n# EOF\n",
+    ] {
+        assert!(matches!(
+            decoder.decode(payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts),
+            Err(DecodeError::TimestampOverflow { .. })
+        ));
+    }
+}
+
+#[test]
+fn ignoring_sample_timestamps_requires_fallback_timestamp() {
+    let mut decoder = ArrowDecoder::new();
+    let opts = DecodeOptions::new().with_honor_timestamps(false);
+    let input = b"m 1 10000\n";
+    assert!(matches!(
+        decoder.decode(input, &Format::TEXT, &opts),
+        Err(DecodeError::MissingFallbackTimestamp)
+    ));
+    assert!(matches!(
+        decoder.start_decode(&Format::TEXT, &opts),
+        Err(DecodeError::MissingFallbackTimestamp)
+    ));
+    assert!(matches!(
+        decoder.start_decode_stream(&Format::TEXT, &opts),
+        Err(DecodeError::MissingFallbackTimestamp)
+    ));
+    let mut stream = decoder.decode_stream(input, &Format::TEXT, &opts);
+    assert!(matches!(
+        stream.next(),
+        Some(Err(DecodeError::MissingFallbackTimestamp))
+    ));
+}
+
 #[test]
 fn empty_and_metadata_only_inputs_produce_empty_records() {
     let mut dec = ArrowDecoder::new();
@@ -1993,6 +2315,32 @@ fn staleness_wire_nans_type_transitions_policies_and_cooperative_cursor() {
         )
         .unwrap();
     assert_eq!(ts_stale.num_data_points(), 1);
+
+    // Ignoring wire timestamps makes every sample untimestamped, as Prometheus clears parsed
+    // timestamps before tracking staleness, so scalar and assembled series are tracked even
+    // with `track_timestamps_staleness == false`.
+    let ignore_ts_opts = opts.with_honor_timestamps(false);
+    let mut ignore_ts_tracker = StalenessTracker::new();
+    dec.decode_with_staleness(
+        b"# TYPE ig gauge\nig 1 1700000000000\n\
+          # TYPE is summary\nis_sum 1 1700000000000\nis_count 1 1700000000000\n\
+          # TYPE ih histogram\nih_bucket{le=\"+Inf\"} 1 1700000000000\nih_sum 1 1700000000000\nih_count 1 1700000000000\n",
+        &Format::TEXT,
+        &ignore_ts_opts,
+        &mut ignore_ts_tracker,
+    )
+    .unwrap();
+    assert_eq!(ignore_ts_tracker.active_series_len(), 3);
+    let ignore_ts_stale = dec
+        .decode_with_staleness(
+            b"",
+            &Format::TEXT,
+            &ignore_ts_opts.with_timestamp_ms(2_000),
+            &mut ignore_ts_tracker,
+        )
+        .unwrap();
+    assert_eq!(ignore_ts_stale.num_data_points(), 3);
+    assert!(ignore_ts_tracker.is_empty());
 
     // Mixed family (untimestamped series + explicit-timestamp series with `track_timestamps_staleness == false`):
     // when the untimestamped series disappears while the explicit-timestamp series remains, both must share
