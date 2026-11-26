@@ -1,0 +1,939 @@
+{
+  "expected_errors": [
+    {
+      "filename": "jobname.bad.yml",
+      "err_msg": "job_name is empty"
+    },
+    {
+      "filename": "jobname_dup.bad.yml",
+      "err_msg": "found multiple scrape configs with job name \"prometheus\""
+    },
+    {
+      "filename": "scrape_interval.bad.yml",
+      "err_msg": "scrape timeout greater than scrape interval"
+    },
+    {
+      "filename": "labelname.bad.yml",
+      "err_msg": "\"\\xff\" is not a valid label name"
+    },
+    {
+      "filename": "labelvalue.bad.yml",
+      "err_msg": "\"\\xff\" is not a valid label value"
+    },
+    {
+      "filename": "regex.bad.yml",
+      "err_msg": "error parsing regexp"
+    },
+    {
+      "filename": "modulus_missing.bad.yml",
+      "err_msg": "relabel configuration for hashmod requires non-zero modulus"
+    },
+    {
+      "filename": "labelkeep.bad.yml",
+      "err_msg": "labelkeep action requires only 'regex', and no other fields"
+    },
+    {
+      "filename": "labelkeep2.bad.yml",
+      "err_msg": "labelkeep action requires only 'regex', and no other fields"
+    },
+    {
+      "filename": "labelkeep3.bad.yml",
+      "err_msg": "labelkeep action requires only 'regex', and no other fields"
+    },
+    {
+      "filename": "labelkeep4.bad.yml",
+      "err_msg": "labelkeep action requires only 'regex', and no other fields"
+    },
+    {
+      "filename": "labelkeep5.bad.yml",
+      "err_msg": "labelkeep action requires only 'regex', and no other fields"
+    },
+    {
+      "filename": "labeldrop.bad.yml",
+      "err_msg": "labeldrop action requires only 'regex', and no other fields"
+    },
+    {
+      "filename": "labeldrop2.bad.yml",
+      "err_msg": "labeldrop action requires only 'regex', and no other fields"
+    },
+    {
+      "filename": "labeldrop3.bad.yml",
+      "err_msg": "labeldrop action requires only 'regex', and no other fields"
+    },
+    {
+      "filename": "labeldrop4.bad.yml",
+      "err_msg": "labeldrop action requires only 'regex', and no other fields"
+    },
+    {
+      "filename": "labeldrop5.bad.yml",
+      "err_msg": "labeldrop action requires only 'regex', and no other fields"
+    },
+    {
+      "filename": "dropequal.bad.yml",
+      "err_msg": "relabel configuration for dropequal action requires 'target_label' value"
+    },
+    {
+      "filename": "dropequal1.bad.yml",
+      "err_msg": "dropequal action requires only 'source_labels' and `target_label`, and no other fields"
+    },
+    {
+      "filename": "keepequal.bad.yml",
+      "err_msg": "relabel configuration for keepequal action requires 'target_label' value"
+    },
+    {
+      "filename": "keepequal1.bad.yml",
+      "err_msg": "keepequal action requires only 'source_labels' and `target_label`, and no other fields"
+    },
+    {
+      "filename": "labelmap.bad.yml",
+      "err_msg": "!!binary value contains invalid base64 data"
+    },
+    {
+      "filename": "lowercase.bad.yml",
+      "err_msg": "relabel configuration for lowercase action requires 'target_label' value"
+    },
+    {
+      "filename": "lowercase3.bad.yml",
+      "err_msg": "'replacement' can not be set for lowercase action"
+    },
+    {
+      "filename": "uppercase.bad.yml",
+      "err_msg": "relabel configuration for uppercase action requires 'target_label' value"
+    },
+    {
+      "filename": "uppercase3.bad.yml",
+      "err_msg": "'replacement' can not be set for uppercase action"
+    },
+    {
+      "filename": "rules.bad.yml",
+      "err_msg": "invalid rule file path"
+    },
+    {
+      "filename": "unknown_attr.bad.yml",
+      "err_msg": "field consult_sd_configs not found in type"
+    },
+    {
+      "filename": "bearertoken.bad.yml",
+      "err_msg": "at most one of bearer_token \u0026 bearer_token_file must be configured"
+    },
+    {
+      "filename": "bearertoken_basicauth.bad.yml",
+      "err_msg": "at most one of basic_auth, oauth2, bearer_token \u0026 bearer_token_file must be configured"
+    },
+    {
+      "filename": "kubernetes_http_config_without_api_server.bad.yml",
+      "err_msg": "to use custom HTTP client configuration please provide the 'api_server' URL explicitly"
+    },
+    {
+      "filename": "kubernetes_kubeconfig_with_own_namespace.bad.yml",
+      "err_msg": "cannot use 'kubeconfig_file' and 'namespaces.own_namespace' simultaneously"
+    },
+    {
+      "filename": "kubernetes_api_server_with_own_namespace.bad.yml",
+      "err_msg": "cannot use 'api_server' and 'namespaces.own_namespace' simultaneously"
+    },
+    {
+      "filename": "kubernetes_kubeconfig_with_apiserver.bad.yml",
+      "err_msg": "cannot use 'kubeconfig_file' and 'api_server' simultaneously"
+    },
+    {
+      "filename": "kubernetes_kubeconfig_with_http_config.bad.yml",
+      "err_msg": "cannot use a custom HTTP client configuration together with 'kubeconfig_file'"
+    },
+    {
+      "filename": "kubernetes_bearertoken.bad.yml",
+      "err_msg": "at most one of bearer_token \u0026 bearer_token_file must be configured"
+    },
+    {
+      "filename": "kubernetes_role.bad.yml",
+      "err_msg": "role"
+    },
+    {
+      "filename": "kubernetes_selectors_endpoints.bad.yml",
+      "err_msg": "endpoints role supports only pod, service, endpoints selectors"
+    },
+    {
+      "filename": "kubernetes_selectors_ingress.bad.yml",
+      "err_msg": "ingress role supports only ingress selectors"
+    },
+    {
+      "filename": "kubernetes_selectors_node.bad.yml",
+      "err_msg": "node role supports only node selectors"
+    },
+    {
+      "filename": "kubernetes_selectors_pod.bad.yml",
+      "err_msg": "pod role supports only pod, node selectors"
+    },
+    {
+      "filename": "kubernetes_selectors_service.bad.yml",
+      "err_msg": "service role supports only service selectors"
+    },
+    {
+      "filename": "kubernetes_namespace_discovery.bad.yml",
+      "err_msg": "field foo not found in type kubernetes.plain"
+    },
+    {
+      "filename": "kubernetes_selectors_duplicated_role.bad.yml",
+      "err_msg": "duplicated selector role: pod"
+    },
+    {
+      "filename": "kubernetes_selectors_incorrect_selector.bad.yml",
+      "err_msg": "invalid selector: 'metadata.status-Running'; can't understand 'metadata.status-Running'"
+    },
+    {
+      "filename": "kubernetes_bearertoken_basicauth.bad.yml",
+      "err_msg": "at most one of basic_auth, oauth2, bearer_token \u0026 bearer_token_file must be configured"
+    },
+    {
+      "filename": "kubernetes_authorization_basicauth.bad.yml",
+      "err_msg": "at most one of basic_auth, oauth2 \u0026 authorization must be configured"
+    },
+    {
+      "filename": "marathon_no_servers.bad.yml",
+      "err_msg": "marathon_sd: must contain at least one Marathon server"
+    },
+    {
+      "filename": "marathon_authtoken_authtokenfile.bad.yml",
+      "err_msg": "marathon_sd: at most one of auth_token \u0026 auth_token_file must be configured"
+    },
+    {
+      "filename": "marathon_authtoken_basicauth.bad.yml",
+      "err_msg": "marathon_sd: at most one of basic_auth, auth_token \u0026 auth_token_file must be configured"
+    },
+    {
+      "filename": "marathon_authtoken_bearertoken.bad.yml",
+      "err_msg": "marathon_sd: at most one of bearer_token, bearer_token_file, auth_token \u0026 auth_token_file must be configured"
+    },
+    {
+      "filename": "marathon_authtoken_authorization.bad.yml",
+      "err_msg": "marathon_sd: at most one of auth_token, auth_token_file \u0026 authorization must be configured"
+    },
+    {
+      "filename": "openstack_role.bad.yml",
+      "err_msg": "unknown OpenStack SD role"
+    },
+    {
+      "filename": "openstack_availability.bad.yml",
+      "err_msg": "unknown availability invalid, must be one of admin, internal or public"
+    },
+    {
+      "filename": "url_in_targetgroup.bad.yml",
+      "err_msg": "\"http://bad\" is not a valid hostname"
+    },
+    {
+      "filename": "target_label_missing.bad.yml",
+      "err_msg": "relabel configuration for replace action requires 'target_label' value"
+    },
+    {
+      "filename": "target_label_hashmod_missing.bad.yml",
+      "err_msg": "relabel configuration for hashmod action requires 'target_label' value"
+    },
+    {
+      "filename": "unknown_global_attr.bad.yml",
+      "err_msg": "field nonexistent_field not found in type config.plain"
+    },
+    {
+      "filename": "remote_read_url_missing.bad.yml",
+      "err_msg": "url for remote_read is empty"
+    },
+    {
+      "filename": "remote_write_header.bad.yml",
+      "err_msg": "x-prometheus-remote-write-version is a reserved header. It must not be changed"
+    },
+    {
+      "filename": "remote_read_header.bad.yml",
+      "err_msg": "x-prometheus-remote-write-version is a reserved header. It must not be changed"
+    },
+    {
+      "filename": "remote_write_authorization_header.bad.yml",
+      "err_msg": "authorization header must be changed via the basic_auth, authorization, oauth2, sigv4, azuread or google_iam parameter"
+    },
+    {
+      "filename": "remote_write_wrong_msg.bad.yml",
+      "err_msg": "invalid protobuf_message value: unknown type for remote write protobuf message io.prometheus.writet.v2.Request, supported: prometheus.WriteRequest, io.prometheus.write.v2.Request"
+    },
+    {
+      "filename": "remote_write_url_missing.bad.yml",
+      "err_msg": "url for remote_write is empty"
+    },
+    {
+      "filename": "remote_write_dup.bad.yml",
+      "err_msg": "found multiple remote write configs with job name \"queue1\""
+    },
+    {
+      "filename": "remote_write_queue_max_samples_per_send_zero.bad.yml",
+      "err_msg": "remote write queue max_samples_per_send must be positive"
+    },
+    {
+      "filename": "remote_write_queue_max_shards_zero.bad.yml",
+      "err_msg": "remote write queue max_shards must be positive"
+    },
+    {
+      "filename": "remote_write_queue_min_shards_zero.bad.yml",
+      "err_msg": "remote write queue min_shards must be positive"
+    },
+    {
+      "filename": "remote_write_queue_capacity_zero.bad.yml",
+      "err_msg": "remote write queue capacity must be positive"
+    },
+    {
+      "filename": "remote_write_queue_min_shards_greater_than_max.bad.yml",
+      "err_msg": "remote write queue min_shards must not be greater than max_shards"
+    },
+    {
+      "filename": "remote_write_queue_max_backoff_less_than_min.bad.yml",
+      "err_msg": "remote write queue max_backoff must not be less than min_backoff"
+    },
+    {
+      "filename": "remote_read_dup.bad.yml",
+      "err_msg": "found multiple remote read configs with job name \"queue1\""
+    },
+    {
+      "filename": "ec2_filters_empty_values.bad.yml",
+      "err_msg": "EC2 SD configuration filter values cannot be empty"
+    },
+    {
+      "filename": "ec2_token_file.bad.yml",
+      "err_msg": "at most one of bearer_token \u0026 bearer_token_file must be configured"
+    },
+    {
+      "filename": "lightsail_token_file.bad.yml",
+      "err_msg": "at most one of bearer_token \u0026 bearer_token_file must be configured"
+    },
+    {
+      "filename": "section_key_dup.bad.yml",
+      "err_msg": "field scrape_configs already set in type config.plain"
+    },
+    {
+      "filename": "azure_client_id_missing.bad.yml",
+      "err_msg": "azure SD configuration requires a client_id"
+    },
+    {
+      "filename": "azure_client_secret_missing.bad.yml",
+      "err_msg": "azure SD configuration requires a client_secret"
+    },
+    {
+      "filename": "azure_subscription_id_missing.bad.yml",
+      "err_msg": "azure SD configuration requires a subscription_id"
+    },
+    {
+      "filename": "azure_tenant_id_missing.bad.yml",
+      "err_msg": "azure SD configuration requires a tenant_id"
+    },
+    {
+      "filename": "azure_authentication_method.bad.yml",
+      "err_msg": "unknown authentication_type \"invalid\". Supported types are \"OAuth\", \"ManagedIdentity\", \"SDK\" or \"WorkloadIdentity\""
+    },
+    {
+      "filename": "oci_authentication_method.bad.yml",
+      "err_msg": "oci_sd: unknown auth method \"invalid\", expected \"api_key\" or \"instance_principal\""
+    },
+    {
+      "filename": "azure_bearertoken_basicauth.bad.yml",
+      "err_msg": "at most one of basic_auth, oauth2, bearer_token \u0026 bearer_token_file must be configured"
+    },
+    {
+      "filename": "empty_scrape_config.bad.yml",
+      "err_msg": "empty or null scrape config section"
+    },
+    {
+      "filename": "empty_rw_config.bad.yml",
+      "err_msg": "empty or null remote write config section"
+    },
+    {
+      "filename": "empty_rr_config.bad.yml",
+      "err_msg": "empty or null remote read config section"
+    },
+    {
+      "filename": "empty_target_relabel_config.bad.yml",
+      "err_msg": "empty or null target relabeling rule"
+    },
+    {
+      "filename": "empty_metric_relabel_config.bad.yml",
+      "err_msg": "empty or null metric relabeling rule"
+    },
+    {
+      "filename": "empty_alert_relabel_config.bad.yml",
+      "err_msg": "empty or null alert relabeling rule"
+    },
+    {
+      "filename": "empty_alertmanager_relabel_config.bad.yml",
+      "err_msg": "empty or null Alertmanager target relabeling rule"
+    },
+    {
+      "filename": "empty_rw_relabel_config.bad.yml",
+      "err_msg": "empty or null relabeling rule in remote write config"
+    },
+    {
+      "filename": "empty_static_config.bad.yml",
+      "err_msg": "empty or null section in static_configs"
+    },
+    {
+      "filename": "puppetdb_no_query.bad.yml",
+      "err_msg": "query missing"
+    },
+    {
+      "filename": "puppetdb_no_url.bad.yml",
+      "err_msg": "URL is missing"
+    },
+    {
+      "filename": "puppetdb_bad_url.bad.yml",
+      "err_msg": "host is missing in URL"
+    },
+    {
+      "filename": "puppetdb_no_scheme.bad.yml",
+      "err_msg": "URL scheme must be 'http' or 'https'"
+    },
+    {
+      "filename": "puppetdb_token_file.bad.yml",
+      "err_msg": "at most one of bearer_token \u0026 bearer_token_file must be configured"
+    },
+    {
+      "filename": "hetzner_role.bad.yml",
+      "err_msg": "unknown role"
+    },
+    {
+      "filename": "eureka_no_server.bad.yml",
+      "err_msg": "empty or null eureka server"
+    },
+    {
+      "filename": "eureka_invalid_server.bad.yml",
+      "err_msg": "invalid eureka server URL"
+    },
+    {
+      "filename": "scaleway_role.bad.yml",
+      "err_msg": "unknown role \"invalid\""
+    },
+    {
+      "filename": "scaleway_no_secret.bad.yml",
+      "err_msg": "one of secret_key \u0026 secret_key_file must be configured"
+    },
+    {
+      "filename": "scaleway_two_secrets.bad.yml",
+      "err_msg": "at most one of secret_key \u0026 secret_key_file must be configured"
+    },
+    {
+      "filename": "outscale_no_region.bad.yml",
+      "err_msg": "outscale SD configuration requires a region"
+    },
+    {
+      "filename": "outscale_no_secret.bad.yml",
+      "err_msg": "one of secret_key \u0026 secret_key_file must be configured"
+    },
+    {
+      "filename": "outscale_two_secrets.bad.yml",
+      "err_msg": "at most one of secret_key \u0026 secret_key_file must be configured"
+    },
+    {
+      "filename": "scrape_body_size_limit.bad.yml",
+      "err_msg": "units: unknown unit  in 100"
+    },
+    {
+      "filename": "http_url_no_scheme.bad.yml",
+      "err_msg": "URL scheme must be 'http' or 'https'"
+    },
+    {
+      "filename": "http_url_no_host.bad.yml",
+      "err_msg": "host is missing in URL"
+    },
+    {
+      "filename": "http_token_file.bad.yml",
+      "err_msg": "at most one of bearer_token \u0026 bearer_token_file must be configured"
+    },
+    {
+      "filename": "http_url_bad_scheme.bad.yml",
+      "err_msg": "URL scheme must be 'http' or 'https'"
+    },
+    {
+      "filename": "empty_scrape_config_action.bad.yml",
+      "err_msg": "relabel action cannot be empty"
+    },
+    {
+      "filename": "tracing_missing_endpoint.bad.yml",
+      "err_msg": "tracing endpoint must be set"
+    },
+    {
+      "filename": "tracing_invalid_header.bad.yml",
+      "err_msg": "x-prometheus-remote-write-version is a reserved header. It must not be changed"
+    },
+    {
+      "filename": "tracing_invalid_authorization_header.bad.yml",
+      "err_msg": "authorization header configuration is not yet supported"
+    },
+    {
+      "filename": "tracing_invalid_compression.bad.yml",
+      "err_msg": "invalid compression type foo provided, valid options: gzip"
+    },
+    {
+      "filename": "uyuni_no_server.bad.yml",
+      "err_msg": "Uyuni SD configuration requires server host"
+    },
+    {
+      "filename": "uyuni_token_file.bad.yml",
+      "err_msg": "at most one of bearer_token \u0026 bearer_token_file must be configured"
+    },
+    {
+      "filename": "ionos_datacenter.bad.yml",
+      "err_msg": "datacenter id can't be empty"
+    },
+    {
+      "filename": "ovhcloud_no_secret.bad.yml",
+      "err_msg": "application secret can not be empty"
+    },
+    {
+      "filename": "ovhcloud_bad_service.bad.yml",
+      "err_msg": "unknown service: fakeservice"
+    },
+    {
+      "filename": "scrape_config_files_glob.bad.yml",
+      "err_msg": "parsing YAML file testdata/scrape_config_files_glob.bad.yml: invalid scrape config file path \"scrape_configs/*/*\""
+    },
+    {
+      "filename": "scrape_config_files_scrape_protocols.bad.yml",
+      "err_msg": "parsing YAML file testdata/scrape_config_files_scrape_protocols.bad.yml: scrape_protocols: unknown scrape protocol prometheusproto, supported: [OpenMetricsText0.0.1 OpenMetricsText1.0.0 OpenMetricsText2.0.0 PrometheusProto PrometheusText0.0.4 PrometheusText1.0.0] for scrape config with job name \"node\""
+    },
+    {
+      "filename": "scrape_config_files_scrape_protocols2.bad.yml",
+      "err_msg": "parsing YAML file testdata/scrape_config_files_scrape_protocols2.bad.yml: duplicated protocol in scrape_protocols, got [OpenMetricsText1.0.0 PrometheusProto OpenMetricsText1.0.0] for scrape config with job name \"node\""
+    },
+    {
+      "filename": "scrape_config_files_fallback_scrape_protocol1.bad.yml",
+      "err_msg": "parsing YAML file testdata/scrape_config_files_fallback_scrape_protocol1.bad.yml: invalid fallback_scrape_protocol for scrape config with job name \"node\": unknown scrape protocol prometheusproto, supported: [OpenMetricsText0.0.1 OpenMetricsText1.0.0 OpenMetricsText2.0.0 PrometheusProto PrometheusText0.0.4 PrometheusText1.0.0]"
+    },
+    {
+      "filename": "scrape_config_files_fallback_scrape_protocol2.bad.yml",
+      "err_msg": "unmarshal errors"
+    },
+    {
+      "filename": "scrape_config_utf8_conflicting.bad.yml",
+      "err_msg": "utf8 metric names requested but validation scheme is not set to UTF8"
+    },
+    {
+      "filename": "stackit_endpoint.bad.yml",
+      "err_msg": "invalid endpoint"
+    },
+    {
+      "filename": "tsdb_retention_time.bad.yml",
+      "err_msg": "not a valid duration string: \"-1h\""
+    },
+    {
+      "filename": "tsdb_retention_size.bad.yml",
+      "err_msg": "'storage.tsdb.retention.size' must be greater than or equal to 0"
+    },
+    {
+      "filename": "tsdb_retention_percentage.bad.yml",
+      "err_msg": "'storage.tsdb.retention.percentage' must be in the range [0, 100]"
+    },
+    {
+      "filename": "tsdb_retention_percentage_negative.bad.yml",
+      "err_msg": "'storage.tsdb.retention.percentage' must be in the range [0, 100]"
+    },
+    {
+      "filename": "tsdb_chunk_encoding_floats.bad.yml",
+      "err_msg": "'storage.tsdb.chunk_encoding.floats' must be 'xor' or 'xor2', or the field must be omitted entirely, got \"xor3\""
+    },
+    {
+      "filename": "tsdb_chunk_encoding_floats_wrong_case.bad.yml",
+      "err_msg": "'storage.tsdb.chunk_encoding.floats' must be 'xor' or 'xor2', or the field must be omitted entirely, got \"XOR\""
+    },
+    {
+      "filename": "tsdb_chunk_encoding_floats_wrong_case_xor2.bad.yml",
+      "err_msg": "'storage.tsdb.chunk_encoding.floats' must be 'xor' or 'xor2', or the field must be omitted entirely, got \"XOR2\""
+    },
+    {
+      "filename": "metric_name_validation_scheme.bad.yml",
+      "err_msg": "unrecognized ValidationScheme: \"invalid_scheme\""
+    }
+  ],
+  "get_scrape_configs_cases": [
+    {
+      "config_file": "scrape_config_files.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "scrape_native_histograms": false,
+      "always_scrape_classic_histograms": false,
+      "convert_classic_histograms_to_nhcb": false
+    },
+    {
+      "config_file": "scrape_config_files_only.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "scrape_native_histograms": false,
+      "always_scrape_classic_histograms": false,
+      "convert_classic_histograms_to_nhcb": false
+    },
+    {
+      "config_file": "scrape_config_files_combined.good.yml",
+      "job_names": [
+        "node",
+        "prometheus",
+        "alertmanager"
+      ],
+      "scrape_native_histograms": false,
+      "always_scrape_classic_histograms": false,
+      "convert_classic_histograms_to_nhcb": false
+    },
+    {
+      "config_file": "scrape_config_files_glob.good.yml",
+      "job_names": [
+        "prometheus",
+        "node"
+      ],
+      "scrape_protocols": [
+        "OpenMetricsText1.0.0",
+        "OpenMetricsText0.0.1",
+        "PrometheusText1.0.0",
+        "PrometheusText0.0.4"
+      ],
+      "scrape_native_histograms": false,
+      "always_scrape_classic_histograms": false,
+      "convert_classic_histograms_to_nhcb": false,
+      "extra_scrape_metrics": false
+    },
+    {
+      "config_file": "scrape_config_files_double_import.bad.yml",
+      "err_msg": "found multiple scrape configs with job name \"prometheus\""
+    },
+    {
+      "config_file": "scrape_config_files_duplicate.bad.yml",
+      "err_msg": "found multiple scrape configs with job name \"prometheus\""
+    },
+    {
+      "config_file": "scrape_config_files_global.bad.yml",
+      "err_msg": "scrape timeout greater than scrape interval for scrape config with job name \"prometheus\""
+    },
+    {
+      "config_file": "global_convert_classic_hist_to_nhcb.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "always_scrape_classic_histograms": false,
+      "convert_classic_histograms_to_nhcb": true
+    },
+    {
+      "config_file": "local_disable_convert_classic_hist_to_nhcb.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "always_scrape_classic_histograms": false,
+      "convert_classic_histograms_to_nhcb": false
+    },
+    {
+      "config_file": "local_convert_classic_hist_to_nhcb.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "always_scrape_classic_histograms": false,
+      "convert_classic_histograms_to_nhcb": true
+    },
+    {
+      "config_file": "global_enable_always_scrape_classic_hist.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "always_scrape_classic_histograms": true,
+      "convert_classic_histograms_to_nhcb": false
+    },
+    {
+      "config_file": "global_disable_always_scrape_classic_hist.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "always_scrape_classic_histograms": false,
+      "convert_classic_histograms_to_nhcb": false
+    },
+    {
+      "config_file": "local_enable_always_scrape_classic_hist.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "always_scrape_classic_histograms": true,
+      "convert_classic_histograms_to_nhcb": false
+    },
+    {
+      "config_file": "local_disable_always_scrape_classic_hist.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "always_scrape_classic_histograms": false,
+      "convert_classic_histograms_to_nhcb": false
+    },
+    {
+      "config_file": "global_enable_scrape_native_hist.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "scrape_protocols": [
+        "PrometheusProto",
+        "OpenMetricsText1.0.0",
+        "OpenMetricsText0.0.1",
+        "PrometheusText1.0.0",
+        "PrometheusText0.0.4"
+      ],
+      "scrape_native_histograms": true
+    },
+    {
+      "config_file": "global_enable_scrape_native_hist_and_scrape_protocols.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "scrape_protocols": [
+        "PrometheusText0.0.4"
+      ],
+      "scrape_native_histograms": true
+    },
+    {
+      "config_file": "local_enable_scrape_native_hist.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "scrape_protocols": [
+        "PrometheusProto",
+        "OpenMetricsText1.0.0",
+        "OpenMetricsText0.0.1",
+        "PrometheusText1.0.0",
+        "PrometheusText0.0.4"
+      ],
+      "scrape_native_histograms": true
+    },
+    {
+      "config_file": "local_enable_scrape_native_hist_and_scrape_protocols.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "scrape_protocols": [
+        "PrometheusText0.0.4"
+      ],
+      "scrape_native_histograms": true
+    },
+    {
+      "config_file": "local_disable_scrape_native_hist.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "scrape_protocols": [
+        "OpenMetricsText1.0.0",
+        "OpenMetricsText0.0.1",
+        "PrometheusText1.0.0",
+        "PrometheusText0.0.4"
+      ],
+      "scrape_native_histograms": false
+    },
+    {
+      "config_file": "global_scrape_protocols_and_local_disable_scrape_native_hist.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "scrape_protocols": [
+        "PrometheusText0.0.4"
+      ],
+      "scrape_native_histograms": false
+    },
+    {
+      "config_file": "global_enable_extra_scrape_metrics.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "extra_scrape_metrics": true
+    },
+    {
+      "config_file": "global_disable_extra_scrape_metrics.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "extra_scrape_metrics": false
+    },
+    {
+      "config_file": "local_enable_extra_scrape_metrics.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "extra_scrape_metrics": true
+    },
+    {
+      "config_file": "local_disable_extra_scrape_metrics.good.yml",
+      "job_names": [
+        "prometheus"
+      ],
+      "extra_scrape_metrics": false
+    }
+  ],
+  "validation_settings_cases": [
+    {
+      "name": "blank config implies default",
+      "filename": "scrape_config_default_validation_mode.yml",
+      "expect_validation_scheme": "utf8",
+      "expect_escaping_scheme": "allow-utf-8"
+    },
+    {
+      "name": "global setting implies local settings",
+      "filename": "scrape_config_global_validation_mode.yml",
+      "expect_validation_scheme": "legacy",
+      "expect_escaping_scheme": "dots"
+    },
+    {
+      "name": "local setting",
+      "filename": "scrape_config_local_validation_mode.yml",
+      "expect_validation_scheme": "legacy",
+      "expect_escaping_scheme": "values"
+    },
+    {
+      "name": "local setting overrides global setting",
+      "filename": "scrape_config_local_global_validation_mode.yml",
+      "expect_validation_scheme": "utf8",
+      "expect_escaping_scheme": "dots"
+    },
+    {
+      "name": "local validation implies underscores escaping",
+      "filename": "scrape_config_local_infer_escaping.yml",
+      "expect_validation_scheme": "legacy",
+      "expect_escaping_scheme": "underscores"
+    }
+  ],
+  "escaping_settings_cases": [
+    {
+      "name": "blank config implies default",
+      "filename": "scrape_config_default_validation_mode.yml",
+      "expect_validation_scheme": "utf8",
+      "expect_escaping_scheme": "allow-utf-8"
+    },
+    {
+      "name": "global setting implies local settings",
+      "filename": "scrape_config_global_validation_mode.yml",
+      "expect_validation_scheme": "legacy",
+      "expect_escaping_scheme": "dots"
+    },
+    {
+      "name": "local setting",
+      "filename": "scrape_config_local_validation_mode.yml",
+      "expect_validation_scheme": "legacy",
+      "expect_escaping_scheme": "values"
+    },
+    {
+      "name": "local setting overrides global setting",
+      "filename": "scrape_config_local_global_validation_mode.yml",
+      "expect_validation_scheme": "utf8",
+      "expect_escaping_scheme": "dots"
+    }
+  ],
+  "invalid_http_client_configs": [
+    {
+      "filename": "http.conf.bearer-token-and-file-set.bad.yml",
+      "err_msg": "at most one of bearer_token \u0026 bearer_token_file must be configured"
+    },
+    {
+      "filename": "http.conf.empty.bad.yml",
+      "err_msg": "at most one of basic_auth, oauth2, bearer_token \u0026 bearer_token_file must be configured"
+    },
+    {
+      "filename": "http.conf.basic-auth.too-much.bad.yaml",
+      "err_msg": "at most one of basic_auth password, password_file \u0026 password_ref must be configured"
+    },
+    {
+      "filename": "http.conf.basic-auth.bad-username.yaml",
+      "err_msg": "at most one of basic_auth username, username_file \u0026 username_ref must be configured"
+    },
+    {
+      "filename": "http.conf.mix-bearer-and-creds.bad.yaml",
+      "err_msg": "authorization is not compatible with bearer_token \u0026 bearer_token_file"
+    },
+    {
+      "filename": "http.conf.auth-creds-and-file-set.too-much.bad.yaml",
+      "err_msg": "at most one of authorization credentials \u0026 credentials_file must be configured"
+    },
+    {
+      "filename": "http.conf.basic-auth-and-auth-creds.too-much.bad.yaml",
+      "err_msg": "at most one of basic_auth, oauth2 \u0026 authorization must be configured"
+    },
+    {
+      "filename": "http.conf.basic-auth-and-oauth2.too-much.bad.yaml",
+      "err_msg": "at most one of basic_auth, oauth2 \u0026 authorization must be configured"
+    },
+    {
+      "filename": "http.conf.auth-creds-no-basic.bad.yaml",
+      "err_msg": "authorization type cannot be set to \"basic\", use \"basic_auth\" instead"
+    },
+    {
+      "filename": "http.conf.oauth2-secret-and-file-set.bad.yml",
+      "err_msg": "at most one of oauth2 client_secret, client_secret_file \u0026 client_secret_ref must be configured"
+    },
+    {
+      "filename": "http.conf.oauth2-certificate-and-file-set.bad.yml",
+      "err_msg": "at most one of oauth2 client_certificate_key, client_certificate_key_file \u0026 client_certificate_key_ref must be configured using grant-type=urn:ietf:params:oauth:grant-type:jwt-beare"
+    },
+    {
+      "filename": "http.conf.oauth2-no-client-id.bad.yaml",
+      "err_msg": "oauth2 client_id must be configured"
+    },
+    {
+      "filename": "http.conf.oauth2-no-token-url.bad.yaml",
+      "err_msg": "oauth2 token_url must be configured"
+    },
+    {
+      "filename": "http.conf.proxy-from-env.bad.yaml",
+      "err_msg": "if proxy_from_environment is configured, proxy_url must not be configured"
+    },
+    {
+      "filename": "http.conf.no-proxy.bad.yaml",
+      "err_msg": "if proxy_from_environment is configured, no_proxy must not be configured"
+    },
+    {
+      "filename": "http.conf.no-proxy-without-proxy-url.bad.yaml",
+      "err_msg": "if no_proxy is configured, proxy_url must also be configured"
+    },
+    {
+      "filename": "http.conf.headers-reserved.bad.yaml",
+      "err_msg": "setting header \"User-Agent\" is not allowed"
+    }
+  ],
+  "valid_tls_configs": [
+    {
+      "filename": "tls_config.empty.good.json"
+    },
+    {
+      "filename": "tls_config.insecure.good.json",
+      "insecure_skip_verify": true
+    },
+    {
+      "filename": "tls_config.tlsversion.good.json",
+      "min_version": "TLS11"
+    },
+    {
+      "filename": "tls_config.max_version.good.json",
+      "max_version": "TLS12"
+    },
+    {
+      "filename": "tls_config.empty.good.yml"
+    },
+    {
+      "filename": "tls_config.insecure.good.yml",
+      "insecure_skip_verify": true
+    },
+    {
+      "filename": "tls_config.tlsversion.good.yml",
+      "min_version": "TLS11"
+    },
+    {
+      "filename": "tls_config.max_version.good.yml",
+      "max_version": "TLS12"
+    },
+    {
+      "filename": "tls_config.max_and_min_version.good.yml",
+      "min_version": "TLS11",
+      "max_version": "TLS12"
+    },
+    {
+      "filename": "tls_config.max_and_min_version_same.good.yml",
+      "min_version": "TLS12",
+      "max_version": "TLS12"
+    }
+  ],
+  "invalid_tls_configs": [
+    {
+      "filename": "tls_config.max_and_min_version.bad.yml",
+      "err_msg": "tls_config.max_version must be greater than or equal to tls_config.min_version if both are specified"
+    }
+  ]
+}

@@ -23,17 +23,20 @@ const EMPTY_SLOT: u32 = u32::MAX;
 /// 64 bits.
 const FX_SEED: u64 = 0x517c_c1b7_2722_0a95;
 
-/// Open-addressed hash table slot mapping a string's 64-bit hash to its interned `u32` ID.
+/// Open-addressed hash table slot mapping a string's 32-bit folded hash to its interned `u32` ID.
 ///
-/// Storing `hash` inline beside `id` lets linear probing skip non-matching slots in contiguous
-/// `Bucket` memory without touching the `offsets` or `bytes` buffers until a hash match occurs.
+/// Storing the 32-bit folded `fx_hash` inline beside `id` packs each slot into 8 bytes (8 slots
+/// per 64-byte cache line) so linear probing skips non-matching slots without touching `offsets`
+/// or `bytes` until a hash match occurs.
 #[derive(Clone, Copy)]
 struct Bucket {
-    /// Cached `fx_hash` of the interned byte slice, or `0` when `id == EMPTY_SLOT`.
-    hash: u64,
+    /// Cached 32-bit folded `fx_hash` of the interned byte slice, or `0` when `id == EMPTY_SLOT`.
+    hash: u32,
     /// Index into `StringInterner::offsets` (`0..len()`), or `EMPTY_SLOT` when vacant.
     id: u32,
 }
+
+const _: () = assert!(size_of::<Bucket>() == 8);
 
 impl Bucket {
     const EMPTY: Self = Self {
@@ -42,9 +45,22 @@ impl Bucket {
     };
 }
 
+/// Returns the smallest power-of-two bucket table capacity (`>= 16`, or `0` when `len == 0`) that
+/// keeps the load factor strictly below 70% (`len * 10 < cap * 7`).
+#[inline]
+pub(super) const fn bucket_capacity_for_len(len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        let min_cap = (len.saturating_mul(10) / 7).saturating_add(1);
+        let cap = min_cap.next_power_of_two();
+        if cap < 16 { 16 } else { cap }
+    }
+}
+
 /// Fast non-cryptographic byte hash used for per-scrape label and metric-name interning.
 #[inline]
-fn fx_hash(bytes: &[u8]) -> u64 {
+fn fx_hash(bytes: &[u8]) -> u32 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     let (chunks, remainder) = bytes.as_chunks::<8>();
     for chunk in chunks {
@@ -59,7 +75,7 @@ fn fx_hash(bytes: &[u8]) -> u64 {
     // the upper half down bijectively so short IDs differing at the end spread across slots.
     hash ^= hash >> 32;
     hash = hash.wrapping_mul(FX_SEED);
-    hash ^ (hash >> 32)
+    (hash ^ (hash >> 32)) as u32
 }
 
 /// Reusable open-addressed string interner backed by a single `Vec<u8>` buffer and `Vec<i32>`
@@ -75,8 +91,19 @@ pub(super) struct StringInterner {
 }
 
 impl StringInterner {
+    pub(super) const fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            offsets: Vec::new(),
+            buckets: Vec::new(),
+        }
+    }
+
     pub(super) fn with_capacity(strings: usize, byte_cap: usize) -> Self {
-        let bucket_cap = (strings.saturating_mul(2)).next_power_of_two().max(16);
+        if strings == 0 && byte_cap == 0 {
+            return Self::new();
+        }
+        let bucket_cap = bucket_capacity_for_len(strings).max(16);
         let mut offsets = Vec::with_capacity(strings + 1);
         offsets.push(0);
         Self {
@@ -86,17 +113,26 @@ impl StringInterner {
         }
     }
 
+    /// Shrinks excess capacity in the backing `bytes` and `offsets` buffers to match their current
+    /// lengths.
+    pub(super) fn shrink_to_fit(&mut self) {
+        self.bytes.shrink_to_fit();
+        self.offsets.shrink_to_fit();
+    }
+
     /// Resets the interner for the next scrape while preserving backing capacities.
     pub(super) fn clear(&mut self) {
         self.bytes.clear();
-        self.offsets.clear();
-        self.offsets.push(0);
+        if !self.offsets.is_empty() {
+            self.offsets.clear();
+            self.offsets.push(0);
+        }
         self.buckets.fill(Bucket::EMPTY);
     }
 
     #[inline]
     pub(super) fn len(&self) -> usize {
-        self.offsets.len() - 1
+        self.offsets.len().saturating_sub(1)
     }
 
     pub(super) fn retained_memory_bytes(&self) -> usize {
@@ -125,6 +161,9 @@ impl StringInterner {
     /// Looks up a previously interned byte slice without inserting it.
     #[inline]
     pub(super) fn lookup(&self, raw: &[u8]) -> Option<u32> {
+        if self.buckets.is_empty() {
+            return None;
+        }
         let hash = fx_hash(raw);
         let mask = self.buckets.len() - 1;
         let mut slot = (hash as usize) & mask;
@@ -145,6 +184,10 @@ impl StringInterner {
     /// arena exceeds `i32::MAX`.
     #[inline]
     pub(super) fn intern(&mut self, raw: &[u8]) -> Option<u32> {
+        if self.buckets.is_empty() {
+            self.offsets.push(0);
+            self.buckets.resize(16, Bucket::EMPTY);
+        }
         let hash = fx_hash(raw);
         let mask = self.buckets.len() - 1;
         let mut slot = (hash as usize) & mask;
@@ -198,9 +241,17 @@ impl StringInterner {
 
     /// Materializes all interned strings in insertion order (`0..len()`) as an Arrow `StringArray`.
     pub(super) fn to_string_array(&self) -> StringArray {
-        let offsets_buf = Buffer::from_slice_ref(&self.offsets);
-        let offsets =
-            OffsetBuffer::new(ScalarBuffer::<i32>::new(offsets_buf, 0, self.offsets.len()));
+        let offsets_slice = if self.offsets.is_empty() {
+            &[0i32][..]
+        } else {
+            &self.offsets[..]
+        };
+        let offsets_buf = Buffer::from_slice_ref(offsets_slice);
+        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::new(
+            offsets_buf,
+            0,
+            offsets_slice.len(),
+        ));
         let values = Buffer::from_slice_ref(&self.bytes);
         // SAFETY-FREE invariant: every interned entry came from a valid `&str`, and `self.offsets`
         // is monotonically non-decreasing starting at `0` and ending at `self.bytes.len()`.

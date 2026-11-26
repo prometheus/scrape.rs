@@ -784,8 +784,21 @@ fn kubernetes_relabel_pipeline_and_serde_roundtrip() {
         .validate(ValidationScheme::Utf8)
         .unwrap();
 
-    // Explicit empty string `"action": ""` must fail deserialization like Go Action.UnmarshalYAML.
+    // Explicit empty string `"action": ""` or `"action": null` must fail deserialization
+    // like Go Action.UnmarshalYAML.
     assert!(serde_json::from_str::<Config>(r#"{"action": ""}"#).is_err());
+    let null_action_err = serde_json::from_str::<Config>(r#"{"action": null}"#).unwrap_err();
+    assert!(
+        null_action_err
+            .to_string()
+            .contains("relabel action cannot be empty"),
+        "unexpected error: {null_action_err}"
+    );
+    let bad_regex_err = Regexp::new("*").unwrap_err();
+    assert!(
+        bad_regex_err.to_string().contains("error parsing regexp"),
+        "unexpected error: {bad_regex_err}"
+    );
 }
 
 #[test]

@@ -111,13 +111,13 @@ func renderEntries(parser textparse.Parser, startTimestamps bool) string {
 			series, timestampMillis, h, fh := parser.Histogram()
 			fmt.Fprintf(&out, "histogram %s %s", quote(series), formatTimestamp(timestampMillis))
 			if h != nil {
-				fmt.Fprintf(&out, " int schema=%d count=%d sum=%016x zero_threshold=%016x zero_count=%d hint=%d pos_spans=%s pos=%s neg_spans=%s neg=%s",
+				fmt.Fprintf(&out, " int schema=%d count=%d sum=%016x zero_threshold=%016x zero_count=%d hint=%d pos_spans=%s pos=%s neg_spans=%s neg=%s custom=%s",
 					h.Schema, h.Count, math.Float64bits(h.Sum), math.Float64bits(h.ZeroThreshold), h.ZeroCount, h.CounterResetHint,
-					formatSpans(h.PositiveSpans), formatInts(h.PositiveBuckets), formatSpans(h.NegativeSpans), formatInts(h.NegativeBuckets))
+					formatSpans(h.PositiveSpans), formatInts(h.PositiveBuckets), formatSpans(h.NegativeSpans), formatInts(h.NegativeBuckets), formatFloats(h.CustomValues))
 			} else {
-				fmt.Fprintf(&out, " float schema=%d count=%016x sum=%016x zero_threshold=%016x zero_count=%016x hint=%d pos_spans=%s pos=%s neg_spans=%s neg=%s",
+				fmt.Fprintf(&out, " float schema=%d count=%016x sum=%016x zero_threshold=%016x zero_count=%016x hint=%d pos_spans=%s pos=%s neg_spans=%s neg=%s custom=%s",
 					fh.Schema, math.Float64bits(fh.Count), math.Float64bits(fh.Sum), math.Float64bits(fh.ZeroThreshold), math.Float64bits(fh.ZeroCount), fh.CounterResetHint,
-					formatSpans(fh.PositiveSpans), formatFloats(fh.PositiveBuckets), formatSpans(fh.NegativeSpans), formatFloats(fh.NegativeBuckets))
+					formatSpans(fh.PositiveSpans), formatFloats(fh.PositiveBuckets), formatSpans(fh.NegativeSpans), formatFloats(fh.NegativeBuckets), formatFloats(fh.CustomValues))
 			}
 			parser.Labels(&labelSet)
 			writeLabels(&out, labelSet)
