@@ -18,6 +18,8 @@ exclude = [
 default = ["arrow", "dto"]
 arrow = ["dep:arrow-array", "dep:arrow-buffer", "dep:arrow-schema"]
 dto = ["dep:prost", "dep:prost-types"]
+# Exposes the Layer 0 parsers to `benches/parse.rs`. Not a public API.
+bench-internals = []
 
 [dependencies]
 arrow-array = { workspace = true, optional = true }
@@ -36,6 +38,11 @@ protox = { workspace = true }
 name = "decode"
 harness = false
 required-features = ["arrow"]
+
+[[bench]]
+name = "parse"
+harness = false
+required-features = ["dto", "bench-internals"]
 
 [lints]
 workspace = true

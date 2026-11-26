@@ -25,6 +25,8 @@ mod promlex;
 mod promparse;
 #[cfg(feature = "dto")]
 mod protobufparse;
+#[cfg(feature = "dto")]
+mod protowire;
 
 pub(crate) use float::parse_go_float;
 pub use omparse::OpenMetricsParser;
