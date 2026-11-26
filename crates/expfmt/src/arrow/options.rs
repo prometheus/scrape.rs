@@ -150,6 +150,7 @@ pub enum UntypedPolicy {
 
 /// Options controlling [`super::ArrowDecoder::decode`] and [`super::ArrowDecoder::decode_stream`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodeOptions {
     /// Default timestamp in milliseconds since the Unix epoch applied to samples that omit an
     /// explicit wire timestamp, or to every sample when [`Self::honor_timestamps`] is `false`.
@@ -164,9 +165,10 @@ pub struct DecodeOptions {
     /// [`Self::timestamp_ms`]. Disabling the flag requires [`Self::timestamp_ms`]; decoding rejects
     /// the combination without one.
     ///
-    /// Consumers of this policy, such as staleness tracking or duplicate detection, must read the
-    /// resolved timestamp or this flag, never the presence of a wire timestamp: with the flag
-    /// equal to `false`, every sample is untimestamped.
+    /// Consumers of this policy, such as staleness tracking or duplicate detection, must gate on
+    /// this flag together with wire-timestamp presence, not on the resolved timestamp: with the
+    /// flag equal to `false`, `time_unix_nano` is always populated from [`Self::timestamp_ms`],
+    /// yet every sample is untimestamped.
     pub honor_timestamps: bool,
     /// Maximum number of data points materialized per [`super::OtapMetricRecords`] chunk yielded by
     /// [`super::ArrowDecoder::decode_stream`]. Values of `0` are clamped to `1`. Single-batch
