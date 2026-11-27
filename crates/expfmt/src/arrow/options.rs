@@ -342,6 +342,16 @@ pub enum DecodeError {
         label: String,
     },
 
+    /// A native histogram failed the checks Prometheus applies before storing it, Go's
+    /// `Histogram.Validate`, or used a schema the decoder cannot map to OTAP.
+    #[error("invalid native histogram for metric {metric:?}: {reason}")]
+    InvalidHistogram {
+        /// Metric family name.
+        metric: String,
+        /// Why the histogram is invalid.
+        reason: String,
+    },
+
     /// Converting a millisecond timestamp to nanoseconds overflowed `i64`.
     #[error("timestamp {timestamp_ms} ms overflows i64 nanoseconds")]
     TimestampOverflow {

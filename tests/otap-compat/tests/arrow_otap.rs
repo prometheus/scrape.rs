@@ -117,6 +117,10 @@ fn metric_payload_type_discriminants_match_otap_proto() {
             ArrowPayloadType::HistogramDataPoints,
         ),
         (
+            MetricPayloadType::ExpHistogramDataPoints,
+            ArrowPayloadType::ExpHistogramDataPoints,
+        ),
+        (
             MetricPayloadType::NumberDpAttrs,
             ArrowPayloadType::NumberDpAttrs,
         ),
@@ -129,6 +133,10 @@ fn metric_payload_type_discriminants_match_otap_proto() {
             ArrowPayloadType::HistogramDpAttrs,
         ),
         (
+            MetricPayloadType::ExpHistogramDpAttrs,
+            ArrowPayloadType::ExpHistogramDpAttrs,
+        ),
+        (
             MetricPayloadType::NumberDpExemplars,
             ArrowPayloadType::NumberDpExemplars,
         ),
@@ -137,12 +145,20 @@ fn metric_payload_type_discriminants_match_otap_proto() {
             ArrowPayloadType::HistogramDpExemplars,
         ),
         (
+            MetricPayloadType::ExpHistogramDpExemplars,
+            ArrowPayloadType::ExpHistogramDpExemplars,
+        ),
+        (
             MetricPayloadType::NumberDpExemplarAttrs,
             ArrowPayloadType::NumberDpExemplarAttrs,
         ),
         (
             MetricPayloadType::HistogramDpExemplarAttrs,
             ArrowPayloadType::HistogramDpExemplarAttrs,
+        ),
+        (
+            MetricPayloadType::ExpHistogramDpExemplarAttrs,
+            ArrowPayloadType::ExpHistogramDpExemplarAttrs,
         ),
         (
             MetricPayloadType::MetricAttrs,

@@ -17,7 +17,8 @@
 //! pattern ([`STALE_NAN_BITS`] / [`STALE_NAN`], matching Go's `model/value.StaleNaN`). In
 //! OpenTelemetry and OTAP, stale data points carry [`DATA_POINT_FLAG_NO_RECORDED_VALUE`] (`1`,
 //! `DataPointFlags::FLAG_NO_RECORDED_VALUE`) in the optional `flags` (`UInt32`) column on
-//! `NumberDataPoints`, `SummaryDataPoints`, and `HistogramDataPoints`.
+//! `NumberDataPoints`, `SummaryDataPoints`, `HistogramDataPoints`, and
+//! `ExpHistogramDataPoints`.
 //!
 //! [`StalenessTracker`] maintains the active series set for a single scrape target across
 //! consecutive scrapes in arena-backed tables so steady-state scrapes whose series set does not
@@ -27,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use crate::parse::MetricType;
 
-use super::columns::{HistogramDpTable, MetricTable, NumberDpTable, SummaryDpTable};
+use super::columns::{
+    ExpHistogramDpTable, HistogramDpTable, MetricTable, NumberDpTable, SummaryDpTable,
+};
 use super::family::{CurrentFamily, emit_family_row, hash_attrs};
 use super::intern::{StringInterner, bucket_capacity_for_len};
 use super::options::{
@@ -137,6 +140,8 @@ pub(super) enum DpKind {
     Number = 0,
     Summary = 1,
     Histogram = 2,
+    /// Exponential native histogram, only decoded from protobuf input.
+    ExpHistogram = 3,
 }
 
 impl DpKind {
@@ -145,7 +150,8 @@ impl DpKind {
         match v {
             0 => Self::Number,
             1 => Self::Summary,
-            _ => Self::Histogram,
+            2 => Self::Histogram,
+            _ => Self::ExpHistogram,
         }
     }
 }
@@ -249,6 +255,25 @@ struct TrackedFamily {
     pending_has_unit: bool,
     has_pending_meta: bool,
     current_batch_id: Option<u16>,
+    /// Row of the family's exponential histogram points in the current batch, see
+    /// `CurrentFamily::exp_batch_id`.
+    current_exp_batch_id: Option<u16>,
+}
+
+impl TrackedFamily {
+    /// Takes the rows `current_family` emitted in this batch. A row the family has not emitted
+    /// yet keeps the row an earlier part of the same family emitted, so a family split in the
+    /// input, or one whose classic and exponential points come in separate parts, does not
+    /// make its stale points emit a second row. `reset_batch_ids` clears both between batches.
+    #[inline]
+    fn sync_batch_ids(&mut self, current_family: &CurrentFamily) {
+        if current_family.batch_id.is_some() {
+            self.current_batch_id = current_family.batch_id;
+        }
+        if current_family.exp_batch_id.is_some() {
+            self.current_exp_batch_id = current_family.exp_batch_id;
+        }
+    }
 }
 
 const MAX_FAMILY_IDX: u32 = (1 << 27) - 1;
@@ -263,7 +288,7 @@ const SEEN_MASK: u32 = 0b11;
 struct TrackedSeries {
     /// Bit-packed metadata:
     /// - bits `0..27`: `family_idx` (`0..=MAX_FAMILY_IDX`)
-    /// - bits `27..29`: [`DpKind`] (`0..=2`)
+    /// - bits `27..29`: [`DpKind`] (`0..=3`)
     /// - bit `29`: committed `active` status from the previous successful scrape
     /// - bits `30..32`: [`SeenState`] (`0..=2`) during the current in-progress scrape
     packed: u32,
@@ -532,6 +557,7 @@ impl StalenessTracker {
         }
         for fam in &mut self.families {
             fam.current_batch_id = None;
+            fam.current_exp_batch_id = None;
             fam.has_pending_meta = false;
         }
         for s in &mut self.series {
@@ -547,6 +573,7 @@ impl StalenessTracker {
     pub(super) fn reset_batch_ids(&mut self) {
         for fam in &mut self.families {
             fam.current_batch_id = None;
+            fam.current_exp_batch_id = None;
         }
         self.batch_key_to_tracker.clear();
         self.batch_val_to_tracker.clear();
@@ -561,6 +588,7 @@ impl StalenessTracker {
         }
         for fam in &mut self.families {
             fam.current_batch_id = None;
+            fam.current_exp_batch_id = None;
             fam.has_pending_meta = false;
         }
         for s in &mut self.series {
@@ -593,6 +621,7 @@ impl StalenessTracker {
                 fam.has_pending_meta = false;
             }
             fam.current_batch_id = None;
+            fam.current_exp_batch_id = None;
         }
         self.batch_key_to_tracker.clear();
         self.batch_val_to_tracker.clear();
@@ -732,6 +761,7 @@ impl StalenessTracker {
                     pending_has_unit: fam.has_unit,
                     has_pending_meta: false,
                     current_batch_id: None,
+                    current_exp_batch_id: None,
                 });
                 fam_remap[old_fam_idx] = new_idx;
                 new_idx
@@ -1091,7 +1121,7 @@ impl StalenessTracker {
             && fam.metric_type == metric_type
             && fam.saw_total_suffix == saw_total_suffix
         {
-            fam.current_batch_id = current_family.batch_id;
+            fam.sync_batch_ids(current_family);
             return Ok(());
         }
 
@@ -1134,7 +1164,7 @@ impl StalenessTracker {
             && fam.metric_type == metric_type
             && fam.saw_total_suffix == saw_total_suffix
         {
-            fam.current_batch_id = current_family.batch_id;
+            fam.sync_batch_ids(current_family);
             return Ok(idx);
         }
 
@@ -1208,6 +1238,7 @@ impl StalenessTracker {
             pending_has_unit: current_family.has_unit,
             has_pending_meta: true,
             current_batch_id: current_family.batch_id,
+            current_exp_batch_id: current_family.exp_batch_id,
         });
         self.family_buckets[slot] = FamilyBucket { hash, family_idx };
 
@@ -1257,7 +1288,7 @@ impl StalenessTracker {
         entry.pending_has_help = current_family.has_help;
         entry.pending_has_unit = current_family.has_unit;
         entry.has_pending_meta = true;
-        entry.current_batch_id = current_family.batch_id;
+        entry.sync_batch_ids(current_family);
         Ok(())
     }
 
@@ -1342,6 +1373,7 @@ impl StalenessTracker {
         num_dp: &mut NumberDpTable,
         sum_dp: &mut SummaryDpTable,
         hist_dp: &mut HistogramDpTable,
+        exp_hist_dp: &mut ExpHistogramDpTable,
         batch_keys: &mut StringInterner,
         batch_vals: &mut StringInterner,
         opts: &DecodeOptions,
@@ -1370,9 +1402,15 @@ impl StalenessTracker {
                     self.stale_cursor += 1;
                 } else {
                     if let Some(max_dps) = max_data_points {
-                        let current_dps =
-                            num_dp.base.len() + sum_dp.base.len() + hist_dp.base.len();
-                        let need_new_metric = fam.current_batch_id.is_none();
+                        let current_dps = num_dp.base.len()
+                            + sum_dp.base.len()
+                            + hist_dp.base.len()
+                            + exp_hist_dp.base.len();
+                        let need_new_metric = if s.kind() == DpKind::ExpHistogram {
+                            fam.current_exp_batch_id.is_none()
+                        } else {
+                            fam.current_batch_id.is_none()
+                        };
                         if current_dps >= max_dps
                             || (need_new_metric && metrics.len() >= max_metrics)
                         {
@@ -1386,6 +1424,7 @@ impl StalenessTracker {
                         num_dp,
                         sum_dp,
                         hist_dp,
+                        exp_hist_dp,
                         batch_keys,
                         batch_vals,
                         opts,
@@ -1419,13 +1458,20 @@ impl StalenessTracker {
         num_dp: &mut NumberDpTable,
         sum_dp: &mut SummaryDpTable,
         hist_dp: &mut HistogramDpTable,
+        exp_hist_dp: &mut ExpHistogramDpTable,
         batch_keys: &mut StringInterner,
         batch_vals: &mut StringInterner,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
     ) -> Result<(), DecodeError> {
         let fam_idx = s.family_idx() as usize;
-        let parent_id = if let Some(id) = self.families[fam_idx].current_batch_id {
+        let exp_histogram = s.kind() == DpKind::ExpHistogram;
+        let batch_id = if exp_histogram {
+            self.families[fam_idx].current_exp_batch_id
+        } else {
+            self.families[fam_idx].current_batch_id
+        };
+        let parent_id = if let Some(id) = batch_id {
             id
         } else {
             let fam = self.families[fam_idx];
@@ -1457,10 +1503,15 @@ impl StalenessTracker {
                 &self.family_bytes[help_start as usize..help_end as usize],
                 has_unit,
                 &self.family_bytes[unit_start as usize..unit_end as usize],
+                exp_histogram,
                 metrics,
                 opts,
             )?;
-            self.families[fam_idx].current_batch_id = Some(id);
+            if exp_histogram {
+                self.families[fam_idx].current_exp_batch_id = Some(id);
+            } else {
+                self.families[fam_idx].current_batch_id = Some(id);
+            }
             id
         };
 
@@ -1578,6 +1629,23 @@ impl StalenessTracker {
                 })?;
                 hist_dp.bucket_offsets.push(bucket_off);
                 hist_dp.bounds_offsets.push(bounds_off);
+            }
+            DpKind::ExpHistogram => {
+                let dp_index = exp_hist_dp.base.len();
+                let dp_id = u32::try_from(dp_index).map_err(|_| DecodeError::CapacityOverflow {
+                    table: "ExpHistogramDataPoints",
+                    count: dp_index + 1,
+                })?;
+                exp_hist_dp
+                    .attrs
+                    .extend_for_parent(dp_id, &self.temp_tracker_attrs);
+                exp_hist_dp.base.push_with_flags(
+                    parent_id,
+                    None,
+                    default_ts_ns,
+                    DATA_POINT_FLAG_NO_RECORDED_VALUE,
+                );
+                exp_hist_dp.push_stale_values();
             }
         }
         Ok(())

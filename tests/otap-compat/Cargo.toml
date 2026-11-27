@@ -18,7 +18,9 @@ publish = false
 [dev-dependencies]
 dhat = "0.3"
 otel-arrow-dfe-pdata = { version = "0.62", features = ["testing"] }
-prometheus-expfmt = { path = "../../crates/expfmt", default-features = false, features = ["arrow"] }
+prometheus-expfmt = { path = "../../crates/expfmt", default-features = false, features = ["arrow", "dto"] }
+prost = "0.14"
+prost-types = "0.14"
 tokio = { version = "1.48", default-features = false, features = ["macros", "rt", "sync", "time"] }
 
 [lints.rust]

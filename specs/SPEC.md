@@ -132,6 +132,48 @@ scrape bytes
 - Optional per-target series staleness tracking via `StalenessTracker` (`ArrowDecoder::decode_with_staleness`, `decode_stream_with_staleness`, `step_decode_with_staleness`, `finish_decode_with_staleness`, `flush_target_stale`, and `flush_target_stale_stream`) detects disappeared time series across scrapes as well as incoming `STALE_NAN_BITS` (`0x7ff0_0000_0000_0002`) markers. Stale points set `DATA_POINT_FLAG_NO_RECORDED_VALUE` (`1`) in a lazily materialized `flags` (`UInt32`) column and omit `double_value` and `histogram_sum` (`NULL` in Arrow, `0.0` for `summary_sum`), leaving non-stale batch schemas unchanged. `StalenessTracker` interns active series labels in contiguous arenas with zero steady-state heap allocations, rolls back uncommitted changes on parse errors or dropped streams, and compacts deactivated series under label churn so per-target live heap stays proportional to active series. Callers that do not pass a `StalenessTracker` (`decode`, `decode_stream`, `step_decode`) pay zero cross-scrape memory overhead.
 - `ArrowDecoder` owns its scratch buffers and Arrow builders without internal locks or global state, so a per-core `!Send` receiver can reuse allocations across scrapes with bounded memory.
 
+#### Protobuf input and native histograms
+
+With the `dto` feature (on by default), `ArrowDecoder` decodes delimited protobuf (`FormatType::ProtoDelim`). It produces the same OTAP tables as text input and supports the same `decode`, `decode_stream`, `DecodeBudget`, `DecodeCursor`, and `StalenessTracker` APIs.
+
+- The protobuf parser decodes one `MetricFamily` message at a time, so the protobuf entry loop reads the decoded message instead of byte spans. It shares the interners, batching, `max_data_points_per_batch`, and budget rules with the text loop. Its parser state, including histogram scratch and the capacity of the decoded message, is reused across scrapes. The decoder keeps the larger of the old and the finished parser state, like the text loop's scratch, and drops the metrics of the last message when a scrape ends.
+- The parser returns one series entry per summary, so a summary counts as one entry against `DecodeBudget::max_entries`. An empty message, which Go skips, also counts as one entry.
+- Every message starts a new metric row, even when it repeats the name of the message before it. Go accepts split families, so the protobuf loop never returns the text loop's duplicate or late metadata errors.
+- Counters, gauges, and untyped metrics map like text. A counter exemplar goes to `NumberDpExemplars`.
+- Labels are checked like text, also for points that are dropped. Exemplar labels may be named `__name__`.
+- A start timestamp that does not fit in `i64` nanoseconds is unset, like an out-of-range `_created` value. An exemplar timestamp that does not fit returns `DecodeError::TimestampOverflow`, like a sample timestamp. Go's `UnixMilli` wraps instead.
+- A summary becomes one `SummaryDataPoints` row from `dto::Summary`. Only finite quantiles are kept, sorted by quantile.
+- Staleness works like text input:
+  - A stale NaN value, summary sum or quantile, or histogram sum sets `FLAG_NO_RECORDED_VALUE` and clears the values: a null `double_value`, zero summary count and sum with no quantiles, and zero histogram count with a null sum and no buckets for NHCB.
+  - With a `StalenessTracker`, every point is recorded by its OTAP table. Exponential points use their own `DpKind`, so an NHCB point and an exponential point with the same labels are two series.
+  - A disappeared series gets a stale point in its own table. A stale exponential point has zero counts, scale, and zero threshold, a null `sum`, and empty bucket lists. Its metric row is the family's `metric_type = 4` row in the current batch, also when the family is split across messages.
+  - A point with its own timestamp is tracked only with `track_timestamps_staleness`, and a dropped point (an untyped series with `UntypedPolicy::Drop`, or a float histogram) is not tracked.
+- Histograms follow the [OpenTelemetry Prometheus compatibility spec](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/compatibility/prometheus_and_openmetrics.md). Classic protobuf histograms are converted to NHCB (#37) by the Layer 0 parser. The Layer 1 decoder then maps each native histogram by schema:
+  - **Integer custom buckets (schema `-53`, NHCB)** become `HistogramDataPoints` rows. `explicit_bounds` are the custom values, and `bucket_counts` has one dense count per bucket, including `+Inf`, with `0` for buckets the spans skip.
+  - **Exponential integer histograms (schema `-4` to `8`)** become `ExpHistogramDataPoints` rows (`metric_type = 4`, cumulative `aggregation_temporality`):
+    - `scale` is the schema. `zero_count`, `zero_threshold`, `sum`, and the start time are copied.
+    - The sparse spans of each side become one dense `positive` or `negative` list. Its `offset` is the first bucket index minus one.
+    - `min` and `max` are never set.
+    - Buckets whose bounds fall outside the float64 range are dropped and not counted. These are the `±Inf` overflow bucket above index `1024 << schema` and the buckets below the smallest subnormal. `count` is `zero_count` plus the kept buckets.
+    - If a side's dense list would be wider than 160 buckets (the OpenTelemetry SDK's default `MaxSize`) and wider than 8 times its sparse bucket count, `scale` is lowered and adjacent buckets are merged until both sides fit, like Prometheus's `native_histogram_bucket_limit`. This keeps a few sparse buckets far apart from allocating a list of up to about 2^19 buckets.
+    - A stale NaN sum sets `flags` to `FLAG_NO_RECORDED_VALUE`, with the same values as a disappeared series: zero counts, scale, and zero threshold, a null `sum` (`sum` is nullable only in batches with such a point), and empty bucket lists.
+  - **Float histograms**, exponential or NHCB, are dropped, as the spec requires for the float flavor. A classic histogram with float counts converts to a float NHCB, so it is dropped too. They and their labels are still validated first, so an invalid one fails the scrape like in Go.
+  - **Any other schema** fails the scrape with `DecodeError::InvalidHistogram`, like Go's `Validate` with the default scrape config. The OpenTelemetry spec drops such histograms instead. Go lowers schemas `9` to `52` only when `native_histogram_min_bucket_factor` asks for a schema below `8`, and the decoder has no such option.
+- Every native histogram is checked like Go's [`Histogram.Validate`](https://github.com/prometheus/prometheus/blob/v0.315.1/model/histogram/histogram.go#L426) and `FloatHistogram.Validate`. Prometheus runs `Validate` when it appends a scraped histogram, and an invalid histogram fails the scrape. A failed check returns `DecodeError::InvalidHistogram`. The checks cover:
+  - Span offsets and lengths.
+  - Negative bucket counts.
+  - The total count, which must equal `zero_count` plus the bucket counts, or be at least that sum when `sum` is NaN. Float histograms skip this check, like in Go.
+  - For custom buckets: the bounds, the zero bucket, and the bucket count. Like Go's `checkHistogramCustomBounds`, the first bound may be `-Inf`, which classic buckets with `le="-Inf"` convert to. The zero count is checked as sent, so a fractional or NaN float zero count is rejected.
+- A bucket list that outgrows the OTAP `i32` list offsets returns `DecodeError::CapacityOverflow`, not `InvalidHistogram`.
+- A family whose messages mix NHCB and exponential points gets two metric rows with the same name and metadata, one `metric_type = 3` and one `metric_type = 4`.
+- `gaugehistogram` families are kept, like in text input, though the OpenTelemetry spec drops classic and native gauge histograms. They keep the Prometheus type in metric metadata, and exponential gauge histograms use cumulative temporality.
+- Histogram exemplars go to `HistogramDpExemplars` or `ExpHistogramDpExemplars`. Exemplars without timestamps are skipped for every protobuf histogram: Go's `ProtobufParser` skips them for native histograms, and classic histograms are converted to NHCB. `span_id` and `trace_id` exemplar labels move into their OTAP columns.
+
+Known gaps:
+- Layer 0 always prefers native buckets when a histogram has both native and classic buckets. Go's `IgnoreNativeHistograms` scrape option is not wired in yet.
+- `ProtoText` and `ProtoCompact` return `DecodeError::UnsupportedFormat` (see Phase 3).
+- The protobuf loop allocates for each decoded `MetricFamily` through `prost`. Zero-copy protobuf decoding is tracked in #59.
+
 ### Target and metric relabeling architecture
 
 The `relabel` module implements Prometheus `relabel_configs`, `metric_relabel_configs`, and `honor_labels` across three execution tiers matched to data cardinality:
@@ -198,6 +240,7 @@ A Go test harness under `tests/go-harness/` will verify wire compatibility again
 
 To verify that `ArrowDecoder` meets the [`open-telemetry/otel-arrow#3277`](https://github.com/open-telemetry/otel-arrow/issues/3277) data model and runtime constraints before the receiver itself lands, integration tests pull [`otel-arrow-dfe-pdata`](https://github.com/open-telemetry/otel-arrow/blob/main/rust/otap-dataflow/crates/pdata/Cargo.toml) with `features = ["testing"]` as a `dev-dependency`:
 - Inserting every `RecordBatch` produced by `ArrowDecoder` into [`OtapArrowRecords::Metrics`](https://github.com/open-telemetry/otel-arrow/blob/main/rust/otap-dataflow/crates/pdata/src/otap.rs#L40-L55) via `set(payload_type, batch)` validates column names, data types, dictionary encodings, and nullability rules against the OTAP schema specification.
+- The same checks cover protobuf input, including the `ExpHistogramDataPoints` (14), `ExpHistogramDpAttrs` (18), `ExpHistogramDpExemplars` (21), and `ExpHistogramDpExemplarAttrs` (24) tables that native histograms fill, and Go's protobuf fixtures from `model/textparse` and `expfmt`.
 - Running [`encode_transport_optimized()`](https://github.com/open-telemetry/otel-arrow/blob/main/rust/otap-dataflow/crates/pdata/src/otap.rs#L112-L146) followed by `decode_transport_optimized_ids()` verifies relational `id` and `parent_id` invariants across metrics, attributes, data points, and exemplars.
 - Calling [`otap_to_otlp`](https://github.com/open-telemetry/otel-arrow/blob/main/rust/otap-dataflow/crates/pdata/src/testing/round_trip.rs#L65-L83) and [`assert_equivalent`](https://github.com/open-telemetry/otel-arrow/tree/main/rust/otap-dataflow/crates/pdata/src/testing/equiv) transcodes the decoded `OtapArrowRecords` into OTLP `MetricsData` and checks Prometheus-to-OTLP translation semantics.
 - Driving `ArrowDecoder` inside a single-threaded `tokio::task::LocalSet` across repeated scrapes asserts `!Send` compatibility and verifies via [`retained_memory_bytes()`](https://github.com/open-telemetry/otel-arrow/blob/main/rust/otap-dataflow/crates/pdata/src/otap.rs#L92-L100) and `dhat` that memory stays bounded after warmup.
@@ -220,6 +263,7 @@ To verify that `ArrowDecoder` meets the [`open-telemetry/otel-arrow#3277`](https
 ### Phase 3: OpenMetrics 2.0 and Prometheus protobuf decoding
 - Implement Layer 0, Layer 1, and Layer 2 support for OpenMetrics 2.0 matching [`openmetrics2parse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/openmetrics2parse.go) (native histograms in text format, `st@` start timestamps, composite values) and add `specs/expfmt/openmetrics_2_0.abnf`.
 - Implement delimited protobuf decoding (`FmtProtoDelim`), including native sparse histograms, start timestamps, and exemplars, matching [`protobufparse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/protobufparse.go).
+  - Status: Layer 0 and Layer 1 decode delimited protobuf, including native histograms as described in [Protobuf input and native histograms](#protobuf-input-and-native-histograms). Layer 2 and the Go encoder harness are still to do.
 - Histograms are only returned as native histograms, converting explicit-bucket histograms to NHCB (#37). Classic `_bucket`, `_sum`, and `_count` histogram series are left out on purpose; we can add classic support later if users need it ([discussion](https://github.com/prometheus/scrape.rs/pull/25#discussion_r4476081239)).
 - Out of scope: `FmtProtoText` and `FmtProtoCompact`, because Prometheus only scrapes `encoding=delimited` ([config.go#L584](https://github.com/prometheus/prometheus/blob/v0.315.1/config/config.go#L584)).
 - Extend the Go `expfmt` encoder harness to cover `FmtOpenMetrics_2_0_0` and `FmtProtoDelim`.

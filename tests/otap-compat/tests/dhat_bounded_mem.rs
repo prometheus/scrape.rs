@@ -24,7 +24,9 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use prometheus_expfmt::arrow::{
     ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep, OtapMetricRecords, StalenessTracker,
 };
+use prometheus_expfmt::dto;
 use prometheus_expfmt::format::Format;
+use prost::Message;
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -41,6 +43,77 @@ fn to_otap_arrow_records(records: &OtapMetricRecords) -> OtapArrowRecords {
     OtapArrowRecords::Metrics(store)
 }
 
+/// Histogram families with `series` classic and `series` integer exponential histograms each,
+/// labeled `set` = `set`, at the scrape timestamp. Sets of the same length encode to the same
+/// size, so alternating them churns every series without changing the payload size.
+fn histogram_payload(set: &str, series: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for family in 0..4 {
+        let mut metric = Vec::with_capacity(2 * series);
+        for i in 0..series {
+            let label = vec![
+                dto::LabelPair {
+                    name: "set".to_owned(),
+                    value: set.to_owned(),
+                },
+                dto::LabelPair {
+                    name: "series".to_owned(),
+                    value: format!("{i:04}"),
+                },
+            ];
+            metric.push(dto::Metric {
+                label: label.clone(),
+                histogram: Some(dto::Histogram {
+                    sample_count: 11,
+                    sample_sum: 12.5,
+                    schema: 3,
+                    zero_threshold: 1e-128,
+                    zero_count: 1,
+                    positive_span: vec![dto::BucketSpan {
+                        offset: -2,
+                        length: 4,
+                    }],
+                    positive_delta: vec![1, 1, 1, -1],
+                    negative_span: vec![dto::BucketSpan {
+                        offset: 5,
+                        length: 1,
+                    }],
+                    negative_delta: vec![2],
+                    ..dto::Histogram::default()
+                }),
+                ..dto::Metric::default()
+            });
+            metric.push(dto::Metric {
+                label,
+                histogram: Some(dto::Histogram {
+                    sample_count: 4,
+                    sample_sum: 3.5,
+                    bucket: [(0.5, 1), (1.0, 3), (5.0, 4)]
+                        .into_iter()
+                        .map(|(upper_bound, cumulative_count)| dto::Bucket {
+                            upper_bound,
+                            cumulative_count,
+                            ..dto::Bucket::default()
+                        })
+                        .collect(),
+                    ..dto::Histogram::default()
+                }),
+                ..dto::Metric::default()
+            });
+        }
+        dto::MetricFamily {
+            name: format!("latency_seconds_{family}"),
+            help: "Latency.".to_owned(),
+            r#type: dto::MetricType::Histogram as i32,
+            metric,
+            unit: String::new(),
+        }
+        .encode_length_delimited(&mut out)
+        .unwrap();
+    }
+    out
+}
+
 #[test]
 fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
     let _profiler = dhat::Profiler::builder().testing().build();
@@ -50,6 +123,7 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
         .unwrap()
         .into();
     let om_bench: Rc<[u8]> = fs::read(root.join("alltypes.bench.om.txt")).unwrap().into();
+    let proto: Rc<[u8]> = fs::read(root.join("../expfmt/protobuf")).unwrap().into();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -410,5 +484,116 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
         churn_handle
             .await
             .expect("alternating staleness churn task succeeds");
+
+        // Verify delimited protobuf scrapes, whose parser state owns the decoded `MetricFamily`
+        // and histogram scratch, keep retained scratch memory and live heap constant after
+        // warmup, both in one batch and in budgeted chunks across `.await` points.
+        let proto_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
+        let proto_opts = opts.with_max_data_points_per_batch(16);
+        // A 16-point chunk takes at most 42 entries, so the step budget must be lower to pause.
+        let proto_budget = DecodeBudget::default().with_max_entries(8);
+        let proto_handle = tokio::task::spawn_local(async move {
+            let mut warmup_proto_dec_mem = 0usize;
+            let mut warmup_proto_live_heap = 0usize;
+
+            for i in 0..32 {
+                let records = proto_decoder
+                    .borrow_mut()
+                    .decode(&proto, &Format::PROTO_DELIM, &opts)
+                    .expect("protobuf scrape succeeds");
+                let otap = to_otap_arrow_records(&records);
+                drop(otap);
+                drop(records);
+
+                let mut cursor = proto_decoder
+                    .borrow_mut()
+                    .start_decode_stream(&Format::PROTO_DELIM, &proto_opts)
+                    .expect("protobuf cursor starts");
+                let mut pending = 0;
+                loop {
+                    let step = proto_decoder
+                        .borrow_mut()
+                        .step_decode(&mut cursor, &proto, proto_budget)
+                        .expect("protobuf step succeeds");
+                    match step {
+                        DecodeStep::Pending => {
+                            pending += 1;
+                            tokio::task::yield_now().await;
+                        }
+                        DecodeStep::Batch(chunk) => drop(to_otap_arrow_records(&chunk)),
+                        DecodeStep::Done => break,
+                    }
+                }
+                assert!(pending > 0, "protobuf scrape never yielded at iteration {i}");
+
+                let dec_mem = proto_decoder.borrow().retained_memory_bytes();
+                let live_heap = dhat::HeapStats::get().curr_bytes;
+                if i == 1 {
+                    warmup_proto_dec_mem = dec_mem;
+                    warmup_proto_live_heap = live_heap;
+                } else if i > 1 {
+                    assert_eq!(
+                        dec_mem, warmup_proto_dec_mem,
+                        "protobuf decoder scratch memory grew at iteration {i}"
+                    );
+                    assert_eq!(
+                        live_heap, warmup_proto_live_heap,
+                        "live heap bytes leaked after protobuf scrape at iteration {i}"
+                    );
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        proto_handle.await.expect("protobuf local task succeeds");
+
+        // Verify protobuf native and classic histograms under full label churn: alternating
+        // label sets make every series stale each scrape, so the tracker compacts every cycle,
+        // and the exponential bucket lists, decoder scratch, tracker, and live heap stay
+        // constant after warmup.
+        let hist_a: Rc<[u8]> = histogram_payload("a", 64).into();
+        let hist_b: Rc<[u8]> = histogram_payload("b", 64).into();
+        let hist_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
+        let hist_tracker = Rc::new(RefCell::new(StalenessTracker::new()));
+        let hist_handle = tokio::task::spawn_local(async move {
+            let mut warmup = (0usize, 0usize, 0usize);
+            for i in 0..32 {
+                let payload = if i % 2 == 0 { &hist_a } else { &hist_b };
+                let records = hist_decoder
+                    .borrow_mut()
+                    .decode_with_staleness(
+                        payload,
+                        &Format::PROTO_DELIM,
+                        &opts,
+                        &mut hist_tracker.borrow_mut(),
+                    )
+                    .expect("protobuf histogram scrape succeeds");
+                if i > 0 {
+                    // 512 live points plus the 512 stale points of the previous set.
+                    assert_eq!(records.num_data_points(), 1_024);
+                }
+                drop(to_otap_arrow_records(&records));
+                drop(records);
+
+                let current = (
+                    hist_decoder.borrow().retained_memory_bytes(),
+                    hist_tracker.borrow().retained_memory_bytes(),
+                    dhat::HeapStats::get().curr_bytes,
+                );
+                if i == 3 {
+                    warmup = current;
+                } else if i > 3 {
+                    assert_eq!(
+                        current, warmup,
+                        "(decoder, tracker, live heap) bytes grew on protobuf histogram churn at \
+                         iteration {i}"
+                    );
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        hist_handle
+            .await
+            .expect("protobuf histogram churn task succeeds");
     });
 }

@@ -21,8 +21,8 @@ use super::options::{
     CounterSuffixPolicy, DecodeError, DecodeOptions, UnitSuffixPolicy, UntypedPolicy,
 };
 use super::schema::{
-    OTAP_METRIC_TYPE_GAUGE, OTAP_METRIC_TYPE_HISTOGRAM, OTAP_METRIC_TYPE_SUM,
-    OTAP_METRIC_TYPE_SUMMARY,
+    OTAP_METRIC_TYPE_EXP_HISTOGRAM, OTAP_METRIC_TYPE_GAUGE, OTAP_METRIC_TYPE_HISTOGRAM,
+    OTAP_METRIC_TYPE_SUM, OTAP_METRIC_TYPE_SUMMARY, has_aggregation_temporality,
 };
 use super::staleness::{DATA_POINT_FLAG_NO_RECORDED_VALUE, DpKind, StalenessTracker};
 
@@ -58,6 +58,10 @@ pub(super) struct CurrentFamily {
     pub(super) help: Vec<u8>,
     pub(super) unit: Vec<u8>,
     pub(super) batch_id: Option<u16>,
+    /// Row of the family's exponential histogram points in the current batch. A protobuf
+    /// histogram family can mix exponential and custom-bucket native histograms, which OTAP
+    /// stores as two metric rows with the same name and metadata.
+    pub(super) exp_batch_id: Option<u16>,
     pub(super) tracker_family_idx: Option<u32>,
 }
 
@@ -85,6 +89,7 @@ impl CurrentFamily {
         self.help.clear();
         self.unit.clear();
         self.batch_id = None;
+        self.exp_batch_id = None;
         self.tracker_family_idx = None;
     }
 
@@ -115,6 +120,7 @@ impl CurrentFamily {
         self.help.clear();
         self.unit.clear();
         self.batch_id = None;
+        self.exp_batch_id = None;
         self.tracker_family_idx = None;
     }
 
@@ -206,7 +212,33 @@ impl CurrentFamily {
         if let Some(id) = self.batch_id {
             return Ok(id);
         }
+        let id = self.emit_row(metrics, opts, false)?;
+        self.batch_id = Some(id);
+        Ok(id)
+    }
 
+    /// Same as [`CurrentFamily::emit_into_batch`] for the row of exponential histogram points.
+    #[cfg(feature = "dto")]
+    #[inline]
+    pub(super) fn emit_exp_histogram_into_batch(
+        &mut self,
+        metrics: &mut MetricTable,
+        opts: &DecodeOptions,
+    ) -> Result<u16, DecodeError> {
+        if let Some(id) = self.exp_batch_id {
+            return Ok(id);
+        }
+        let id = self.emit_row(metrics, opts, true)?;
+        self.exp_batch_id = Some(id);
+        Ok(id)
+    }
+
+    fn emit_row(
+        &mut self,
+        metrics: &mut MetricTable,
+        opts: &DecodeOptions,
+        exp_histogram: bool,
+    ) -> Result<u16, DecodeError> {
         let (fam_name, metric_type, saw_total_suffix) = self.canonical_key();
         let id = emit_family_row(
             fam_name,
@@ -216,18 +248,20 @@ impl CurrentFamily {
             &self.help,
             self.has_unit,
             &self.unit,
+            exp_histogram,
             metrics,
             opts,
         )?;
-
         self.has_samples = true;
-        self.batch_id = Some(id);
         Ok(id)
     }
 }
 
 /// Appends a `UnivariateMetrics` row and its `MetricAttrs` (`prometheus.type`) entry to `metrics`
 /// for the given family metadata and translation options, returning its `u16` metric ID.
+///
+/// `exp_histogram` sets the OTAP type to `ExpHistogram`, for the exponential native histograms
+/// of a histogram family.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_family_row(
@@ -238,6 +272,7 @@ pub(super) fn emit_family_row(
     help: &[u8],
     has_unit: bool,
     unit: &[u8],
+    exp_histogram: bool,
     metrics: &mut MetricTable,
     opts: &DecodeOptions,
 ) -> Result<u16, DecodeError> {
@@ -311,8 +346,12 @@ pub(super) fn emit_family_row(
         }
     };
 
-    let has_temporality =
-        otap_type == OTAP_METRIC_TYPE_SUM || otap_type == OTAP_METRIC_TYPE_HISTOGRAM;
+    let otap_type = if exp_histogram {
+        OTAP_METRIC_TYPE_EXP_HISTOGRAM
+    } else {
+        otap_type
+    };
+    let has_temporality = has_aggregation_temporality(otap_type);
     let has_sum = otap_type == OTAP_METRIC_TYPE_SUM;
 
     metrics.metric_types.push(otap_type);

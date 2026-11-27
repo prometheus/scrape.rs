@@ -10,6 +10,7 @@ Run these before you push. CI runs the same commands, see [.github/workflows/ci.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+cargo clippy -p prometheus-expfmt --all-targets --no-default-features --features arrow -- -D warnings
 cargo test --workspace --all-features
 cargo test --workspace --no-default-features
 ```

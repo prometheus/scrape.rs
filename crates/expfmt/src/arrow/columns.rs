@@ -26,12 +26,13 @@ use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer
 use super::DecodeError;
 use super::intern::StringInterner;
 use super::schema::{
-    AGGREGATION_TEMPORALITY_CUMULATIVE, ATTR_VALUE_TYPE_STR, KeyEncoding,
-    OTAP_METRIC_TYPE_HISTOGRAM, OTAP_METRIC_TYPE_SUM, UTC_TIME_ZONE, ValEncoding, dp_attrs_schema,
-    exemplars_schema, histogram_bucket_counts_item_field, histogram_dp_schema,
-    histogram_explicit_bounds_item_field, metric_attrs_key_dict, metric_attrs_schema,
-    metric_attrs_type_val_dict, number_dp_schema, resource_struct_fields, summary_dp_schema,
-    summary_quantile_item_field, summary_quantile_struct_fields, univariate_metrics_schema,
+    AGGREGATION_TEMPORALITY_CUMULATIVE, ATTR_VALUE_TYPE_STR, KeyEncoding, OTAP_METRIC_TYPE_SUM,
+    UTC_TIME_ZONE, ValEncoding, dp_attrs_schema, exemplars_schema, exp_histogram_buckets_fields,
+    exp_histogram_dp_schema, has_aggregation_temporality, histogram_bucket_counts_item_field,
+    histogram_dp_schema, histogram_explicit_bounds_item_field, metric_attrs_key_dict,
+    metric_attrs_schema, metric_attrs_type_val_dict, number_dp_schema, resource_struct_fields,
+    summary_dp_schema, summary_quantile_item_field, summary_quantile_struct_fields,
+    univariate_metrics_schema,
 };
 
 /// Reusable scratch vectors used when materializing Arrow columns without reallocating.
@@ -41,6 +42,9 @@ pub(super) struct ScratchBuffers {
     pub(super) u32_buf: Vec<u32>,
     pub(super) i32_buf: Vec<i32>,
     pub(super) bytes: Vec<u8>,
+    /// `(start, end, checked)` of each label name unescaped into `bytes`, sorted by name, for
+    /// the label checks of the decode loop.
+    pub(super) label_names: Vec<(usize, usize, bool)>,
 }
 
 impl ScratchBuffers {
@@ -51,6 +55,7 @@ impl ScratchBuffers {
             u32_buf: Vec::with_capacity(data_points),
             i32_buf: Vec::with_capacity(metrics + 1),
             bytes: Vec::new(),
+            label_names: Vec::new(),
         }
     }
 
@@ -60,6 +65,7 @@ impl ScratchBuffers {
             + self.u32_buf.capacity() * size_of::<u32>()
             + self.i32_buf.capacity() * size_of::<i32>()
             + self.bytes.capacity()
+            + self.label_names.capacity() * size_of::<(usize, usize, bool)>()
     }
 
     pub(super) fn build_attr_columns(
@@ -391,7 +397,7 @@ impl MetricTable {
         if self.any_temporality {
             scratch.i32_buf.clear();
             scratch.i32_buf.extend(self.metric_types.iter().map(|&t| {
-                if t == OTAP_METRIC_TYPE_SUM || t == OTAP_METRIC_TYPE_HISTOGRAM {
+                if has_aggregation_temporality(t) {
                     AGGREGATION_TEMPORALITY_CUMULATIVE
                 } else {
                     0
@@ -401,7 +407,7 @@ impl MetricTable {
                 NullBuffer::new(BooleanBuffer::from_iter(
                     self.metric_types
                         .iter()
-                        .map(|&t| t == OTAP_METRIC_TYPE_SUM || t == OTAP_METRIC_TYPE_HISTOGRAM),
+                        .map(|&t| has_aggregation_temporality(t)),
                 ))
             });
             cols.push(Arc::new(Int32Array::new(
@@ -1281,6 +1287,170 @@ impl HistogramDpTable {
             None,
         );
         cols.push(Arc::new(explicit_bounds_list));
+        self.base.append_flags_column(&mut cols);
+
+        Ok(Some(RecordBatch::try_new(schema, cols)?))
+    }
+}
+
+/// Dense bucket layout of one side (`positive` or `negative`) of `ExpHistogramDataPoints`: one
+/// `offset` per data point plus a flat `bucket_counts` list.
+#[derive(Default)]
+pub(super) struct ExpBucketsCol {
+    pub(super) offsets: Vec<i32>,
+    pub(super) list_offsets: Vec<i32>,
+    pub(super) counts: Vec<u64>,
+}
+
+impl ExpBucketsCol {
+    pub(super) fn clear(&mut self) {
+        self.offsets.clear();
+        self.list_offsets.clear();
+        self.counts.clear();
+    }
+
+    pub(super) fn retained_memory_bytes(&self) -> usize {
+        self.offsets.capacity() * size_of::<i32>()
+            + self.list_offsets.capacity() * size_of::<i32>()
+            + self.counts.capacity() * size_of::<u64>()
+    }
+
+    /// Returns `true` when at least one data point has a non-empty bucket list.
+    #[inline]
+    pub(super) fn any_buckets(&self) -> bool {
+        !self.counts.is_empty()
+    }
+
+    /// Appends an empty bucket list with offset 0.
+    fn push_empty(&mut self) {
+        if self.list_offsets.is_empty() {
+            self.list_offsets.push(0);
+        }
+        let end = self.list_offsets[self.list_offsets.len() - 1];
+        self.offsets.push(0);
+        self.list_offsets.push(end);
+    }
+
+    fn to_struct_array(&self) -> Result<ArrayRef, DecodeError> {
+        let counts = ListArray::new(
+            histogram_bucket_counts_item_field(),
+            OffsetBuffer::new(scalar_from_slice(&self.list_offsets)),
+            Arc::new(UInt64Array::new(scalar_from_slice(&self.counts), None)),
+            None,
+        );
+        let offsets = Int32Array::new(scalar_from_slice(&self.offsets), None);
+        Ok(Arc::new(StructArray::try_new(
+            exp_histogram_buckets_fields(),
+            vec![Arc::new(counts), Arc::new(offsets)],
+            None,
+        )?))
+    }
+}
+
+/// Staging buffers for `ExpHistogramDataPoints`, `ExpHistogramDpAttrs`,
+/// `ExpHistogramDpExemplars`, and `ExpHistogramDpExemplarAttrs`.
+#[derive(Default)]
+pub(super) struct ExpHistogramDpTable {
+    pub(super) base: DpBaseCols,
+    pub(super) counts: Vec<u64>,
+    /// Null for stale data points, like the classic histogram `sum`.
+    pub(super) sums: OptionalValueCol<f64>,
+    pub(super) scales: Vec<i32>,
+    pub(super) zero_counts: Vec<u64>,
+    pub(super) zero_thresholds: Vec<f64>,
+    pub(super) positive: ExpBucketsCol,
+    pub(super) negative: ExpBucketsCol,
+    pub(super) attrs: AttrTable,
+    pub(super) exemplars: ExemplarTable,
+}
+
+impl ExpHistogramDpTable {
+    /// Appends the value columns of a stale data point: zero counts, scale, and zero threshold,
+    /// a null sum, and empty buckets. The caller appends the base columns with the
+    /// no-recorded-value flag.
+    pub(super) fn push_stale_values(&mut self) {
+        self.sums.push_null(self.counts.len());
+        self.counts.push(0);
+        self.scales.push(0);
+        self.zero_counts.push(0);
+        self.zero_thresholds.push(0.0);
+        self.positive.push_empty();
+        self.negative.push_empty();
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.base.clear();
+        self.counts.clear();
+        self.sums.clear();
+        self.scales.clear();
+        self.zero_counts.clear();
+        self.zero_thresholds.clear();
+        self.positive.clear();
+        self.negative.clear();
+        self.attrs.clear();
+        self.exemplars.clear();
+    }
+
+    pub(super) fn retained_memory_bytes(&self) -> usize {
+        self.base.retained_memory_bytes()
+            + self.counts.capacity() * size_of::<u64>()
+            + self.sums.retained_memory_bytes()
+            + self.scales.capacity() * size_of::<i32>()
+            + self.zero_counts.capacity() * size_of::<u64>()
+            + self.zero_thresholds.capacity() * size_of::<f64>()
+            + self.positive.retained_memory_bytes()
+            + self.negative.retained_memory_bytes()
+            + self.attrs.retained_memory_bytes()
+            + self.exemplars.retained_memory_bytes()
+    }
+
+    pub(super) fn build_batch(
+        &self,
+        has_default_ts: bool,
+        scratch: &mut ScratchBuffers,
+    ) -> Result<Option<RecordBatch>, DecodeError> {
+        if self.base.is_empty() {
+            return Ok(None);
+        }
+        let has_id = !self.attrs.is_empty() || !self.exemplars.is_empty();
+        let (has_start_time, start_time_nullable, has_time, time_nullable) =
+            self.base.schema_flags(has_default_ts);
+        let has_negative = self.negative.any_buckets();
+
+        let schema = exp_histogram_dp_schema(
+            has_id,
+            has_start_time,
+            start_time_nullable,
+            has_time,
+            time_nullable,
+            self.sums.is_nullable(),
+            has_negative,
+            self.base.has_flags(),
+        );
+        let mut cols: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+        self.base
+            .append_columns(&mut cols, has_id, has_default_ts, &mut scratch.u32_buf);
+        cols.push(Arc::new(UInt64Array::new(
+            scalar_from_slice(&self.counts),
+            None,
+        )));
+        cols.push(self.sums.to_f64_array());
+        cols.push(Arc::new(Int32Array::new(
+            scalar_from_slice(&self.scales),
+            None,
+        )));
+        cols.push(Arc::new(UInt64Array::new(
+            scalar_from_slice(&self.zero_counts),
+            None,
+        )));
+        cols.push(Arc::new(Float64Array::new(
+            scalar_from_slice(&self.zero_thresholds),
+            None,
+        )));
+        cols.push(self.positive.to_struct_array()?);
+        if has_negative {
+            cols.push(self.negative.to_struct_array()?);
+        }
         self.base.append_flags_column(&mut cols);
 
         Ok(Some(RecordBatch::try_new(schema, cols)?))

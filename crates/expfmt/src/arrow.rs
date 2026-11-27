@@ -22,17 +22,24 @@
 mod columns;
 mod family;
 mod intern;
+// Only protobuf input carries native histograms until OpenMetrics 2.0 is dispatched.
+#[cfg(feature = "dto")]
+mod native;
 mod options;
+#[cfg(feature = "dto")]
+mod proto;
 mod records;
 mod schema;
 mod staleness;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "dto"))]
+mod tests_proto;
 
 use std::future::Future;
 use std::iter::FusedIterator;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::format::{Format, FormatType};
 use crate::parse::{
@@ -40,10 +47,12 @@ use crate::parse::{
     OpenMetricsParserState, ParseError, Parser, PromParser, PromParserState, parse_go_float,
     unescape_bytes_into,
 };
+#[cfg(feature = "dto")]
+use crate::parse::{ProtobufParser, ProtobufParserState};
 
 use self::columns::{
-    AttrEncoding, HistogramDpTable, MetricTable, NumberDpTable, ScratchBuffers, SummaryDpTable,
-    f64_to_u64_count, ms_to_ns, parse_hex_array,
+    AttrEncoding, ExpHistogramDpTable, HistogramDpTable, MetricTable, NumberDpTable,
+    ScratchBuffers, SummaryDpTable, f64_to_u64_count, ms_to_ns, parse_hex_array,
 };
 use self::family::{CurrentFamily, FamilyAssembly, SeriesRole};
 use self::intern::StringInterner;
@@ -91,9 +100,14 @@ pub enum DecodeStep {
     Done,
 }
 
+// `ProtobufParserState` owns the decoded `MetricFamily` and histogram scratch. Boxing it would
+// allocate on every decode step, so the enum stays unboxed.
+#[allow(clippy::large_enum_variant)]
 enum ActiveParserState {
     Prom(PromParserState),
     OpenMetrics(OpenMetricsParserState),
+    #[cfg(feature = "dto")]
+    Protobuf(ProtobufParserState),
     Invalid,
 }
 
@@ -104,6 +118,10 @@ impl ActiveParserState {
             Self::Prom(state) => ActiveParser::Prom(PromParser::from_state(input, state)),
             Self::OpenMetrics(state) => {
                 ActiveParser::OpenMetrics(OpenMetricsParser::from_state(input, state))
+            }
+            #[cfg(feature = "dto")]
+            Self::Protobuf(state) => {
+                ActiveParser::Protobuf(ProtobufParser::from_state(input, state))
             }
             Self::Invalid => ActiveParser::Invalid,
         }
@@ -123,6 +141,8 @@ impl ActiveParserState {
                     decoder.om_scratch = scratch;
                 }
             }
+            #[cfg(feature = "dto")]
+            Self::Protobuf(state) => decoder.proto.keep_state(state),
             Self::Invalid => {}
         }
     }
@@ -177,9 +197,14 @@ impl DecodeCursor {
     }
 }
 
+// See `ActiveParserState` for why the protobuf parser is not boxed.
+#[allow(clippy::large_enum_variant)]
 enum ActiveParser<'input> {
     Prom(PromParser<'input>),
     OpenMetrics(OpenMetricsParser<'input>),
+    /// Driven by `ArrowDecoder::ingest_proto_entries`, never by the text accessors below.
+    #[cfg(feature = "dto")]
+    Protobuf(ProtobufParser<'input>),
     Invalid,
 }
 
@@ -194,6 +219,8 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => p.pos(),
             Self::OpenMetrics(p) => p.pos(),
+            #[cfg(feature = "dto")]
+            Self::Protobuf(p) => p.pos(),
             Self::Invalid => 0,
         }
     }
@@ -203,6 +230,8 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => ActiveParserState::Prom(p.into_state()),
             Self::OpenMetrics(p) => ActiveParserState::OpenMetrics(p.into_state()),
+            #[cfg(feature = "dto")]
+            Self::Protobuf(p) => ActiveParserState::Protobuf(p.into_state()),
             Self::Invalid => ActiveParserState::Invalid,
         }
     }
@@ -212,7 +241,7 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => p.next_entry(),
             Self::OpenMetrics(p) => p.next_entry(),
-            Self::Invalid => Ok(None),
+            _ => Ok(None),
         }
     }
 
@@ -221,7 +250,7 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => p.name_offset(),
             Self::OpenMetrics(p) => p.name_offset(),
-            Self::Invalid => 0,
+            _ => 0,
         }
     }
 
@@ -230,7 +259,7 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => p.raw_help(),
             Self::OpenMetrics(p) => p.raw_help(),
-            Self::Invalid => (b"", b""),
+            _ => (b"", b""),
         }
     }
 
@@ -239,7 +268,7 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => p.metric_type(),
             Self::OpenMetrics(p) => p.metric_type(),
-            Self::Invalid => (b"", MetricType::Unknown),
+            _ => (b"", MetricType::Unknown),
         }
     }
 
@@ -248,7 +277,7 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => p.unit(),
             Self::OpenMetrics(p) => p.unit(),
-            Self::Invalid => (b"", b""),
+            _ => (b"", b""),
         }
     }
 
@@ -257,23 +286,23 @@ impl<'input> ActiveParser<'input> {
         match self {
             Self::Prom(p) => p.raw_series_parts(),
             Self::OpenMetrics(p) => p.raw_series_parts(),
-            Self::Invalid => (b"", &[], b"", None, 0.0),
+            _ => (b"", &[], b"", None, 0.0),
         }
     }
 
     #[inline]
     fn raw_exemplar_parts(&self) -> Option<(f64, Option<i64>, &[LabelSpan])> {
         match self {
-            Self::Prom(_) | Self::Invalid => None,
             Self::OpenMetrics(p) => p.raw_exemplar_parts(),
+            _ => None,
         }
     }
 
     #[inline]
     fn start_timestamp(&mut self) -> Option<i64> {
         match self {
-            Self::Prom(_) | Self::Invalid => None,
             Self::OpenMetrics(p) => p.start_timestamp(),
+            _ => None,
         }
     }
 
@@ -291,6 +320,11 @@ impl<'input> ActiveParser<'input> {
                     decoder.om_scratch = scratch;
                 }
             }
+            #[cfg(feature = "dto")]
+            Self::Protobuf(p) => {
+                let parser = std::mem::replace(p, ProtobufParser::new(b""));
+                decoder.proto.keep_state(parser.into_state());
+            }
             Self::Invalid => {}
         }
     }
@@ -306,6 +340,8 @@ pub struct ArrowDecoder {
     scrape_id: u64,
     prom_spans: Vec<LabelSpan>,
     om_scratch: OmScratch,
+    #[cfg(feature = "dto")]
+    proto: proto::ProtoScratch,
     unescape_buf: Vec<u8>,
     series_name_buf: Vec<u8>,
     current_family: CurrentFamily,
@@ -317,6 +353,7 @@ pub struct ArrowDecoder {
     num_dp: NumberDpTable,
     sum_dp: SummaryDpTable,
     hist_dp: HistogramDpTable,
+    exp_hist_dp: ExpHistogramDpTable,
     temp_attrs: Vec<(u32, u32)>,
     scratch: ScratchBuffers,
 }
@@ -350,6 +387,8 @@ impl ArrowDecoder {
             scrape_id: 0,
             prom_spans: Vec::with_capacity(16),
             om_scratch: OmScratch::default(),
+            #[cfg(feature = "dto")]
+            proto: proto::ProtoScratch::default(),
             unescape_buf: Vec::new(),
             series_name_buf: Vec::with_capacity(64),
             current_family: CurrentFamily::with_capacity(64, 128),
@@ -361,6 +400,7 @@ impl ArrowDecoder {
             num_dp: NumberDpTable::with_capacity(data_points, attrs),
             sum_dp: SummaryDpTable::default(),
             hist_dp: HistogramDpTable::default(),
+            exp_hist_dp: ExpHistogramDpTable::default(),
             temp_attrs: Vec::new(),
             scratch: ScratchBuffers::with_capacity(metrics, data_points, attrs),
         }
@@ -382,8 +422,21 @@ impl ArrowDecoder {
             + self.num_dp.retained_memory_bytes()
             + self.sum_dp.retained_memory_bytes()
             + self.hist_dp.retained_memory_bytes()
+            + self.exp_hist_dp.retained_memory_bytes()
             + self.temp_attrs.capacity() * size_of::<(u32, u32)>()
             + self.scratch.retained_memory_bytes()
+            + self.proto_retained_memory_bytes()
+    }
+
+    #[cfg(feature = "dto")]
+    fn proto_retained_memory_bytes(&self) -> usize {
+        self.proto.retained_memory_bytes()
+    }
+
+    #[cfg(not(feature = "dto"))]
+    #[allow(clippy::unused_self)]
+    fn proto_retained_memory_bytes(&self) -> usize {
+        0
     }
 
     /// Decodes a single exposition scrape buffer of `format` into OTAP metric
@@ -391,13 +444,22 @@ impl ArrowDecoder {
     ///
     /// # Contiguous families and batching
     ///
-    /// Input parsing streams `Entry` items one by one from `PromParser` or
-    /// `OpenMetricsParser` directly into reusable columnar staging vectors and label string
-    /// interners without materializing intermediate per-sample structs or per-string allocations.
+    /// Input parsing streams `Entry` items one by one from `PromParser`, `OpenMetricsParser`, or,
+    /// with the `dto` feature, `ProtobufParser` for [`Format::PROTO_DELIM`], directly into
+    /// reusable columnar staging vectors and label string interners without materializing
+    /// intermediate per-sample structs or per-string allocations.
     /// Metric families are decoded as contiguous runs, with `# HELP`, `# TYPE`, and `# UNIT`
     /// lines appearing before that family's samples. Non-contiguous repetitions of an earlier
     /// metric name are not reassembled or rejected; each run starts with fresh `untyped` metadata
     /// unless preceded by its own metadata lines.
+    ///
+    /// Each protobuf `MetricFamily` message becomes its own family. Native histograms follow
+    /// the OpenTelemetry Prometheus compatibility spec: exponential schemas become
+    /// `ExpHistogramDataPoints`, and custom-bucket histograms, which classic protobuf histograms
+    /// are converted to like in Go, become explicit-bucket `HistogramDataPoints`. A family that
+    /// mixes both gets one metric row of each type. Float histograms are dropped. A
+    /// native histogram that Go's `Validate` would reject fails the scrape with
+    /// [`DecodeError::InvalidHistogram`].
     ///
     /// Single-batch `decode` returns [`DecodeError::CapacityOverflow`] if a scrape contains more
     /// than 65,536 distinct metric families (OTAP's `u16` `UnivariateMetrics.id` limit). Use
@@ -421,7 +483,7 @@ impl ArrowDecoder {
         let mut pending_series = false;
         let mut done = false;
         let mut tracker = None;
-        let res = self.ingest_entries::<false, false, false>(
+        let res = self.ingest::<false, false, false>(
             &mut parser,
             opts,
             default_ts_ns,
@@ -639,7 +701,7 @@ impl ArrowDecoder {
         let state = std::mem::replace(&mut cursor.parser_state, ActiveParserState::Invalid);
         let mut parser = state.into_parser(input);
         let res = if cursor.chunked {
-            self.ingest_entries::<true, BUDGETED, TRACKED>(
+            self.ingest::<true, BUDGETED, TRACKED>(
                 &mut parser,
                 &cursor.opts,
                 cursor.default_ts_ns,
@@ -650,7 +712,7 @@ impl ArrowDecoder {
                 tracker,
             )
         } else {
-            self.ingest_entries::<false, BUDGETED, TRACKED>(
+            self.ingest::<false, BUDGETED, TRACKED>(
                 &mut parser,
                 &cursor.opts,
                 cursor.default_ts_ns,
@@ -743,7 +805,7 @@ impl ArrowDecoder {
         let mut pending_series = false;
         let mut done = false;
         let mut tracker_opt = Some(tracker);
-        let res = self.ingest_entries::<false, false, true>(
+        let res = self.ingest::<false, false, true>(
             &mut parser,
             opts,
             default_ts_ns,
@@ -846,6 +908,7 @@ impl ArrowDecoder {
             &mut self.num_dp,
             &mut self.sum_dp,
             &mut self.hist_dp,
+            &mut self.exp_hist_dp,
             &mut self.key_interner,
             &mut self.val_interner,
             opts,
@@ -992,8 +1055,14 @@ impl ArrowDecoder {
                 let scratch = std::mem::take(&mut self.om_scratch);
                 ActiveParser::OpenMetrics(OpenMetricsParser::with_scratch(input, scratch))
             }
+            #[cfg(feature = "dto")]
+            FormatType::ProtoDelim => {
+                let mut state = std::mem::take(&mut self.proto.state);
+                state.reset(true);
+                ActiveParser::Protobuf(ProtobufParser::from_state(input, state))
+            }
             _ => {
-                // TODO(bwplotka): Dispatch Proto* in Phase 3.
+                // TODO(bwplotka): Dispatch ProtoText and ProtoCompact, and OpenMetrics 2.0.
                 return Err(DecodeError::UnsupportedFormat(format.as_str().to_owned()));
             }
         };
@@ -1009,12 +1078,14 @@ impl ArrowDecoder {
 
     fn reset_batch(&mut self) {
         self.current_family.batch_id = None;
+        self.current_family.exp_batch_id = None;
         self.metrics.clear();
         self.key_interner.clear();
         self.val_interner.clear();
         self.num_dp.clear();
         self.sum_dp.clear();
         self.hist_dp.clear();
+        self.exp_hist_dp.clear();
     }
 
     #[inline]
@@ -1030,12 +1101,71 @@ impl ArrowDecoder {
 
     #[inline]
     fn total_data_points(&self) -> usize {
-        self.num_dp.base.len() + self.sum_dp.base.len() + self.hist_dp.base.len()
+        self.num_dp.base.len()
+            + self.sum_dp.base.len()
+            + self.hist_dp.base.len()
+            + self.exp_hist_dp.base.len()
     }
 
     #[inline]
     fn batch_data_points(&self) -> usize {
         self.total_data_points() + self.assembly.groups.len()
+    }
+
+    /// Ends the input of the text or protobuf entry loop: drains the series that disappeared
+    /// from `tracker` as stale points, bounded by `step_budget`
+    /// (`(remaining_entries, started, max_duration)`) and, when chunked, by `max_data_points`,
+    /// then returns the last batch and commits the scrape.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_input<const CHUNKED: bool, const TRACKED: bool>(
+        &mut self,
+        tracker: &mut Option<&mut StalenessTracker>,
+        opts: &DecodeOptions,
+        default_ts_ns: Option<i64>,
+        max_data_points: usize,
+        step_budget: Option<(usize, Instant, Duration)>,
+        done: &mut bool,
+    ) -> Result<DecodeStep, DecodeError> {
+        let drain_step = if TRACKED && let Some(tr) = tracker.as_deref_mut() {
+            tr.finish_scrape_step(
+                &mut self.metrics,
+                &mut self.num_dp,
+                &mut self.sum_dp,
+                &mut self.hist_dp,
+                &mut self.exp_hist_dp,
+                &mut self.key_interner,
+                &mut self.val_interner,
+                opts,
+                default_ts_ns,
+                CHUNKED.then_some(max_data_points),
+                MAX_METRICS_PER_BATCH,
+                step_budget,
+            )?
+        } else {
+            StaleDrainStep::Complete
+        };
+        if TRACKED && drain_step == StaleDrainStep::YieldPending {
+            return Ok(DecodeStep::Pending);
+        }
+        let has_more_stale = TRACKED && drain_step == StaleDrainStep::ChunkFull;
+        if self.metrics.is_empty() {
+            *done = true;
+            if TRACKED && let Some(tr) = tracker.as_deref_mut() {
+                tr.commit_scrape();
+            }
+            return Ok(DecodeStep::Done);
+        }
+        let batch = self.finish_batches(default_ts_ns.is_some())?;
+        if !has_more_stale {
+            *done = true;
+            if TRACKED && let Some(tr) = tracker.as_deref_mut() {
+                tr.commit_scrape();
+            }
+        }
+        if CHUNKED {
+            self.reset_batch_for_mode::<TRACKED>(tracker);
+        }
+        Ok(DecodeStep::Batch(batch))
     }
 
     #[inline]
@@ -1096,6 +1226,46 @@ impl ArrowDecoder {
         Ok(())
     }
 
+    /// Runs the entry loop of the active parser: protobuf has its own loop, so the text loop
+    /// below stays specialized for byte spans into the input.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn ingest<const CHUNKED: bool, const BUDGETED: bool, const TRACKED: bool>(
+        &mut self,
+        parser: &mut ActiveParser<'_>,
+        opts: &DecodeOptions,
+        default_ts_ns: Option<i64>,
+        max_data_points: usize,
+        budget: Option<DecodeBudget>,
+        pending_series: &mut bool,
+        done: &mut bool,
+        tracker: &mut Option<&mut StalenessTracker>,
+    ) -> Result<DecodeStep, DecodeError> {
+        #[cfg(feature = "dto")]
+        if let ActiveParser::Protobuf(parser) = parser {
+            return self.ingest_proto_entries::<CHUNKED, BUDGETED, TRACKED>(
+                parser,
+                opts,
+                default_ts_ns,
+                max_data_points,
+                budget,
+                pending_series,
+                done,
+                tracker,
+            );
+        }
+        self.ingest_entries::<CHUNKED, BUDGETED, TRACKED>(
+            parser,
+            opts,
+            default_ts_ns,
+            max_data_points,
+            budget,
+            pending_series,
+            done,
+            tracker,
+        )
+    }
+
     // Monomorphizing on `CHUNKED`, `BUDGETED`, and `TRACKED` shares one entry dispatch loop across
     // synchronous single-batch `decode`, streaming `decode_stream`, cooperative decoding, and
     // their `_with_staleness` counterparts while compiling out unused checks and register state on
@@ -1135,54 +1305,18 @@ impl ArrowDecoder {
                     Some(entry) => entry,
                     None => {
                         self.flush_pending_family::<TRACKED>(tracker, opts, default_ts_ns)?;
-                        let drain_step = if TRACKED {
-                            let step_budget = budget.filter(|_| BUDGETED).and_then(|b| {
-                                started.map(|st| {
-                                    (max_entries.saturating_sub(entries), st, b.max_duration)
-                                })
-                            });
-                            if let Some(tr) = tracker.as_deref_mut() {
-                                tr.finish_scrape_step(
-                                    &mut self.metrics,
-                                    &mut self.num_dp,
-                                    &mut self.sum_dp,
-                                    &mut self.hist_dp,
-                                    &mut self.key_interner,
-                                    &mut self.val_interner,
-                                    opts,
-                                    default_ts_ns,
-                                    CHUNKED.then_some(max_data_points),
-                                    MAX_METRICS_PER_BATCH,
-                                    step_budget,
-                                )?
-                            } else {
-                                StaleDrainStep::Complete
-                            }
-                        } else {
-                            StaleDrainStep::Complete
-                        };
-                        if TRACKED && drain_step == StaleDrainStep::YieldPending {
-                            return Ok(DecodeStep::Pending);
-                        }
-                        let has_more_stale = TRACKED && drain_step == StaleDrainStep::ChunkFull;
-                        if self.metrics.is_empty() {
-                            *done = true;
-                            if TRACKED && let Some(tr) = tracker.as_deref_mut() {
-                                tr.commit_scrape();
-                            }
-                            return Ok(DecodeStep::Done);
-                        }
-                        let batch = self.finish_batches(default_ts_ns.is_some())?;
-                        if !has_more_stale {
-                            *done = true;
-                            if TRACKED && let Some(tr) = tracker.as_deref_mut() {
-                                tr.commit_scrape();
-                            }
-                        }
-                        if CHUNKED {
-                            self.reset_batch_for_mode::<TRACKED>(tracker);
-                        }
-                        return Ok(DecodeStep::Batch(batch));
+                        let step_budget = budget.filter(|_| BUDGETED).and_then(|b| {
+                            started
+                                .map(|st| (max_entries.saturating_sub(entries), st, b.max_duration))
+                        });
+                        return self.finish_input::<CHUNKED, TRACKED>(
+                            tracker,
+                            opts,
+                            default_ts_ns,
+                            max_data_points,
+                            step_budget,
+                            done,
+                        );
                     }
                 }
             };
@@ -1444,9 +1578,7 @@ impl ArrowDecoder {
         let is_dropped = self.current_family.metric_type == MetricType::Unknown
             && opts.untyped_policy == UntypedPolicy::Drop;
         if is_dropped {
-            for span_idx in 0..label_spans.len() {
-                self.validate_empty_label(span_idx, &label_spans[..=span_idx], full_input)?;
-            }
+            self.check_uninterned_labels(label_spans, full_input, true)?;
             self.current_family.has_samples = true;
             return Ok(());
         }
@@ -1666,8 +1798,9 @@ impl ArrowDecoder {
         let mut sorted_by_key_id = true;
         let mut seen_special = false;
         let mut special_val: Option<f64> = None;
+        let mut has_empty_value = false;
 
-        for (span_idx, span) in label_spans.iter().enumerate() {
+        for span in label_spans {
             let raw_key = &full_input[span.name_start..span.name_end];
             let raw_val = &full_input[span.val_start..span.val_end];
 
@@ -1690,10 +1823,10 @@ impl ArrowDecoder {
             }
 
             // Prometheus treats `label=""` as an absent label (`labels.Builder` deletes empty
-            // values). Validate reserved and duplicate label names before skipping so unused keys
-            // and `""` never enter the OTAP attribute dictionaries.
+            // values). Its name is checked after the loop, so unused keys and `""` never enter
+            // the OTAP attribute dictionaries.
             if raw_val.is_empty() {
-                self.validate_empty_label(span_idx, label_spans, full_input)?;
+                has_empty_value = true;
                 continue;
             }
 
@@ -1715,6 +1848,9 @@ impl ArrowDecoder {
                 &self.key_interner,
                 &self.current_family,
             )?;
+        }
+        if has_empty_value {
+            self.check_uninterned_labels(label_spans, full_input, false)?;
         }
 
         Ok(special_val)
@@ -1782,13 +1918,14 @@ impl ArrowDecoder {
         };
         let mut prev_key_id: Option<u32> = None;
         let mut sorted_by_key_id = true;
+        let mut has_empty_value = false;
 
-        for (span_idx, span) in ex_spans.iter().enumerate() {
+        for span in ex_spans {
             let raw_key = &full_input[span.name_start..span.name_end];
             let raw_val = &full_input[span.val_start..span.val_end];
 
             if raw_val.is_empty() {
-                self.validate_empty_label(span_idx, ex_spans, full_input)?;
+                has_empty_value = true;
                 continue;
             }
 
@@ -1846,6 +1983,9 @@ impl ArrowDecoder {
             };
             Self::sort_and_check_duplicates(slice, &self.key_interner, &self.current_family)?;
         }
+        if has_empty_value {
+            self.check_uninterned_labels(ex_spans, full_input, false)?;
+        }
 
         Ok((span_id, trace_id))
     }
@@ -1863,42 +2003,72 @@ impl ArrowDecoder {
         val_table: &'static str,
     ) -> Result<(u32, u32), DecodeError> {
         let key = unescape_bytes_into(raw_key, true, &mut self.unescape_buf);
+        let key_id = Self::intern_key(
+            &mut self.key_interner,
+            &self.current_family,
+            key,
+            reject_metric_name,
+            prev_key_id,
+            sorted_by_key_id,
+            key_table,
+        )?;
+        let val = unescape_bytes_into(raw_val, true, &mut self.unescape_buf);
+        let val_id = Self::intern_val(&mut self.val_interner, val, val_table)?;
+        Ok((key_id, val_id))
+    }
+
+    /// Interns an unescaped label name, rejects `__name__` when `reject_metric_name` is set,
+    /// and tracks whether the names arrive sorted by key ID, with adjacent duplicates rejected.
+    #[inline]
+    fn intern_key(
+        key_interner: &mut StringInterner,
+        current_family: &CurrentFamily,
+        key: &[u8],
+        reject_metric_name: bool,
+        prev_key_id: &mut Option<u32>,
+        sorted_by_key_id: &mut bool,
+        key_table: &'static str,
+    ) -> Result<u32, DecodeError> {
         if reject_metric_name && key == METRIC_NAME_LABEL.as_bytes() {
             return Err(DecodeError::DuplicateLabel {
-                metric: self.current_family.name_string(),
+                metric: current_family.name_string(),
                 label: METRIC_NAME_LABEL.to_owned(),
             });
         }
-        let key_id =
-            self.key_interner
-                .intern(key)
-                .ok_or_else(|| DecodeError::CapacityOverflow {
-                    table: key_table,
-                    count: self.key_interner.len(),
-                })?;
+        let key_id = key_interner
+            .intern(key)
+            .ok_or_else(|| DecodeError::CapacityOverflow {
+                table: key_table,
+                count: key_interner.len(),
+            })?;
 
         if let Some(prev) = *prev_key_id
             && key_id <= prev
         {
             if key_id == prev {
                 return Err(DecodeError::DuplicateLabel {
-                    metric: self.current_family.name_string(),
-                    label: self.key_interner.get(key_id).to_owned(),
+                    metric: current_family.name_string(),
+                    label: key_interner.get(key_id).to_owned(),
                 });
             }
             *sorted_by_key_id = false;
         }
         *prev_key_id = Some(key_id);
+        Ok(key_id)
+    }
 
-        let val = unescape_bytes_into(raw_val, true, &mut self.unescape_buf);
-        let val_id =
-            self.val_interner
-                .intern(val)
-                .ok_or_else(|| DecodeError::CapacityOverflow {
-                    table: val_table,
-                    count: self.val_interner.len(),
-                })?;
-        Ok((key_id, val_id))
+    #[inline]
+    fn intern_val(
+        val_interner: &mut StringInterner,
+        val: &[u8],
+        val_table: &'static str,
+    ) -> Result<u32, DecodeError> {
+        val_interner
+            .intern(val)
+            .ok_or_else(|| DecodeError::CapacityOverflow {
+                table: val_table,
+                count: val_interner.len(),
+            })
     }
 
     #[cold]
@@ -1919,32 +2089,41 @@ impl ArrowDecoder {
         Ok(())
     }
 
+    /// Checks the names of labels that are not interned: every label when `check_all` is set,
+    /// else only labels with empty values. A checked label fails if it is `__name__` or if
+    /// another label has the same name. The names are unescaped into scratch and sorted, so a
+    /// long label list takes O(L log L), not O(L^2).
     #[cold]
-    fn validate_empty_label(
+    fn check_uninterned_labels(
         &mut self,
-        span_idx: usize,
         label_spans: &[LabelSpan],
         full_input: &[u8],
+        check_all: bool,
     ) -> Result<(), DecodeError> {
-        let span = &label_spans[span_idx];
-        let raw_key = &full_input[span.name_start..span.name_end];
-        let key = unescape_bytes_into(raw_key, true, &mut self.unescape_buf);
-        if key == METRIC_NAME_LABEL.as_bytes() {
-            return Err(DecodeError::DuplicateLabel {
-                metric: self.current_family.name_string(),
-                label: METRIC_NAME_LABEL.to_owned(),
-            });
+        let names = &mut self.scratch.bytes;
+        let order = &mut self.scratch.label_names;
+        names.clear();
+        order.clear();
+        for span in label_spans {
+            let raw_key = &full_input[span.name_start..span.name_end];
+            let start = names.len();
+            names.extend_from_slice(unescape_bytes_into(raw_key, true, &mut self.unescape_buf));
+            order.push((
+                start,
+                names.len(),
+                check_all || span.val_start == span.val_end,
+            ));
         }
-        for (other_idx, other) in label_spans.iter().enumerate() {
-            if other_idx == span_idx {
-                continue;
-            }
-            let other_raw_key = &full_input[other.name_start..other.name_end];
-            let other_key = unescape_bytes_into(other_raw_key, true, &mut self.scratch.bytes);
-            if key == other_key {
+        order.sort_unstable_by(|a, b| names[a.0..a.1].cmp(&names[b.0..b.1]));
+        let name_at = |i: usize| order.get(i).map(|&(start, end, _)| &names[start..end]);
+        for (i, &(start, end, checked)) in order.iter().enumerate() {
+            let name = &names[start..end];
+            let duplicate =
+                i.checked_sub(1).and_then(name_at) == Some(name) || name_at(i + 1) == Some(name);
+            if checked && (name == METRIC_NAME_LABEL.as_bytes() || duplicate) {
                 return Err(DecodeError::DuplicateLabel {
                     metric: self.current_family.name_string(),
-                    label: String::from_utf8_lossy(key).into_owned(),
+                    label: String::from_utf8_lossy(name).into_owned(),
                 });
             }
         }
@@ -1962,20 +2141,31 @@ impl ArrowDecoder {
         let histogram_data_points = self
             .hist_dp
             .build_batch(has_default_ts, &mut self.scratch)?;
+        let exp_histogram_data_points = self
+            .exp_hist_dp
+            .build_batch(has_default_ts, &mut self.scratch)?;
 
         let any_dp_attrs = !self.num_dp.attrs.is_empty()
             || !self.sum_dp.attrs.is_empty()
             || !self.hist_dp.attrs.is_empty()
+            || !self.exp_hist_dp.attrs.is_empty()
             || !self.num_dp.exemplars.attrs.is_empty()
-            || !self.hist_dp.exemplars.attrs.is_empty();
+            || !self.hist_dp.exemplars.attrs.is_empty()
+            || !self.exp_hist_dp.exemplars.attrs.is_empty();
 
         let enc = AttrEncoding::new(&self.key_interner, &self.val_interner, any_dp_attrs);
         let number_dp_attrs = self.num_dp.attrs.build_batch(&enc, &mut self.scratch)?;
         let summary_dp_attrs = self.sum_dp.attrs.build_batch(&enc, &mut self.scratch)?;
         let histogram_dp_attrs = self.hist_dp.attrs.build_batch(&enc, &mut self.scratch)?;
+        let exp_histogram_dp_attrs = self
+            .exp_hist_dp
+            .attrs
+            .build_batch(&enc, &mut self.scratch)?;
 
         let number_dp_exemplars = self.num_dp.exemplars.build_batch(&mut self.scratch)?;
         let histogram_dp_exemplars = self.hist_dp.exemplars.build_batch(&mut self.scratch)?;
+        let exp_histogram_dp_exemplars =
+            self.exp_hist_dp.exemplars.build_batch(&mut self.scratch)?;
 
         let number_dp_exemplar_attrs = self
             .num_dp
@@ -1984,6 +2174,11 @@ impl ArrowDecoder {
             .build_batch(&enc, &mut self.scratch)?;
         let histogram_dp_exemplar_attrs = self
             .hist_dp
+            .exemplars
+            .attrs
+            .build_batch(&enc, &mut self.scratch)?;
+        let exp_histogram_dp_exemplar_attrs = self
+            .exp_hist_dp
             .exemplars
             .attrs
             .build_batch(&enc, &mut self.scratch)?;
@@ -1996,13 +2191,17 @@ impl ArrowDecoder {
             number_data_points,
             summary_data_points,
             histogram_data_points,
+            exp_histogram_data_points,
             number_dp_attrs,
             summary_dp_attrs,
             histogram_dp_attrs,
+            exp_histogram_dp_attrs,
             number_dp_exemplars,
             histogram_dp_exemplars,
+            exp_histogram_dp_exemplars,
             number_dp_exemplar_attrs,
             histogram_dp_exemplar_attrs,
+            exp_histogram_dp_exemplar_attrs,
         })
     }
 }

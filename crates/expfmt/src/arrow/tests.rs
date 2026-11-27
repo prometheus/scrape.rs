@@ -210,6 +210,7 @@ fn rejects_invalid_metadata_and_duplicate_labels() {
         b"m{a=\"\",a=\"\"} 1\n",
         b"m{a=\"1\",a=\"\"} 1\n",
         b"m{a=\"\",a=\"1\"} 1\n",
+        b"m{a=\"\",b=\"1\",a=\"2\"} 1\n",
         b"m{\"a\\nb\"=\"\",\"a\nb\"=\"1\"} 1\n",
         b"m{__name__=\"override\"} 1\n",
         b"m{__name__=\"\"} 1\n",
@@ -262,6 +263,39 @@ fn rejects_invalid_metadata_and_duplicate_labels() {
             .column_by_name("start_time_unix_nano")
             .is_none()
     );
+}
+
+#[test]
+fn dropped_series_and_exemplars_check_label_names() {
+    let mut dec = ArrowDecoder::new();
+    let drop_opts = DecodeOptions::new().with_untyped_policy(UntypedPolicy::Drop);
+    for payload in [
+        b"m{b=\"1\",a=\"2\",b=\"3\"} 1\n" as &[u8],
+        b"m{a=\"1\",__name__=\"m\"} 1\n",
+    ] {
+        let err = dec.decode(payload, &Format::TEXT, &drop_opts).unwrap_err();
+        assert!(matches!(err, DecodeError::DuplicateLabel { .. }), "{err:?}");
+    }
+    let dropped = dec.decode(b"m{b=\"1\",a=\"2\"} 1\n", &Format::TEXT, &drop_opts);
+    assert!(dropped.unwrap().is_empty());
+
+    let opts = DecodeOptions::default();
+    let exemplar = |labels: &str| format!("# TYPE c counter\nc_total 1 # {{{labels}}} 1\n# EOF\n");
+    let err = dec
+        .decode(
+            exemplar("a=\"\",b=\"1\",a=\"2\"").as_bytes(),
+            &Format::OPEN_METRICS_1_0_0,
+            &opts,
+        )
+        .unwrap_err();
+    assert!(matches!(err, DecodeError::DuplicateLabel { .. }), "{err:?}");
+    // Only the empty label is checked, and exemplars may have a `__name__` label.
+    let records = dec.decode(
+        exemplar("__name__=\"x\",a=\"\"").as_bytes(),
+        &Format::OPEN_METRICS_1_0_0,
+        &opts,
+    );
+    assert_eq!(records.unwrap().num_data_points(), 1);
 }
 
 #[test]

@@ -32,6 +32,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Run clippy (no default features)
         run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+      - name: Run clippy (arrow without dto)
+        run: cargo clippy -p prometheus-expfmt --all-targets --no-default-features --features arrow -- -D warnings
       - name: Run tests (all features)
         run: cargo test --workspace --all-features
       - name: Run tests (no default features)

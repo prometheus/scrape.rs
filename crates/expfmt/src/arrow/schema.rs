@@ -37,8 +37,19 @@ pub(super) const OTAP_METRIC_TYPE_GAUGE: u8 = 1;
 pub(super) const OTAP_METRIC_TYPE_SUM: u8 = 2;
 /// OTAP `UnivariateMetrics.metric_type` wire value for an explicit-bucket Histogram metric.
 pub(super) const OTAP_METRIC_TYPE_HISTOGRAM: u8 = 3;
+/// OTAP `UnivariateMetrics.metric_type` wire value for an Exponential Histogram metric.
+pub(super) const OTAP_METRIC_TYPE_EXP_HISTOGRAM: u8 = 4;
 /// OTAP `UnivariateMetrics.metric_type` wire value for a Summary metric.
 pub(super) const OTAP_METRIC_TYPE_SUMMARY: u8 = 5;
+
+/// Returns `true` for OTAP metric types that carry `aggregation_temporality`.
+#[inline]
+pub(super) const fn has_aggregation_temporality(otap_type: u8) -> bool {
+    matches!(
+        otap_type,
+        OTAP_METRIC_TYPE_SUM | OTAP_METRIC_TYPE_HISTOGRAM | OTAP_METRIC_TYPE_EXP_HISTOGRAM
+    )
+}
 
 /// OTLP `AggregationTemporality::Cumulative` wire value (`2`).
 pub(super) const AGGREGATION_TEMPORALITY_CUMULATIVE: i32 = 2;
@@ -468,6 +479,119 @@ pub(super) fn histogram_dp_schema(
         | (usize::from(sum_nullable) << 6)
         | (usize::from(has_flags) << 7);
     Arc::clone(&HISTOGRAM_DP_SCHEMAS[mask])
+}
+
+static EXP_HISTOGRAM_BUCKETS_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        Field::new(
+            "bucket_counts",
+            DataType::List(histogram_bucket_counts_item_field()),
+            false,
+        ),
+        Field::new("offset", DataType::Int32, false),
+    ])
+});
+
+/// Child fields of the `positive` and `negative` struct columns of `ExpHistogramDataPoints`.
+#[inline]
+pub(super) fn exp_histogram_buckets_fields() -> Fields {
+    EXP_HISTOGRAM_BUCKETS_FIELDS.clone()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_exp_histogram_dp_schema(
+    has_id: bool,
+    has_start_time: bool,
+    start_time_nullable: bool,
+    has_time: bool,
+    time_nullable: bool,
+    sum_nullable: bool,
+    has_negative: bool,
+    has_flags: bool,
+) -> SchemaRef {
+    let mut fields = Vec::with_capacity(13);
+    if has_id {
+        fields.push(Field::new("id", DataType::UInt32, false).with_metadata(plain_id_metadata()));
+    }
+    fields
+        .push(Field::new("parent_id", DataType::UInt16, false).with_metadata(plain_id_metadata()));
+    if has_start_time {
+        fields.push(Field::new(
+            "start_time_unix_nano",
+            timestamp_ns_type(),
+            start_time_nullable,
+        ));
+    }
+    if has_time {
+        fields.push(Field::new(
+            "time_unix_nano",
+            timestamp_ns_type(),
+            time_nullable,
+        ));
+    }
+    fields.push(Field::new("count", DataType::UInt64, false));
+    fields.push(Field::new("sum", DataType::Float64, sum_nullable));
+    fields.push(Field::new("scale", DataType::Int32, false));
+    fields.push(Field::new("zero_count", DataType::UInt64, false));
+    fields.push(Field::new("zero_threshold", DataType::Float64, false));
+    fields.push(Field::new(
+        "positive",
+        DataType::Struct(exp_histogram_buckets_fields()),
+        false,
+    ));
+    if has_negative {
+        fields.push(Field::new(
+            "negative",
+            DataType::Struct(exp_histogram_buckets_fields()),
+            false,
+        ));
+    }
+    if has_flags {
+        fields.push(Field::new("flags", DataType::UInt32, false));
+    }
+    Arc::new(Schema::new(fields))
+}
+
+static EXP_HISTOGRAM_DP_SCHEMAS: LazyLock<[SchemaRef; 256]> = LazyLock::new(|| {
+    std::array::from_fn(|mask| {
+        build_exp_histogram_dp_schema(
+            (mask & 1) != 0,
+            (mask & 2) != 0,
+            (mask & 4) != 0,
+            (mask & 8) != 0,
+            (mask & 16) != 0,
+            (mask & 32) != 0,
+            (mask & 64) != 0,
+            (mask & 128) != 0,
+        )
+    })
+});
+
+/// Returns the adaptive `ExpHistogramDataPoints` schema. `sum` is nullable when a stale data
+/// point in the batch has no sum, `negative` is left out when no data point in the batch has
+/// negative buckets, `flags` when none is flagged. `min` and `max` are never emitted, because
+/// Prometheus native histograms do not track them.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn exp_histogram_dp_schema(
+    has_id: bool,
+    has_start_time: bool,
+    start_time_nullable: bool,
+    has_time: bool,
+    time_nullable: bool,
+    sum_nullable: bool,
+    has_negative: bool,
+    has_flags: bool,
+) -> SchemaRef {
+    let mask = usize::from(has_id)
+        | (usize::from(has_start_time) << 1)
+        | (usize::from(start_time_nullable) << 2)
+        | (usize::from(has_time) << 3)
+        | (usize::from(time_nullable) << 4)
+        | (usize::from(sum_nullable) << 5)
+        | (usize::from(has_negative) << 6)
+        | (usize::from(has_flags) << 7);
+    Arc::clone(&EXP_HISTOGRAM_DP_SCHEMAS[mask])
 }
 
 fn build_exemplars_schema(has_id: bool, has_span_id: bool, has_trace_id: bool) -> SchemaRef {
