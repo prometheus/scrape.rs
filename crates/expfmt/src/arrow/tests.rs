@@ -540,12 +540,22 @@ fn decodes_prometheus_text_1_0_0_with_utf8_names() {
         assert_eq!(names.value(0), "http.requests.total", "format={format}");
     }
 
-    // A format the scoped enum does not cover still reports `UnsupportedFormat`.
+    // Resolving a format only authorizes negotiation; formats without a decoder still report
+    // `UnsupportedFormat`, including OpenMetrics 2.0 until its parser lands.
     let mut dec = ArrowDecoder::new();
-    assert!(matches!(
-        dec.decode(payload.as_bytes(), &Format::PROTO_DELIM, &opts),
-        Err(DecodeError::UnsupportedFormat(_))
-    ));
+    for format in [
+        Format::PROTO_DELIM,
+        Format::OPEN_METRICS_2_0_0,
+        Format::OPEN_METRICS_2_0_0_RC,
+    ] {
+        assert!(
+            matches!(
+                dec.decode(payload.as_bytes(), &format, &opts),
+                Err(DecodeError::UnsupportedFormat(_))
+            ),
+            "format={format}"
+        );
+    }
 }
 
 #[test]

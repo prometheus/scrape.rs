@@ -24,6 +24,12 @@
 //! [`EscapingScheme`], so they belong in this module: [`ScrapeProtocol`] and [`accept_header`]
 //! mirror `config.ScrapeProtocol` and `scrape.acceptHeader`, and [`resolve_scrape_format`]
 //! mirrors the `fallback_scrape_protocol` handling of `textparse.extractMediaType`.
+//!
+//! `crates/scrape-manager` keeps its own `config::ScrapeProtocol` and scrape HTTP helpers today;
+//! those should converge on this module in a follow-up. Keeping `ScrapeProtocol` here avoids
+//! making `otel-arrow` depend on the scrape manager's HTTP and YAML stack. Unifying the two needs
+//! an optional `serde` feature on this crate and alignment with the `v0.315.1` config testdata
+//! (`OpenMetricsText2.0.0-rc`).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -317,12 +323,19 @@ impl Format {
 
     /// Returns the `version` parameter of the media type, or `""` if absent or if the media type
     /// cannot be parsed.
+    ///
+    /// A quoted version value that needs backslash unescaping is also reported as `""`, because
+    /// the unescaped value cannot be borrowed from the format string. Resolver outputs always use
+    /// the canonical unquoted constants, so scrape negotiation is unaffected.
     #[must_use]
     pub fn version(&self) -> &str {
-        let Some((_, params)) = parse_media_type(&self.0) else {
+        let Ok((_, params)) = parse_media_type_detailed(&self.0) else {
             return "";
         };
-        params.get(VERSION_KEY).copied().unwrap_or("")
+        match params.get(VERSION_KEY) {
+            Some(Cow::Borrowed(version)) => version,
+            Some(Cow::Owned(_)) | None => "",
+        }
     }
 
     /// Returns whether this format is OpenMetrics 2.0 (`2.0.0` or `2.0.0-rc`).
@@ -405,15 +418,23 @@ impl AsRef<str> for Format {
 }
 
 /// Standard accepted formats for [`negotiate`], ordered by preference.
+///
+/// Text 1.0.0 is appended after 0.0.4 so an `Accept` header produced by [`accept_header`] with
+/// [`ScrapeProtocol::PrometheusText1_0_0`] still selects UTF-8 text; 0.0.4 remains the fallback
+/// when no supported version is requested.
 pub const DEFAULT_ACCEPTED_FORMATS: &[Format] = &[
     Format::PROTO_DELIM,
     Format::PROTO_TEXT,
     Format::PROTO_COMPACT,
     Format::TEXT,
+    Format::TEXT_1_0_0,
 ];
 
 /// Standard accepted formats including stable OpenMetrics formats for
 /// [`negotiate_including_open_metrics`], ordered by preference.
+///
+/// Mirrors the `prometheus/common` v0.72.1 list (the version pinned by `tests/go-harness`) with
+/// text 1.0.0 appended after 0.0.4, because scrapers negotiate that format.
 pub const DEFAULT_OPEN_METRICS_ACCEPTED_FORMATS: &[Format] = &[
     Format::OPEN_METRICS_1_0_0,
     Format::OPEN_METRICS_0_0_1,
@@ -421,13 +442,17 @@ pub const DEFAULT_OPEN_METRICS_ACCEPTED_FORMATS: &[Format] = &[
     Format::PROTO_TEXT,
     Format::PROTO_COMPACT,
     Format::TEXT,
+    Format::TEXT_1_0_0,
 ];
 
 /// Extracts the baseline [`Format`] from an HTTP response `Content-Type` header value,
-/// matching `ResponseFormat` in `prometheus/common/expfmt/decode.go`.
+/// matching `ResponseFormat` in `prometheus/common/expfmt/decode.go` v0.72.1, with the extensions
+/// described here.
 ///
-/// A valid `escaping=<scheme>` parameter on a format that negotiates one is carried over to the
-/// returned [`Format`].
+/// Beyond that Go version, this also recognizes `text/plain; version=1.0.0`, which scrapers
+/// negotiate, and carries a valid `escaping=<scheme>` parameter over on formats that negotiate
+/// one. `prometheus/common` `main` additionally recognizes OpenMetrics `2.0.0` and `2.0.0-rc`;
+/// see [`resolve_scrape_format`] for the scraper-side resolution that follows Prometheus.
 #[must_use]
 pub fn response_format(content_type: &str) -> Format {
     let Some((media_type, params)) = parse_media_type(content_type) else {
@@ -436,27 +461,27 @@ pub fn response_format(content_type: &str) -> Format {
 
     let format = match media_type.as_str() {
         PROTO_TYPE => {
-            if let Some(&p) = params.get(PROTO_KEY)
-                && p != PROTO_PROTOCOL
+            if let Some(p) = params.get(PROTO_KEY)
+                && p.as_ref() != PROTO_PROTOCOL
             {
                 return Format::UNKNOWN;
             }
-            if let Some(&e) = params.get(ENCODING_KEY)
-                && e != ENCODING_DELIMITED
+            if let Some(e) = params.get(ENCODING_KEY)
+                && e.as_ref() != ENCODING_DELIMITED
             {
                 return Format::UNKNOWN;
             }
             Format::PROTO_DELIM
         }
-        TEXT_TYPE => match params.get(VERSION_KEY).copied() {
+        TEXT_TYPE => match params.get(VERSION_KEY).map(Cow::as_ref) {
             None | Some(TEXT_VERSION) => Format::TEXT,
-            // NOTE: Go's `expfmt.ResponseFormat` predates Prometheus text 1.0.0 and rejects it.
+            // NOTE: `prometheus/common` v0.72.1 predates Prometheus text 1.0.0 and rejects it.
             // Scrapers negotiate that format (`ScrapeProtocol::PrometheusText1_0_0`), so it is
             // resolved here instead of falling through to `Format::UNKNOWN`.
             Some(TEXT_VERSION_1_0_0) => Format::TEXT_1_0_0,
             Some(_) => return Format::UNKNOWN,
         },
-        OPEN_METRICS_TYPE => match params.get(VERSION_KEY).copied() {
+        OPEN_METRICS_TYPE => match params.get(VERSION_KEY).map(Cow::as_ref) {
             None | Some("") | Some(OPEN_METRICS_VERSION_0_0_1) => Format::OPEN_METRICS_0_0_1,
             Some(OPEN_METRICS_VERSION_1_0_0) => Format::OPEN_METRICS_1_0_0,
             Some(_) => return Format::UNKNOWN,
@@ -476,7 +501,8 @@ pub fn response_format(content_type: &str) -> Format {
 /// `prometheus/common/expfmt`, so `scrape.rs` exposes them from [`crate::format`] as well: a scrape
 /// pipeline needs both the exporter-side [`Format`] negotiation and the scraper-side request and
 /// response handling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ScrapeProtocol {
     /// Varint length-delimited Prometheus protobuf (`PrometheusProto`).
     PrometheusProto,
@@ -495,8 +521,11 @@ pub enum ScrapeProtocol {
 }
 
 impl ScrapeProtocol {
-    /// Every supported scrape protocol, in [`ScrapeProtocol::as_str`] order.
-    pub const ALL: [Self; 7] = [
+    /// Every supported scrape protocol, in declaration order.
+    ///
+    /// This is the exhaustiveness list for round-trip tests, not a preference order; use
+    /// [`DEFAULT_SCRAPE_PROTOCOLS`] or [`DEFAULT_PROTO_FIRST_SCRAPE_PROTOCOLS`] for that.
+    pub const ALL: &[Self] = &[
         Self::PrometheusProto,
         Self::PrometheusText0_0_4,
         Self::PrometheusText1_0_0,
@@ -606,7 +635,8 @@ impl FromStr for ScrapeProtocol {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::ALL
-            .into_iter()
+            .iter()
+            .copied()
             .find(|protocol| protocol.as_str() == s)
             .ok_or_else(|| FormatError::UnknownScrapeProtocol(s.to_owned()))
     }
@@ -929,7 +959,7 @@ fn resolve_media_type(
             reason,
         }
     })?;
-    let version = params.get(VERSION_KEY).copied().unwrap_or("");
+    let version = params.get(VERSION_KEY).map_or("", Cow::as_ref);
 
     let format = match media_type.as_str() {
         OPEN_METRICS_TYPE if is_open_metrics_20_version(version) => {
@@ -985,15 +1015,14 @@ fn resolve_media_type(
 /// [`ScrapeProtocol::supports_escaping`]: legacy `0.0.1` and `0.0.4` media types never advertise
 /// `escaping=`, so a stray parameter on such a response must not change how callers interpret its
 /// names. Invalid schemes are ignored, as Prometheus does.
-fn with_declared_escaping(format: Format, params: &HashMap<String, &str>) -> Format {
+fn with_declared_escaping(format: Format, params: &HashMap<String, Cow<'_, str>>) -> Format {
+    let Some(raw) = params.get(ESCAPING_KEY).map(Cow::as_ref) else {
+        return format;
+    };
     if !carries_escaping_scheme(&format) {
         return format;
     }
-    let Some(scheme) = params
-        .get(ESCAPING_KEY)
-        .copied()
-        .and_then(|raw| raw.parse::<EscapingScheme>().ok())
-    else {
+    let Ok(scheme) = raw.parse::<EscapingScheme>() else {
         return format;
     };
     format.with_escaping_scheme(scheme)
@@ -1002,14 +1031,15 @@ fn with_declared_escaping(format: Format, params: &HashMap<String, &str>) -> For
 /// Whether `format` has a version that negotiates `escaping=<scheme>`, matching
 /// [`ScrapeProtocol::supports_escaping`].
 fn carries_escaping_scheme(format: &Format) -> bool {
-    match format.format_type() {
-        FormatType::TextPlain => format.version() == TEXT_VERSION_1_0_0,
-        FormatType::OpenMetrics => {
-            let version = format.version();
-            version == OPEN_METRICS_VERSION_1_0_0 || is_open_metrics_20_version(version)
-        }
-        _ => false,
-    }
+    // `with_declared_escaping` only receives the canonical baseline constants selected by
+    // `response_format` and `resolve_media_type`, so matching them avoids reparsing the format
+    // string. `scrape_protocol_round_trip` keeps this table aligned with
+    // [`ScrapeProtocol::supports_escaping`].
+    let format = format.as_str();
+    format == FMT_TEXT_1_0_0
+        || format == FMT_OPEN_METRICS_1_0_0
+        || format == FMT_OPEN_METRICS_2_0_0_RC
+        || format == FMT_OPEN_METRICS_2_0_0
 }
 
 /// Negotiates a response [`Format`] from an HTTP `Accept` header value using
@@ -1153,6 +1183,7 @@ static FORMAT_TO_ACCEPT: LazyLock<HashMap<&'static str, AcceptClause<'static>>> 
     LazyLock::new(|| {
         [
             FMT_TEXT,
+            FMT_TEXT_1_0_0,
             FMT_PROTO_DELIM,
             FMT_PROTO_TEXT,
             FMT_PROTO_COMPACT,
@@ -1215,16 +1246,35 @@ fn match_format(ac: &AcceptClause<'_>, f: &Format) -> bool {
     true
 }
 
+// NOTE: `Format::format_type`, `Format::with_escaping_scheme`, and `Format::to_escaping_scheme`
+// still tokenise format strings with a simple `;` split. Resolver outputs are canonical constants,
+// so scrape negotiation does not depend on them understanding quoted parameters; unifying them on
+// this parser is tracked as a follow-up.
+
 /// Minimal RFC 1521 / `mime.ParseMediaType` parser for `type/subtype; key=val` strings.
-fn parse_media_type(input: &str) -> Option<(String, HashMap<String, &str>)> {
+fn parse_media_type(input: &str) -> Option<(String, HashMap<String, Cow<'_, str>>)> {
     parse_media_type_detailed(input).ok()
 }
 
 /// [`parse_media_type`] with a parse reason, so scrape errors can say *why* a target
 /// `Content-Type` was rejected, like the `mime.ParseMediaType` error Go joins into its message.
-fn parse_media_type_detailed(input: &str) -> Result<(String, HashMap<String, &str>), &'static str> {
-    let mut parts = input.split(';');
-    let base = parts.next().unwrap_or_default().trim();
+///
+/// The grammar follows Go: `type/subtype` followed by `;`-separated `key=value` parameters,
+/// where an unquoted value is an RFC 2045 token and a quoted value follows Go's quoted-string
+/// handling (a backslash escapes only a tspecial; raw CR/LF are rejected). A single trailing `;`
+/// is allowed.
+///
+/// Parameter values borrow from `input` when possible. A quoted value that contains a backslash
+/// escape is returned as `Cow::Owned`, because the unescaped text is not a contiguous slice of
+/// `input`; all other values are `Cow::Borrowed`.
+fn parse_media_type_detailed(
+    input: &str,
+) -> Result<(String, HashMap<String, Cow<'_, str>>), &'static str> {
+    const OWS: &[char] = &[' ', '\t'];
+
+    let bytes = input.as_bytes();
+    let media_end = bytes.iter().position(|&b| b == b';').unwrap_or(bytes.len());
+    let base = input[..media_end].trim_matches(OWS);
     let Some((main_type, sub_type)) = base.split_once('/') else {
         return Err("expected a type/subtype media type");
     };
@@ -1233,38 +1283,139 @@ fn parse_media_type_detailed(input: &str) -> Result<(String, HashMap<String, &st
     }
 
     let mut params = HashMap::new();
-    for raw_param in parts {
-        let trimmed = raw_param.trim();
-        if trimmed.is_empty() {
-            continue;
+    let mut rest = &input[media_end..];
+    loop {
+        rest = rest.trim_start_matches(OWS);
+        if rest.is_empty() {
+            break;
         }
-        let Some((k, v)) = trimmed.split_once('=') else {
+        let Some(after_semicolon) = rest.strip_prefix(';') else {
             return Err("invalid media parameter");
         };
-        let k = k.trim();
-        let v = v.trim();
-        let v = if let Some(inner) = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-            inner
-        } else {
-            if v.is_empty() || v.contains('"') {
-                return Err("invalid media parameter value");
-            }
-            v
-        };
-        if !is_valid_token(k) {
+        rest = after_semicolon.trim_start_matches(OWS);
+        if rest.is_empty() {
+            // A trailing `;` is accepted, matching `mime.ParseMediaType`.
+            break;
+        }
+
+        let name_end = rest
+            .bytes()
+            .position(|b| !is_token_byte(b))
+            .unwrap_or(rest.len());
+        if name_end == 0 {
             return Err("invalid media parameter name");
         }
+        let name = &rest[..name_end];
+        rest = rest[name_end..].trim_start_matches(OWS);
+        let Some(after_equals) = rest.strip_prefix('=') else {
+            return Err("invalid media parameter");
+        };
+        rest = after_equals.trim_start_matches(OWS);
+
+        let (value, after_value) = if let Some(quoted) = rest.strip_prefix('"') {
+            consume_quoted_string(quoted)?
+        } else {
+            let value_end = rest
+                .bytes()
+                .position(|b| !is_token_byte(b))
+                .unwrap_or(rest.len());
+            if value_end == 0 {
+                return Err("invalid media parameter value");
+            }
+            (Cow::Borrowed(&rest[..value_end]), &rest[value_end..])
+        };
         // NOTE: Duplicate parameter names are last-wins, where Go's `mime.ParseMediaType` rejects
         // them as "duplicate parameter name".
-        params.insert(k.to_ascii_lowercase(), v);
+        params.insert(name.to_ascii_lowercase(), value);
+        rest = after_value;
     }
     Ok((base.to_ascii_lowercase(), params))
 }
 
+/// Parses the contents of a `quoted-string` after its opening quote, returning the value and the
+/// remaining input after the closing quote.
+///
+/// A backslash only escapes a tspecial, matching Go: the escaped byte is unescaped into an owned
+/// value, while literal backslashes and every other byte borrow from `input`. Raw CR and LF are
+/// rejected.
+fn consume_quoted_string(input: &str) -> Result<(Cow<'_, str>, &str), &'static str> {
+    let bytes = input.as_bytes();
+    let mut unescaped: Option<String> = None;
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let value = match unescaped {
+                    Some(mut out) => {
+                        out.push_str(&input[start..i]);
+                        Cow::Owned(out)
+                    }
+                    None => Cow::Borrowed(&input[start..i]),
+                };
+                return Ok((value, &input[i + 1..]));
+            }
+            b'\\' if i + 1 < bytes.len() && is_tspecial(bytes[i + 1]) => {
+                let out = unescaped.get_or_insert_with(|| input[..start].to_owned());
+                out.push_str(&input[start..i]);
+                out.push(char::from(bytes[i + 1]));
+                i += 2;
+                start = i;
+            }
+            b'\r' | b'\n' => {
+                return Err("invalid character in quoted media parameter value");
+            }
+            _ => i += 1,
+        }
+    }
+    Err("unterminated quoted media parameter value")
+}
+
+/// RFC 2045 tspecial byte, which Go treats as escapable inside a quoted string.
+fn is_tspecial(b: u8) -> bool {
+    matches!(
+        b,
+        b'(' | b')'
+            | b'<'
+            | b'>'
+            | b'@'
+            | b','
+            | b';'
+            | b':'
+            | b'\\'
+            | b'"'
+            | b'/'
+            | b'['
+            | b']'
+            | b'?'
+            | b'='
+    )
+}
+
 fn is_valid_token(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'))
+    !s.is_empty() && s.bytes().all(is_token_byte)
+}
+
+/// RFC 2045 token byte: any printable US-ASCII character except `tspecials`.
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 #[cfg(test)]
@@ -1450,6 +1601,7 @@ mod tests {
                 Format::from("application/openmetrics-text; version=\"2.0.0\"; charset=utf-8"),
                 "2.0.0",
             ),
+            (Format::from(r#"text/plain; version="1.0\"0""#), ""),
             (
                 Format::from("application/openmetrics-text; version=2.0.0; escaping="),
                 "",
@@ -1516,6 +1668,11 @@ mod tests {
                 "text/plain; version=0.0.4; charset=utf-8; escaping=values",
             ),
             (
+                "scraper text 1.0.0 Accept header",
+                accept_header(DEFAULT_SCRAPE_PROTOCOLS, EscapingScheme::AllowUtf8),
+                "text/plain; version=1.0.0; charset=utf-8; escaping=allow-utf-8",
+            ),
+            (
                 "wildcard */*",
                 "*/*".to_owned(),
                 "text/plain; version=0.0.4; charset=utf-8; escaping=underscores",
@@ -1576,6 +1733,11 @@ mod tests {
                 "plain text format 0.0.4 allow-utf-8",
                 "text/plain;version=0.0.4; escaping=allow-utf-8".to_owned(),
                 "text/plain; version=0.0.4; charset=utf-8; escaping=allow-utf-8",
+            ),
+            (
+                "text 1.0.0 without OpenMetrics negotiation",
+                "text/plain;version=1.0.0;escaping=allow-utf-8".to_owned(),
+                "text/plain; version=1.0.0; charset=utf-8; escaping=allow-utf-8",
             ),
             (
                 "wildcard */*",
@@ -1777,6 +1939,103 @@ mod tests {
     }
 
     #[test]
+    fn media_type_parser_accepts_valid_headers() {
+        let (media_type, params) = parse_media_type_detailed("text/plain; version=0.0.4").unwrap();
+        assert_eq!(media_type, "text/plain");
+        assert_eq!(params.get(VERSION_KEY).map(Cow::as_ref), Some("0.0.4"));
+
+        let (media_type, params) = parse_media_type_detailed("TEXT/PLAIN; VERSION=1.0.0").unwrap();
+        assert_eq!(media_type, "text/plain");
+        assert_eq!(params.get(VERSION_KEY).map(Cow::as_ref), Some("1.0.0"));
+
+        let (_, params) =
+            parse_media_type_detailed(r#"text/plain; comment="a;b"; version=1.0.0"#).unwrap();
+        assert_eq!(params.get("comment").map(Cow::as_ref), Some("a;b"));
+        assert_eq!(params.get(VERSION_KEY).map(Cow::as_ref), Some("1.0.0"));
+
+        let (_, params) = parse_media_type_detailed(r#"text/plain; comment="""#).unwrap();
+        assert_eq!(params.get("comment").map(Cow::as_ref), Some(""));
+
+        let (_, params) = parse_media_type_detailed(r#"text/plain; comment="a\"b""#).unwrap();
+        assert_eq!(params.get("comment").map(Cow::as_ref), Some(r#"a"b"#));
+
+        // Go only treats a backslash before a tspecial as an escape; other backslashes are literal.
+        let (_, params) = parse_media_type_detailed(r#"text/plain; comment="a\qb""#).unwrap();
+        assert_eq!(params.get("comment").map(Cow::as_ref), Some(r#"a\qb"#));
+
+        let (_, params) = parse_media_type_detailed(r#"text/plain; comment="a\;b""#).unwrap();
+        assert_eq!(params.get("comment").map(Cow::as_ref), Some("a;b"));
+
+        // Go allows other bytes inside quoted strings, including tabs.
+        let (_, params) = parse_media_type_detailed("text/plain; comment=\"a\tb\"").unwrap();
+        assert_eq!(params.get("comment").map(Cow::as_ref), Some("a\tb"));
+
+        let (_, params) = parse_media_type_detailed("text/plain;").unwrap();
+        assert!(params.is_empty());
+
+        let (_, params) = parse_media_type_detailed("text/plain; version=0.0.4;").unwrap();
+        assert_eq!(params.get(VERSION_KEY).map(Cow::as_ref), Some("0.0.4"));
+
+        let (_, params) = parse_media_type_detailed(" text/plain ; version = 0.0.4 ").unwrap();
+        assert_eq!(params.get(VERSION_KEY).map(Cow::as_ref), Some("0.0.4"));
+
+        let (_, params) =
+            parse_media_type_detailed("text/plain; version=0.0.4; version=1.0.0").unwrap();
+        assert_eq!(params.get(VERSION_KEY).map(Cow::as_ref), Some("1.0.0"));
+
+        let (_, params) = parse_media_type_detailed(
+            r#"application/openmetrics-text; version=2.0.0; charset="utf-8""#,
+        )
+        .unwrap();
+        assert_eq!(params.get(CHARSET_KEY).map(Cow::as_ref), Some("utf-8"));
+
+        let (_, params) = parse_media_type_detailed("text/plain; a=b*c").unwrap();
+        assert_eq!(params.get("a").map(Cow::as_ref), Some("b*c"));
+    }
+
+    #[test]
+    fn media_type_parser_rejects_invalid_headers() {
+        let cases = [
+            ("text/plain;;version=0.0.4", "invalid media parameter name"),
+            (
+                "text/plain; version=2.0.0 charset=utf-8",
+                "invalid media parameter",
+            ),
+            (
+                r#"text/plain; version="2.0.0" charset="utf-8""#,
+                "invalid media parameter",
+            ),
+            (
+                r#"text/plain; version="2.0"#,
+                "unterminated quoted media parameter value",
+            ),
+            (
+                "text/plain; version=\"2.0\\",
+                "unterminated quoted media parameter value",
+            ),
+            (r#"text/plain; version="2.0"0""#, "invalid media parameter"),
+            ("text/plain; version=", "invalid media parameter value"),
+            ("text/plain; =x", "invalid media parameter name"),
+            ("text/plain; charset", "invalid media parameter"),
+            ("/", "invalid media type token"),
+            ("   ", "expected a type/subtype media type"),
+            (
+                "text/plain; comment=\"a\rb\"",
+                "invalid character in quoted media parameter value",
+            ),
+            ("text/plain; version=0.0.4\r", "invalid media parameter"),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_media_type_detailed(input).unwrap_err(),
+                expected,
+                "input={input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn format_errors() {
         let err = "bogus".parse::<EscapingScheme>().unwrap_err();
         assert_eq!(err, FormatError::UnknownEscapingScheme("bogus".to_owned()));
@@ -1805,7 +2064,7 @@ mod tests {
 
     #[test]
     fn scrape_protocol_round_trip() {
-        for protocol in ScrapeProtocol::ALL {
+        for &protocol in ScrapeProtocol::ALL {
             assert_eq!(
                 protocol.as_str().parse::<ScrapeProtocol>(),
                 Ok(protocol),
@@ -1828,7 +2087,7 @@ mod tests {
                 let (_, header_params) = parse_media_type(protocol.header()).unwrap();
                 assert_eq!(
                     format.version(),
-                    header_params.get(VERSION_KEY).copied().unwrap_or_default(),
+                    header_params.get(VERSION_KEY).map_or("", Cow::as_ref),
                     "token={protocol}"
                 );
             }
@@ -1837,7 +2096,7 @@ mod tests {
         // The two tables that encode "which versions negotiate `escaping=`" must not drift:
         // the response side infers it from the resolved `Format`, the request side from the
         // protocol.
-        for protocol in ScrapeProtocol::ALL {
+        for &protocol in ScrapeProtocol::ALL {
             assert_eq!(
                 carries_escaping_scheme(&protocol.format()),
                 protocol.supports_escaping(),
@@ -1964,7 +2223,7 @@ mod tests {
             Option<ScrapeProtocol>,
             bool,
             Result<Format, &'static str>,
-            Option<&'static str>,
+            Option<ScrapeFormatWarning>,
         );
 
         let cases: &[Case] = &[
@@ -1994,9 +2253,9 @@ mod tests {
                 Some(ScrapeProtocol::PrometheusText0_0_4),
                 false,
                 Ok(Format::TEXT),
-                Some(
-                    "non-compliant scrape target sending blank Content-Type, using fallback_scrape_protocol \"text/plain\"",
-                ),
+                Some(ScrapeFormatWarning::BlankContentType {
+                    fallback: ScrapeProtocol::PrometheusText0_0_4,
+                }),
             ),
             Case(
                 "unparsable content type without fallback",
@@ -2014,9 +2273,11 @@ mod tests {
                 Some(ScrapeProtocol::PrometheusText0_0_4),
                 false,
                 Ok(Format::TEXT),
-                Some(
-                    "could not parse received Content-Type \"invalid/\" (invalid media type token), using fallback_scrape_protocol \"text/plain\"",
-                ),
+                Some(ScrapeFormatWarning::UnparsableContentType {
+                    content_type: "invalid/".to_owned(),
+                    reason: "invalid media type token",
+                    fallback: ScrapeProtocol::PrometheusText0_0_4,
+                }),
             ),
             Case(
                 "unparsable content type with openmetrics fallback",
@@ -2024,9 +2285,11 @@ mod tests {
                 Some(ScrapeProtocol::OpenMetricsText0_0_1),
                 false,
                 Ok(Format::OPEN_METRICS_0_0_1),
-                Some(
-                    "could not parse received Content-Type \"invalid/invalid/invalid\" (invalid media type token), using fallback_scrape_protocol \"application/openmetrics-text\"",
-                ),
+                Some(ScrapeFormatWarning::UnparsableContentType {
+                    content_type: "invalid/invalid/invalid".to_owned(),
+                    reason: "invalid media type token",
+                    fallback: ScrapeProtocol::OpenMetricsText0_0_1,
+                }),
             ),
             Case(
                 "unparsable content type with protobuf fallback",
@@ -2034,9 +2297,11 @@ mod tests {
                 Some(ScrapeProtocol::PrometheusProto),
                 false,
                 Ok(Format::PROTO_DELIM),
-                Some(
-                    "could not parse received Content-Type \"invalid/\" (invalid media type token), using fallback_scrape_protocol \"application/vnd.google.protobuf\"",
-                ),
+                Some(ScrapeFormatWarning::UnparsableContentType {
+                    content_type: "invalid/".to_owned(),
+                    reason: "invalid media type token",
+                    fallback: ScrapeProtocol::PrometheusProto,
+                }),
             ),
             Case(
                 "openmetrics without version or charset",
@@ -2094,9 +2359,10 @@ mod tests {
                 Some(ScrapeProtocol::OpenMetricsText1_0_0),
                 false,
                 Ok(Format::OPEN_METRICS_1_0_0),
-                Some(
-                    "received OpenMetrics 2.0 Content-Type \"application/openmetrics-text; version=2.0.0-rc\", but the openmetrics2 feature flag is not enabled, using fallback_scrape_protocol \"application/openmetrics-text\"",
-                ),
+                Some(ScrapeFormatWarning::OpenMetrics2Disabled {
+                    content_type: "application/openmetrics-text; version=2.0.0-rc".to_owned(),
+                    fallback: ScrapeProtocol::OpenMetricsText1_0_0,
+                }),
             ),
             Case(
                 "openmetrics 2.0.0 gated",
@@ -2189,22 +2455,16 @@ mod tests {
                 None,
             ),
             Case(
-                "duplicate media type parameters are last-wins",
-                Some("application/openmetrics-text; charset=UTF-8; charset=utf-8"),
-                None,
-                false,
-                Ok(Format::OPEN_METRICS_0_0_1),
-                None,
-            ),
-            Case(
                 "content type without media type separator",
                 Some("gobbledygook"),
                 Some(ScrapeProtocol::PrometheusText0_0_4),
                 false,
                 Ok(Format::TEXT),
-                Some(
-                    "could not parse received Content-Type \"gobbledygook\" (expected a type/subtype media type), using fallback_scrape_protocol \"text/plain\"",
-                ),
+                Some(ScrapeFormatWarning::UnparsableContentType {
+                    content_type: "gobbledygook".to_owned(),
+                    reason: "expected a type/subtype media type",
+                    fallback: ScrapeProtocol::PrometheusText0_0_4,
+                }),
             ),
             Case(
                 "text plain unknown version uses the 0.0.4 baseline",
@@ -2248,9 +2508,10 @@ mod tests {
                 Some(ScrapeProtocol::PrometheusText0_0_4),
                 false,
                 Ok(Format::TEXT),
-                Some(
-                    "received unsupported Content-Type \"text/html\", using fallback_scrape_protocol \"text/plain\"",
-                ),
+                Some(ScrapeFormatWarning::UnsupportedContentType {
+                    content_type: "text/html".to_owned(),
+                    fallback: ScrapeProtocol::PrometheusText0_0_4,
+                }),
             ),
             Case(
                 "openmetrics 2.0.0 fallback stays 2.0.0 when gated on",
@@ -2258,9 +2519,9 @@ mod tests {
                 Some(ScrapeProtocol::OpenMetricsText2_0_0),
                 true,
                 Ok(Format::OPEN_METRICS_2_0_0),
-                Some(
-                    "non-compliant scrape target sending blank Content-Type, using fallback_scrape_protocol \"application/openmetrics-text\"",
-                ),
+                Some(ScrapeFormatWarning::BlankContentType {
+                    fallback: ScrapeProtocol::OpenMetricsText2_0_0,
+                }),
             ),
             Case(
                 "openmetrics 2.0.0 fallback degrades when gated off",
@@ -2268,9 +2529,222 @@ mod tests {
                 Some(ScrapeProtocol::OpenMetricsText2_0_0),
                 false,
                 Ok(Format::OPEN_METRICS_1_0_0),
+                Some(ScrapeFormatWarning::BlankContentType {
+                    fallback: ScrapeProtocol::OpenMetricsText2_0_0,
+                }),
+            ),
+            Case(
+                "blank content type with text 1.0.0 fallback keeps the fallback protocol",
+                None,
+                Some(ScrapeProtocol::PrometheusText1_0_0),
+                false,
+                Ok(Format::TEXT_1_0_0),
+                Some(ScrapeFormatWarning::BlankContentType {
+                    fallback: ScrapeProtocol::PrometheusText1_0_0,
+                }),
+            ),
+            Case(
+                "blank content type with OpenMetrics 2.0-rc fallback",
+                None,
+                Some(ScrapeProtocol::OpenMetricsText2_0_0Rc),
+                true,
+                Ok(Format::OPEN_METRICS_2_0_0_RC),
+                Some(ScrapeFormatWarning::BlankContentType {
+                    fallback: ScrapeProtocol::OpenMetricsText2_0_0Rc,
+                }),
+            ),
+            Case(
+                "protobuf encoding is ignored",
                 Some(
-                    "non-compliant scrape target sending blank Content-Type, using fallback_scrape_protocol \"application/openmetrics-text\"",
+                    "application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=text",
                 ),
+                None,
+                false,
+                Ok(Format::PROTO_DELIM),
+                None,
+            ),
+            Case(
+                "slash only is an invalid media type",
+                Some("/"),
+                None,
+                false,
+                Err(
+                    "cannot parse Content-Type \"/\" (invalid media type token) and no fallback_scrape_protocol for target",
+                ),
+                None,
+            ),
+            Case(
+                "slash only with text fallback",
+                Some("/"),
+                Some(ScrapeProtocol::PrometheusText0_0_4),
+                false,
+                Ok(Format::TEXT),
+                Some(ScrapeFormatWarning::UnparsableContentType {
+                    content_type: "/".to_owned(),
+                    reason: "invalid media type token",
+                    fallback: ScrapeProtocol::PrometheusText0_0_4,
+                }),
+            ),
+            Case(
+                "whitespace only is an invalid media type",
+                Some("   "),
+                None,
+                false,
+                Err(
+                    "cannot parse Content-Type \"   \" (expected a type/subtype media type) and no fallback_scrape_protocol for target",
+                ),
+                None,
+            ),
+            Case(
+                "whitespace only with openmetrics fallback",
+                Some("   "),
+                Some(ScrapeProtocol::OpenMetricsText0_0_1),
+                false,
+                Ok(Format::OPEN_METRICS_0_0_1),
+                Some(ScrapeFormatWarning::UnparsableContentType {
+                    content_type: "   ".to_owned(),
+                    reason: "expected a type/subtype media type",
+                    fallback: ScrapeProtocol::OpenMetricsText0_0_1,
+                }),
+            ),
+            Case(
+                "missing semicolon between parameters is rejected",
+                Some("application/openmetrics-text; version=2.0.0 charset=utf-8"),
+                None,
+                false,
+                Err(
+                    "cannot parse Content-Type \"application/openmetrics-text; version=2.0.0 charset=utf-8\" (invalid media parameter) and no fallback_scrape_protocol for target",
+                ),
+                None,
+            ),
+            Case(
+                "missing semicolon between parameters with openmetrics fallback",
+                Some("application/openmetrics-text; version=2.0.0 charset=utf-8"),
+                Some(ScrapeProtocol::OpenMetricsText1_0_0),
+                false,
+                Ok(Format::OPEN_METRICS_1_0_0),
+                Some(ScrapeFormatWarning::UnparsableContentType {
+                    content_type: "application/openmetrics-text; version=2.0.0 charset=utf-8"
+                        .to_owned(),
+                    reason: "invalid media parameter",
+                    fallback: ScrapeProtocol::OpenMetricsText1_0_0,
+                }),
+            ),
+            Case(
+                "quoted parameters without a separator are rejected",
+                Some("application/openmetrics-text; version=\"2.0.0\" charset=\"utf-8\""),
+                Some(ScrapeProtocol::OpenMetricsText1_0_0),
+                false,
+                Ok(Format::OPEN_METRICS_1_0_0),
+                Some(ScrapeFormatWarning::UnparsableContentType {
+                    content_type:
+                        "application/openmetrics-text; version=\"2.0.0\" charset=\"utf-8\""
+                            .to_owned(),
+                    reason: "invalid media parameter",
+                    fallback: ScrapeProtocol::OpenMetricsText1_0_0,
+                }),
+            ),
+            Case(
+                "quoted values may contain semicolons",
+                Some("text/plain; version=1.0.0; comment=\"a;b\""),
+                None,
+                false,
+                Ok(Format::TEXT_1_0_0),
+                None,
+            ),
+            Case(
+                "quoted charset is unquoted before resolution",
+                Some("application/openmetrics-text; version=1.0.0; charset=\"utf-8\""),
+                None,
+                false,
+                Ok(Format::OPEN_METRICS_1_0_0),
+                None,
+            ),
+            Case(
+                "duplicate version parameters are last-wins",
+                Some("text/plain; version=0.0.4; version=1.0.0"),
+                None,
+                false,
+                Ok(Format::TEXT_1_0_0),
+                None,
+            ),
+            Case(
+                "duplicate version parameters are last-wins in reverse",
+                Some("text/plain; version=1.0.0; version=0.0.4"),
+                None,
+                false,
+                Ok(Format::TEXT),
+                None,
+            ),
+            Case(
+                "duplicate escaping parameters are last-wins",
+                Some("text/plain; version=1.0.0; escaping=allow-utf-8; escaping=dots"),
+                None,
+                false,
+                Ok(Format::TEXT_1_0_0.with_escaping_scheme(EscapingScheme::EscapeDots)),
+                None,
+            ),
+            Case(
+                "trailing semicolon is accepted",
+                Some("text/plain; version=1.0.0;"),
+                None,
+                false,
+                Ok(Format::TEXT_1_0_0),
+                None,
+            ),
+            Case(
+                "unterminated quoted value with fallback",
+                Some("text/plain; version=\"1.0.0"),
+                Some(ScrapeProtocol::PrometheusText0_0_4),
+                false,
+                Ok(Format::TEXT),
+                Some(ScrapeFormatWarning::UnparsableContentType {
+                    content_type: "text/plain; version=\"1.0.0".to_owned(),
+                    reason: "unterminated quoted media parameter value",
+                    fallback: ScrapeProtocol::PrometheusText0_0_4,
+                }),
+            ),
+            Case(
+                "control character in quoted value with fallback",
+                Some("text/plain; comment=\"a\rb\""),
+                Some(ScrapeProtocol::PrometheusText0_0_4),
+                false,
+                Ok(Format::TEXT),
+                Some(ScrapeFormatWarning::UnparsableContentType {
+                    content_type: "text/plain; comment=\"a\rb\"".to_owned(),
+                    reason: "invalid character in quoted media parameter value",
+                    fallback: ScrapeProtocol::PrometheusText0_0_4,
+                }),
+            ),
+            Case(
+                "missing equals is rejected",
+                Some("text/plain; charset"),
+                None,
+                false,
+                Err(
+                    "cannot parse Content-Type \"text/plain; charset\" (invalid media parameter) and no fallback_scrape_protocol for target",
+                ),
+                None,
+            ),
+            Case(
+                "empty parameter name is rejected",
+                Some("text/plain; =x"),
+                None,
+                false,
+                Err(
+                    "cannot parse Content-Type \"text/plain; =x\" (invalid media parameter name) and no fallback_scrape_protocol for target",
+                ),
+                None,
+            ),
+            Case(
+                "empty parameter value is rejected",
+                Some("text/plain; version="),
+                None,
+                false,
+                Err(
+                    "cannot parse Content-Type \"text/plain; version=\" (invalid media parameter value) and no fallback_scrape_protocol for target",
+                ),
+                None,
             ),
         ];
 
@@ -2281,21 +2755,55 @@ mod tests {
                     let resolved = resolved.expect(name);
                     assert_eq!(&resolved.format, format, "case={name}");
                     assert_eq!(
-                        resolved
-                            .warning
-                            .as_ref()
-                            .map(ToString::to_string)
-                            .as_deref(),
-                        *expected_warning,
+                        resolved.warning.as_ref(),
+                        expected_warning.as_ref(),
                         "case={name}"
                     );
                 }
                 Err(message) => {
                     let err = resolved.expect_err(name);
                     assert_eq!(&err.to_string(), message, "case={name}");
-                    assert_eq!(*expected_warning, None, "case={name}");
+                    assert!(expected_warning.is_none(), "case={name}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn scrape_format_warning_messages() {
+        let cases = [
+            (
+                ScrapeFormatWarning::BlankContentType {
+                    fallback: ScrapeProtocol::PrometheusText0_0_4,
+                },
+                "non-compliant scrape target sending blank Content-Type, using fallback_scrape_protocol \"text/plain\"",
+            ),
+            (
+                ScrapeFormatWarning::UnparsableContentType {
+                    content_type: "invalid/".to_owned(),
+                    reason: "invalid media type token",
+                    fallback: ScrapeProtocol::PrometheusText1_0_0,
+                },
+                "could not parse received Content-Type \"invalid/\" (invalid media type token), using fallback_scrape_protocol \"text/plain\"",
+            ),
+            (
+                ScrapeFormatWarning::OpenMetrics2Disabled {
+                    content_type: "application/openmetrics-text; version=2.0.0-rc".to_owned(),
+                    fallback: ScrapeProtocol::OpenMetricsText1_0_0,
+                },
+                "received OpenMetrics 2.0 Content-Type \"application/openmetrics-text; version=2.0.0-rc\", but the openmetrics2 feature flag is not enabled, using fallback_scrape_protocol \"application/openmetrics-text\"",
+            ),
+            (
+                ScrapeFormatWarning::UnsupportedContentType {
+                    content_type: "text/html".to_owned(),
+                    fallback: ScrapeProtocol::PrometheusText0_0_4,
+                },
+                "received unsupported Content-Type \"text/html\", using fallback_scrape_protocol \"text/plain\"",
+            ),
+        ];
+
+        for (warning, expected) in cases {
+            assert_eq!(warning.to_string(), expected, "warning={warning}");
         }
     }
 }
