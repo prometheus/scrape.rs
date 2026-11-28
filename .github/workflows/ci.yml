@@ -8,46 +8,59 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
 jobs:
   rust:
     name: Rust (fmt, clippy, test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+
+      # Installs the compiler pinned in rust-toolchain.toml, resolved through
+      # mise.lock, so CI and local checkouts build with the same rustc.
+      - name: Install build tools
+        uses: jdx/mise-action@v5
         with:
-          components: rustfmt, clippy
-      - name: Resolve OTAP compatibility lockfile for cache key
-        run: cargo generate-lockfile --manifest-path tests/otap-compat/Cargo.toml
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            tests/otap-compat -> target
+          version: "2026.11.14"
+          # `mise-action` already exports `mise env`'s direct `.mise-bins` PATH.
+          # Prepending `~/.local/share/mise/shims` via `GITHUB_PATH` makes
+          # `mr-boxington-action` hydrate `.mbx-build-script-shims` with a mise
+          # shim instead of the real `mbx` binary, which fails when Cargo runs
+          # cached build scripts from `~/.cargo/registry`.
+          add_shims_to_path: false
+
+      # Restores Cargo's pruned target/ and registry from the newest entry, and
+      # saves a new one only for a successful push to main. The tool step above
+      # comes first because the cache key hashes the `rustc -vV` of the compiler
+      # on PATH.
+      - name: Cache Rust builds
+        uses: jdx/mr-boxington-action@v1
+
       - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Check formatting (OTAP compatibility suite)
-        run: cargo fmt --manifest-path tests/otap-compat/Cargo.toml --all -- --check
+        run: mise run fmt-check
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: mise run lint
       - name: Run clippy (no default features)
-        run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+        run: mise run lint-no-default
       - name: Run tests (all features)
-        run: cargo test --workspace --all-features
+        run: mise run test
       - name: Run tests (no default features)
-        run: cargo test --workspace --no-default-features
+        run: mise run test-no-default
       - name: Run clippy (OTAP compatibility suite)
-        env:
-          CARGO_TARGET_DIR: target
-        run: cargo clippy --manifest-path tests/otap-compat/Cargo.toml --all-targets -- -D warnings
+        run: mise run otap-lint
       - name: Run OTAP compatibility tests
-        env:
-          CARGO_TARGET_DIR: target
-        run: cargo test --manifest-path tests/otap-compat/Cargo.toml
+        run: mise run otap-test
 
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
+    # The MSRV floor in Cargo.toml, not the rust-toolchain.toml pin. Setting the
+    # toolchain here overrides that file for every rustup proxy in the job.
+    env:
+      RUSTUP_TOOLCHAIN: "1.88"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88

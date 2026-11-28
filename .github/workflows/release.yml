@@ -28,7 +28,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Publishes with the compiler pinned in rust-toolchain.toml. Plain Cargo
+      # here on purpose: `cargo publish` packages and uploads, so it has nothing
+      # to gain from mbx's compiler cache.
+      - name: Install build tools
+        uses: jdx/mise-action@v5
+        with:
+          version: "2026.11.14"
+          add_shims_to_path: false
 
       - name: Verify release tag matches workspace crate versions
         if: github.event_name == 'release'

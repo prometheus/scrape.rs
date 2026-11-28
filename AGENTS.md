@@ -2,25 +2,45 @@
 
 Rust libraries for Prometheus and OpenMetrics scrape pipelines. See [README.md](README.md) for scope and layout.
 
+## Build tools
+
+Builds and checks run through the root [`mise.toml`](mise.toml) tasks, which compile with
+[mbx](https://mr-boxington.jdx.dev/)'s shared compiler cache. `rust-toolchain.toml` owns the
+compiler pin for rustup, mise, and CI; `Cargo.toml` records the MSRV. Set up a checkout with:
+
+```sh
+mise trust
+mise install
+```
+
+Use `mise tasks` to list tasks. Plain Cargo still works, it just misses mbx's cache. After
+changing a tool version, run `mise lock` and commit the updated `mise.lock`.
+
 ## Verify your change
 
-Run these before you push. CI runs the same commands, see [.github/workflows/ci.yml](.github/workflows/ci.yml).
+Run these before you push. CI runs the same tasks, see [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo clippy --workspace --all-targets --no-default-features -- -D warnings
-cargo test --workspace --all-features
-cargo test --workspace --no-default-features
+mise run fmt-check
+mise run lint
+mise run lint-no-default
+mise run test
+mise run test-no-default
 ```
 
-If you touch `crates/expfmt/src/arrow`, also run the OTAP compatibility suite. It has its own manifest:
+`mise run ci` runs all of them in CI order, plus the OTAP compatibility suite below.
+
+If you touch `crates/expfmt/src/arrow`, also run the OTAP compatibility suite. It is a separate
+workspace with its own manifest:
 
 ```sh
-cargo test --manifest-path tests/otap-compat/Cargo.toml
+mise run otap-lint
+mise run otap-test
 ```
 
-Do not use Rust language or std features newer than `rust-version` in `Cargo.toml`.
+Do not use Rust language or std features newer than `rust-version` in `Cargo.toml`. The pinned
+toolchain is far newer than the MSRV, so a feature that compiles locally can still break the
+`msrv` CI job.
 
 ## Spec
 
@@ -46,7 +66,7 @@ If Rust must differ from Go on purpose, explain each difference in the PR body w
 
 - Write all benchmarks with [`benchfmt.rs`](https://github.com/bwplotka/benchfmt.rs) using `benchfmt::Suite` and `benchfmt::CountingAlloc` in `harness = false` `[[bench]]` targets so every benchmark emits Go [Benchmark Data Format](https://go.googlesource.com/proposal/+/master/design/14313-benchmark-format.md) lines with `ns/op`, `MB/s`, `B/op`, and `allocs/op` for [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat). Do not use Criterion or custom benchmark output formats.
 - Name benchmarks with `/key=value` sub-benchmark dimensions such as `Decode/case=alltypes.237mfs/mode=decode`, call `b.report_allocs()` and `while b.keep_running()`, and include a `Recommended CLI invocation:` doc comment at the top of each benchmark file.
-- Performance improvements and hot-path changes require running benchmarks before and after the change, for example `cargo bench -p prometheus-expfmt --bench decode -- -bench '^BenchmarkDecode' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt`, and comparing with `benchstat before.txt after.txt`.
+- Performance improvements and hot-path changes require running benchmarks before and after the change, for example `mise run bench -p prometheus-expfmt --bench decode -- -- -bench '^BenchmarkDecode' -benchtime 1s -count 6 -cpu 2 -benchmem | tee ${bench}.txt` (mise eats the first `--`, so benchmark flags need two), and comparing with `benchstat before.txt after.txt`.
 - Always output benchmark results in raw `benchstat` format in the PR body and review comments, and always include links to the exact `before` and `after` commits that the benchmark refers to. Rerun benchmarks and update the commit links whenever addressing review comments that touch benchmarked code or benchmarks.
 - If a subset of benchmark results shows a regression, address it or explain in the PR body why that case is not important.
 - Reuse allocations in hot paths where possible, such as `Vec::clear`, scratch buffers, and interner arenas. When reusing buffers exposed through APIs or traits, document lifetime and copy requirements on the trait or type definition.

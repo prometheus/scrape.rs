@@ -1,0 +1,91 @@
+[settings]
+lockfile = true
+locked = true
+idiomatic_version_file_enable_tools = ["rust"]
+
+# rustup proxies (cargo, rust-analyzer) auto-install the toolchain from
+# rust-toolchain.toml and race with `mise install`, which leaves components
+# such as rustfmt marked installed without binaries ("not applicable").
+# Install only through `mise install` so profile and components apply once.
+[env]
+RUSTUP_AUTO_INSTALL = "0"
+
+[tools]
+# Explicit mbx invocations avoid duplicating the Rust version from rust-toolchain.toml.
+mr-boxington = "1.31.0"
+
+# These tasks leave out --workspace: this virtual workspace defaults to all
+# members, and --workspace would override a -p passed on the command line.
+[tasks.build]
+description = "Build the workspace with all features; extra arguments go to cargo"
+run = "mbx build --locked --all-features"
+
+[tasks.test]
+description = "Run workspace tests with all features, including doctests"
+run = "mbx test --locked --all-features"
+
+[tasks.test-no-default]
+description = "Run workspace tests without default features"
+run = "mbx test --locked --no-default-features"
+
+[tasks.lint]
+description = "Check all workspace targets with Clippy, all features"
+run = "mbx clippy --locked --all-targets --all-features -- -D warnings"
+
+[tasks.lint-no-default]
+description = "Check all workspace targets with Clippy, no default features"
+run = "mbx clippy --locked --all-targets --no-default-features -- -D warnings"
+
+# tests/otap-compat is a separate workspace whose Cargo.lock is gitignored on
+# purpose (see its Cargo.toml), so these tasks cannot pass --locked. They build
+# into the root target directory, which is the tree the CI cache transports.
+[tasks.otap-lint]
+description = "Check the OTAP compatibility suite with Clippy"
+env.CARGO_TARGET_DIR = "{{config_root}}/target"
+run = "mbx clippy --manifest-path tests/otap-compat/Cargo.toml --all-targets -- -D warnings"
+
+[tasks.otap-test]
+description = "Run the OTAP compatibility suite"
+env.CARGO_TARGET_DIR = "{{config_root}}/target"
+run = "mbx test --manifest-path tests/otap-compat/Cargo.toml"
+
+[tasks.build-benches]
+description = "Compile benchmarks without running them"
+run = "mbx build --locked --all-features --benches"
+
+[tasks.bench]
+description = "Run benchmarks; extra arguments go to cargo, so -p and --bench can narrow the run"
+run = "mbx bench --locked --all-features"
+
+[tasks.fmt]
+description = "Format the workspace in place, including the OTAP compatibility suite"
+run = [
+    "cargo fmt --all",
+    "cargo fmt --manifest-path tests/otap-compat/Cargo.toml --all",
+]
+
+[tasks.fmt-check]
+description = "Check formatting of the workspace and the OTAP compatibility suite"
+run = [
+    "cargo fmt --all -- --check",
+    "cargo fmt --manifest-path tests/otap-compat/Cargo.toml --all -- --check",
+]
+
+[tasks.ci]
+description = "Run every check the CI Rust job runs, in CI order"
+run = [
+    "mise run fmt-check",
+    "mise run lint",
+    "mise run lint-no-default",
+    "mise run test",
+    "mise run test-no-default",
+    "mise run otap-lint",
+    "mise run otap-test",
+]
+
+[tasks.clean]
+description = "Remove this checkout's Cargo build directories"
+run = [
+    "cargo clean",
+    "cargo clean --manifest-path tests/otap-compat/Cargo.toml",
+]
