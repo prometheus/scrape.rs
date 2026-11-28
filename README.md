@@ -34,16 +34,36 @@ The project serves two main use cases:
 
 ## Development and testing
 
+Install [mise](https://mise.jdx.dev/) 2026.10.15 or newer, then run from the repository root:
+
+```sh
+mise trust
+mise install
+mise run build
+mise run test
+```
+
+[`rust-toolchain.toml`](rust-toolchain.toml) pins the compiler and components for both rustup and mise; [`Cargo.toml`](Cargo.toml) records the minimum supported Rust version, which CI checks separately. [`mise.lock`](mise.lock) locks tool downloads. After changing a tool version, run `mise lock` explicitly and commit the updated lockfile.
+
+The tasks in [`mise.toml`](mise.toml) compile through [mbx](https://mr-boxington.jdx.dev/), which caches compiler outputs across checkouts. Plain Cargo remains supported, but does not use mbx's shared cache.
+
+Use `mise tasks` to list tasks. `mise run lint`, `mise run lint-no-default`, `mise run test-no-default`, and `mise run fmt-check` run the corresponding CI checks, and `mise run ci` runs all of them in CI order; `mise run fmt` formats in place. Extra arguments are forwarded to Cargo, and mise consumes the first `--`, so test-binary flags need two separators:
+
+```sh
+mise run test -p prometheus-expfmt
+mise run test -p prometheus-expfmt -- -- --nocapture
+```
+
 Run the workspace unit and fixture test suite:
 
 ```sh
-cargo test --workspace --all-features
+mise run test
 ```
 
-Run the [`otel-arrow-dfe-pdata`](https://github.com/open-telemetry/otel-arrow/tree/main/rust/otap-dataflow/crates/pdata) compatibility test suite:
+Run the [`otel-arrow-dfe-pdata`](https://github.com/open-telemetry/otel-arrow/tree/main/rust/otap-dataflow/crates/pdata) compatibility test suite, a separate workspace with its own manifest:
 
 ```sh
-cargo test --manifest-path tests/otap-compat/Cargo.toml
+mise run otap-test
 ```
 
 Run the Go differential fixture extractor and tests (requires Go):
@@ -55,7 +75,7 @@ cd tests/go-harness && go test ./...
 Run the decoding, relabeling, and scrape scheduling benchmarks in Go `benchfmt` format for [`benchstat`](https://pkg.go.dev/golang.org/x/perf/cmd/benchstat):
 
 ```sh
-cargo bench -p prometheus-expfmt --bench decode -- -bench '^BenchmarkDecode' -benchtime 1s -count 6 -cpu 2 -benchmem | tee decode.txt
-cargo bench -p prometheus-relabel --bench relabel -- -bench '^BenchmarkRelabel' -benchtime 1s -count 6 -cpu 2 -benchmem | tee relabel.txt
-cargo bench -p prometheus-scrape-manager --bench scrape -- -bench '^BenchmarkScrape' -benchtime 500ms -count 6 -cpu 2 -benchmem | tee scrape.txt
+mise run bench -p prometheus-expfmt --bench decode -- -- -bench '^BenchmarkDecode' -benchtime 1s -count 6 -cpu 2 -benchmem | tee decode.txt
+mise run bench -p prometheus-relabel --bench relabel -- -- -bench '^BenchmarkRelabel' -benchtime 1s -count 6 -cpu 2 -benchmem | tee relabel.txt
+mise run bench -p prometheus-scrape-manager --bench scrape -- -- -bench '^BenchmarkScrape' -benchtime 500ms -count 6 -cpu 2 -benchmem | tee scrape.txt
 ```
